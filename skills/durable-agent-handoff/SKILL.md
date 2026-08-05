@@ -19,6 +19,16 @@ Do not flatten every task into one phase graph.
 
 Read `../../docs/claude-workflows-compatibility.md` before changing these semantics.
 
+## Keep durable identities separate
+
+- A **Session** owns conversation identity, lineage, inbox, workspace, and the exact native runtime resume handle. It never owns a PID or output pipe.
+- An **Activity** owns independently controllable work, its immutable launch specification, durable output, lifecycle ledger, and ordered Attempts.
+- An **Attempt** is one immutable process execution with runtime/model, PID plus start token, supervisor generation, output identities, and terminal result.
+- An **Attachment** is only an ephemeral reader at an output identity, byte cursor, and snapshot revision. Disconnecting it must not stop work.
+- A stop, signal, adopt, or restart is a durable control intent fenced by Activity generation and exact Attempt identity. PID-only control fails closed.
+
+Do not add process/task fields to Session, use a workflow node as the only execution record, persist UI attachments, or let TUI/RPC views derive competing lifecycle state. Use one canonical ledger and one reducer projection. Before creating another durable store, deepen a shared storage primitive rather than duplicating locking, secure-root validation, torn-write repair, and atomic snapshot logic.
+
 ## Recover and launch
 
 1. Run `handoff doctor` and, for Claude recovery, `handoff discover claude --since 8h --json`.

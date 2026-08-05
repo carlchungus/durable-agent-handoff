@@ -29,6 +29,15 @@ type Store struct {
 	lockRetry   time.Duration
 	now         func() time.Time
 	sleep       func(time.Duration)
+	safetyHooks sessionSafetyHooks
+}
+
+type sessionSafetyHooks struct {
+	afterRootPrecheck  func()
+	afterChildPrecheck func(string)
+	afterFilePrecheck  func(string)
+	afterLock          func()
+	beforeValidation   func(string)
 }
 
 const (
@@ -61,7 +70,7 @@ func OpenStore(dir string) (*Store, error) {
 		return nil, err
 	}
 	defer root.Close()
-	sessions, err := openChildRoot(root, "sessions", true)
+	sessions, err := store.openChildRoot(root, "sessions", true)
 	if err != nil {
 		return nil, err
 	}
@@ -77,13 +86,21 @@ func (s *Store) openRoot() (*os.Root, error) {
 	if !actualDirectory(before) {
 		return nil, fmt.Errorf("session store root %q is not an actual directory", s.dir)
 	}
+	if err = validateTrustedDirectory(before); err != nil {
+		return nil, fmt.Errorf("unsafe session store root %q: %w", s.dir, err)
+	}
+	if s.safetyHooks.afterRootPrecheck != nil {
+		s.safetyHooks.afterRootPrecheck()
+	}
 	root, err := os.OpenRoot(s.dir)
 	if err != nil {
 		return nil, err
 	}
 	after, pathErr := os.Lstat(s.dir)
 	opened, openedErr := root.Stat(".")
-	if pathErr != nil || openedErr != nil || !actualDirectory(after) || !actualDirectory(opened) || !os.SameFile(after, opened) {
+	afterTrustErr := validateTrustedDirectory(after)
+	openedTrustErr := validateTrustedDirectory(opened)
+	if pathErr != nil || openedErr != nil || afterTrustErr != nil || openedTrustErr != nil || !actualDirectory(after) || !actualDirectory(opened) || !os.SameFile(before, after) || !os.SameFile(before, opened) {
 		_ = root.Close()
 		if pathErr != nil {
 			return nil, pathErr
@@ -91,17 +108,23 @@ func (s *Store) openRoot() (*os.Root, error) {
 		if openedErr != nil {
 			return nil, openedErr
 		}
+		if afterTrustErr != nil {
+			return nil, afterTrustErr
+		}
+		if openedTrustErr != nil {
+			return nil, openedTrustErr
+		}
 		return nil, fmt.Errorf("session store root %q changed while opening", s.dir)
 	}
 	return root, nil
 }
 
-func (s *Store) openSessionsRoot() (*os.Root, error) {
+func (s *Store) openSessionsRoot(create bool) (*os.Root, error) {
 	root, err := s.openRoot()
 	if err != nil {
 		return nil, err
 	}
-	sessions, err := openChildRoot(root, "sessions", true)
+	sessions, err := s.openChildRoot(root, "sessions", create)
 	_ = root.Close()
 	return sessions, err
 }
@@ -110,16 +133,16 @@ func (s *Store) openSessionRoot(id string, create bool) (*os.Root, error) {
 	if !sessionIdentifier.MatchString(id) {
 		return nil, fmt.Errorf("invalid agent session id %q", id)
 	}
-	sessions, err := s.openSessionsRoot()
+	sessions, err := s.openSessionsRoot(create)
 	if err != nil {
 		return nil, err
 	}
-	session, err := openChildRoot(sessions, id, create)
+	session, err := s.openChildRoot(sessions, id, create)
 	_ = sessions.Close()
 	return session, err
 }
 
-func openChildRoot(parent *os.Root, name string, create bool) (*os.Root, error) {
+func (s *Store) openChildRoot(parent *os.Root, name string, create bool) (*os.Root, error) {
 	if create {
 		if err := parent.Mkdir(name, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 			return nil, err
@@ -132,19 +155,33 @@ func openChildRoot(parent *os.Root, name string, create bool) (*os.Root, error) 
 	if !actualDirectory(before) {
 		return nil, fmt.Errorf("session storage component %q is not an actual directory", name)
 	}
+	if err = validateTrustedDirectory(before); err != nil {
+		return nil, fmt.Errorf("unsafe session storage component %q: %w", name, err)
+	}
+	if s.safetyHooks.afterChildPrecheck != nil {
+		s.safetyHooks.afterChildPrecheck(name)
+	}
 	child, err := parent.OpenRoot(name)
 	if err != nil {
 		return nil, err
 	}
 	after, pathErr := parent.Lstat(name)
 	opened, openedErr := child.Stat(".")
-	if pathErr != nil || openedErr != nil || !actualDirectory(after) || !actualDirectory(opened) || !os.SameFile(after, opened) {
+	afterTrustErr := validateTrustedDirectory(after)
+	openedTrustErr := validateTrustedDirectory(opened)
+	if pathErr != nil || openedErr != nil || afterTrustErr != nil || openedTrustErr != nil || !actualDirectory(after) || !actualDirectory(opened) || !os.SameFile(before, after) || !os.SameFile(before, opened) {
 		_ = child.Close()
 		if pathErr != nil {
 			return nil, pathErr
 		}
 		if openedErr != nil {
 			return nil, openedErr
+		}
+		if afterTrustErr != nil {
+			return nil, afterTrustErr
+		}
+		if openedTrustErr != nil {
+			return nil, openedTrustErr
 		}
 		return nil, fmt.Errorf("session storage component %q changed while opening", name)
 	}
@@ -155,14 +192,18 @@ func actualDirectory(info os.FileInfo) bool {
 	return info != nil && info.Mode().Type() == os.ModeDir
 }
 
-func openRegular(root *os.Root, name string, flag int, perm os.FileMode) (*os.File, error) {
+func (s *Store) openRegular(root *os.Root, name string, flag int, perm os.FileMode) (*os.File, error) {
 	before, err := root.Lstat(name)
+	existed := err == nil
 	if err == nil {
 		if !before.Mode().IsRegular() {
 			return nil, fmt.Errorf("session storage file %q is not a regular file", name)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) || flag&os.O_CREATE == 0 {
 		return nil, err
+	}
+	if s.safetyHooks.afterFilePrecheck != nil {
+		s.safetyHooks.afterFilePrecheck(name)
 	}
 	file, err := root.OpenFile(name, flag, perm)
 	if err != nil {
@@ -171,7 +212,7 @@ func openRegular(root *os.Root, name string, flag int, perm os.FileMode) (*os.Fi
 	after, pathErr := root.Lstat(name)
 	opened, openedErr := file.Stat()
 	safetyErr := validateRegularFile(file)
-	if pathErr != nil || openedErr != nil || safetyErr != nil || !after.Mode().IsRegular() || !opened.Mode().IsRegular() || !os.SameFile(after, opened) {
+	if pathErr != nil || openedErr != nil || safetyErr != nil || !after.Mode().IsRegular() || !opened.Mode().IsRegular() || !os.SameFile(after, opened) || existed && (!os.SameFile(before, after) || !os.SameFile(before, opened)) {
 		_ = file.Close()
 		if pathErr != nil {
 			return nil, pathErr
@@ -194,12 +235,12 @@ func (s *Store) Ensure(descriptor Descriptor) (*Session, error) {
 	id := stableID(descriptor.WorkflowID, descriptor.NodeID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	root, release, err := s.acquire(id)
+	lease, err := s.acquire(id)
 	if err != nil {
 		return nil, err
 	}
-	defer release()
-	if existing, loadErr := s.loadLocked(root, id); loadErr == nil {
+	defer lease.release()
+	if existing, loadErr := s.loadLocked(lease.root, id); loadErr == nil {
 		return existing, nil
 	} else if !errors.Is(loadErr, os.ErrNotExist) {
 		return nil, loadErr
@@ -232,10 +273,10 @@ func (s *Store) Ensure(descriptor Descriptor) (*Session, error) {
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
-	if err = s.appendLocked(root, id, Event{SessionID: id, Type: "session.created", At: now, Data: agent}); err != nil {
+	if err = s.appendLocked(lease, id, Event{SessionID: id, Type: "session.created", At: now, Data: agent}); err != nil {
 		return nil, err
 	}
-	if err = s.snapshotLocked(root, agent); err != nil {
+	if err = s.snapshotLocked(lease, agent); err != nil {
 		return nil, err
 	}
 	return clone(agent), nil
@@ -254,23 +295,23 @@ func (s *Store) Queue(id, from, body string) (Message, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	root, release, err := s.acquire(id)
+	lease, err := s.acquire(id)
 	if err != nil {
 		return Message{}, err
 	}
-	defer release()
-	agent, err := s.loadLocked(root, id)
+	defer lease.release()
+	agent, err := s.loadLocked(lease.root, id)
 	if err != nil {
 		return Message{}, err
 	}
 	now := time.Now().UTC()
 	message := Message{Sequence: uint64(len(agent.Inbox) + 1), From: from, Body: body, State: MessageQueued, CreatedAt: now}
 	message.ID = fmt.Sprintf("message-%d", message.Sequence)
-	if err = s.appendLocked(root, id, Event{SessionID: id, Type: "message.queued", At: now, Data: message}); err != nil {
+	if err = s.appendLocked(lease, id, Event{SessionID: id, Type: "message.queued", At: now, Data: message}); err != nil {
 		return Message{}, err
 	}
 	applyMessageQueued(agent, message, now)
-	if err = s.snapshotLocked(root, agent); err != nil {
+	if err = s.snapshotLocked(lease, agent); err != nil {
 		return Message{}, err
 	}
 	return message, nil
@@ -285,12 +326,12 @@ func (s *Store) Dispatch(id string, attempt int) ([]Message, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	root, release, err := s.acquire(id)
+	lease, err := s.acquire(id)
 	if err != nil {
 		return nil, err
 	}
-	defer release()
-	agent, err := s.loadLocked(root, id)
+	defer lease.release()
+	agent, err := s.loadLocked(lease.root, id)
 	if err != nil {
 		return nil, err
 	}
@@ -315,11 +356,11 @@ func (s *Store) Dispatch(id string, attempt int) ([]Message, error) {
 	}
 	now := time.Now().UTC()
 	data := deliveryEvent{Attempt: deliveryAttempt}
-	if err = s.appendLocked(root, id, Event{SessionID: id, Type: "messages.dispatched", At: now, Data: data}); err != nil {
+	if err = s.appendLocked(lease, id, Event{SessionID: id, Type: "messages.dispatched", At: now, Data: data}); err != nil {
 		return nil, err
 	}
 	applyMessagesDispatched(agent, deliveryAttempt, now)
-	if err = s.snapshotLocked(root, agent); err != nil {
+	if err = s.snapshotLocked(lease, agent); err != nil {
 		return nil, err
 	}
 	return dispatched, nil
@@ -334,12 +375,12 @@ func (s *Store) Deliver(id string, attempt int) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	root, release, err := s.acquire(id)
+	lease, err := s.acquire(id)
 	if err != nil {
 		return err
 	}
-	defer release()
-	agent, err := s.loadLocked(root, id)
+	defer lease.release()
+	agent, err := s.loadLocked(lease.root, id)
 	if err != nil {
 		return err
 	}
@@ -355,11 +396,11 @@ func (s *Store) Deliver(id string, attempt int) error {
 	}
 	now := time.Now().UTC()
 	data := deliveryEvent{Attempt: attempt}
-	if err = s.appendLocked(root, id, Event{SessionID: id, Type: "messages.delivered", At: now, Data: data}); err != nil {
+	if err = s.appendLocked(lease, id, Event{SessionID: id, Type: "messages.delivered", At: now, Data: data}); err != nil {
 		return err
 	}
 	applyMessagesDelivered(agent, attempt, now)
-	return s.snapshotLocked(root, agent)
+	return s.snapshotLocked(lease, agent)
 }
 
 func (s *Store) Requeue(id string, attempt int) error {
@@ -371,12 +412,12 @@ func (s *Store) Requeue(id string, attempt int) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	root, release, err := s.acquire(id)
+	lease, err := s.acquire(id)
 	if err != nil {
 		return err
 	}
-	defer release()
-	agent, err := s.loadLocked(root, id)
+	defer lease.release()
+	agent, err := s.loadLocked(lease.root, id)
 	if err != nil {
 		return err
 	}
@@ -392,11 +433,11 @@ func (s *Store) Requeue(id string, attempt int) error {
 	}
 	now := time.Now().UTC()
 	data := deliveryEvent{Attempt: attempt}
-	if err = s.appendLocked(root, id, Event{SessionID: id, Type: "messages.requeued", At: now, Data: data}); err != nil {
+	if err = s.appendLocked(lease, id, Event{SessionID: id, Type: "messages.requeued", At: now, Data: data}); err != nil {
 		return err
 	}
 	applyMessagesRequeued(agent, attempt, now)
-	return s.snapshotLocked(root, agent)
+	return s.snapshotLocked(lease, agent)
 }
 
 func (s *Store) Observe(id string, observation Observation) error {
@@ -411,21 +452,21 @@ func (s *Store) Observe(id string, observation Observation) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	root, release, err := s.acquire(id)
+	lease, err := s.acquire(id)
 	if err != nil {
 		return err
 	}
-	defer release()
-	agent, err := s.loadLocked(root, id)
+	defer lease.release()
+	agent, err := s.loadLocked(lease.root, id)
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
-	if err = s.appendLocked(root, id, Event{SessionID: id, Type: "session.observed", At: now, Data: observation}); err != nil {
+	if err = s.appendLocked(lease, id, Event{SessionID: id, Type: "session.observed", At: now, Data: observation}); err != nil {
 		return err
 	}
 	applyObservation(agent, observation, now)
-	return s.snapshotLocked(root, agent)
+	return s.snapshotLocked(lease, agent)
 }
 
 func (s *Store) Load(id string) (*Session, error) {
@@ -450,7 +491,7 @@ func (s *Store) LoadByNode(workflowID, nodeID string) (*Session, error) {
 }
 
 func (s *Store) List() ([]*Session, error) {
-	sessions, err := s.openSessionsRoot()
+	sessions, err := s.openSessionsRoot(false)
 	if err != nil {
 		return nil, err
 	}
@@ -491,7 +532,7 @@ func (s *Store) loadLocked(root *os.Root, id string) (*Session, error) {
 
 func (s *Store) replayLocked(root *os.Root, id string) (*Session, error) {
 	var agent *Session
-	file, err := openRegular(root, "events.jsonl", os.O_RDONLY, 0)
+	file, err := s.openRegular(root, "events.jsonl", os.O_RDONLY, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open agent session ledger: %w", err)
 	}
@@ -626,8 +667,11 @@ func validProcessState(state ProcessState) bool {
 	return state == ProcessStarting || state == ProcessRunning || state == ProcessExited
 }
 
-func (s *Store) appendLocked(root *os.Root, id string, event Event) (err error) {
-	f, err := openRegular(root, "events.jsonl", os.O_CREATE|os.O_RDWR, 0o600)
+func (s *Store) appendLocked(lease *sessionLease, id string, event Event) (err error) {
+	if err = lease.validate("ledger open"); err != nil {
+		return err
+	}
+	f, err := s.openRegular(lease.root, "events.jsonl", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
@@ -636,6 +680,9 @@ func (s *Store) appendLocked(root *os.Root, id string, event Event) (err error) 
 			err = closeErr
 		}
 	}()
+	if err = lease.validate("ledger repair"); err != nil {
+		return err
+	}
 	sequence, err := repairLedgerTail(f)
 	if err != nil {
 		return err
@@ -645,26 +692,37 @@ func (s *Store) appendLocked(root *os.Root, id string, event Event) (err error) 
 		return err
 	}
 	b, err := json.Marshal(event)
-	if err == nil {
-		_, err = f.Write(append(b, '\n'))
+	if err != nil {
+		return err
 	}
+	if err = lease.validate("ledger append"); err != nil {
+		return err
+	}
+	_, err = f.Write(append(b, '\n'))
 	if syncErr := f.Sync(); err == nil {
 		err = syncErr
 	}
 	return err
 }
 
-func (s *Store) snapshotLocked(root *os.Root, agent *Session) error {
+func (s *Store) snapshotLocked(lease *sessionLease, agent *Session) error {
 	b, err := json.MarshalIndent(agent, "", "  ")
 	if err != nil {
 		return err
 	}
+	if err = lease.validate("snapshot temp"); err != nil {
+		return err
+	}
 	tmp := fmt.Sprintf(".state.json.tmp-%d-%d", os.Getpid(), s.now().UnixNano())
-	f, err := openRegular(root, tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	f, err := s.openRegular(lease.root, tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
-	defer root.Remove(tmp)
+	defer lease.root.Remove(tmp)
+	if err = lease.validate("snapshot write"); err != nil {
+		_ = f.Close()
+		return err
+	}
 	if _, err = f.Write(append(b, '\n')); err == nil {
 		err = f.Sync()
 	}
@@ -674,25 +732,96 @@ func (s *Store) snapshotLocked(root *os.Root, agent *Session) error {
 	if err != nil {
 		return err
 	}
-	if err = root.Rename(tmp, "state.json"); err != nil {
+	if err = lease.validate("snapshot rename"); err != nil {
 		return err
 	}
-	if d, openErr := root.Open("."); openErr == nil {
+	if err = lease.root.Rename(tmp, "state.json"); err != nil {
+		return err
+	}
+	if d, openErr := lease.root.Open("."); openErr == nil {
 		_ = d.Sync()
 		_ = d.Close()
 	}
 	return nil
 }
 
-func (s *Store) acquire(id string) (*os.Root, func(), error) {
+type sessionLease struct {
+	store *Store
+	id    string
+	root  *os.Root
+	file  *os.File
+	lock  sessionFileLock
+	owner sessionLockOwner
+	once  sync.Once
+}
+
+func (l *sessionLease) validate(boundary string) error {
+	// The stable kernel lock serializes cooperating supervisors. Revalidation
+	// catches unsupported path replacement before each mutation, while the
+	// private-root requirement excludes other OS users. It intentionally does
+	// not claim to sandbox a hostile process running as the supervisor user.
+	if l.store.safetyHooks.beforeValidation != nil {
+		l.store.safetyHooks.beforeValidation(boundary)
+	}
+	current, err := l.store.openSessionRoot(l.id, false)
+	if err != nil {
+		return fmt.Errorf("validate session storage at %s: %w", boundary, err)
+	}
+	currentInfo, currentErr := current.Stat(".")
+	pinnedInfo, pinnedErr := l.root.Stat(".")
+	_ = current.Close()
+	if currentErr != nil || pinnedErr != nil || !actualDirectory(currentInfo) || !actualDirectory(pinnedInfo) || !os.SameFile(currentInfo, pinnedInfo) {
+		if currentErr != nil {
+			return currentErr
+		}
+		if pinnedErr != nil {
+			return pinnedErr
+		}
+		return fmt.Errorf("session directory identity changed at %s", boundary)
+	}
+	if err = validatePinnedRegular(l.root, ".write.lock", l.file); err != nil {
+		return fmt.Errorf("session lock identity changed at %s: %w", boundary, err)
+	}
+	return nil
+}
+
+func (l *sessionLease) release() {
+	l.once.Do(func() {
+		if l.validate("release") == nil {
+			l.owner.State = sessionLockReleased
+			l.owner.UpdatedAt = l.store.now().UTC()
+			_ = writeLockOwner(l.file, l.owner)
+		}
+		_ = l.lock.Unlock()
+		_ = l.file.Close()
+		_ = l.root.Close()
+	})
+}
+
+func validatePinnedRegular(root *os.Root, name string, pinned *os.File) error {
+	current, err := root.Lstat(name)
+	if err != nil {
+		return err
+	}
+	opened, err := pinned.Stat()
+	if err != nil {
+		return err
+	}
+	if !current.Mode().IsRegular() || !opened.Mode().IsRegular() || !os.SameFile(current, opened) {
+		return errors.New("public entry no longer names the pinned regular file")
+	}
+	return validateRegularFile(pinned)
+}
+
+func (s *Store) acquire(id string) (*sessionLease, error) {
 	root, err := s.openSessionRoot(id, true)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	file, err := openRegular(root, ".write.lock", os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := s.openRegular(root, ".write.lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		_ = root.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	lock := s.newFileLock(file)
 	deadline := s.now().Add(s.lockTimeout)
@@ -701,14 +830,14 @@ func (s *Store) acquire(id string) (*os.Root, func(), error) {
 		if !firstAttempt && !s.now().Before(deadline) {
 			_ = file.Close()
 			_ = root.Close()
-			return nil, nil, fmt.Errorf("timed out waiting for agent session %s lock", id)
+			return nil, fmt.Errorf("timed out waiting for agent session %s lock", id)
 		}
 		firstAttempt = false
 		locked, lockErr := lock.TryLock()
 		if lockErr != nil {
 			_ = file.Close()
 			_ = root.Close()
-			return nil, nil, fmt.Errorf("lock agent session %s: %w", id, lockErr)
+			return nil, fmt.Errorf("lock agent session %s: %w", id, lockErr)
 		}
 		if locked {
 			owner := sessionLockOwner{
@@ -718,23 +847,23 @@ func (s *Store) acquire(id string) (*os.Root, func(), error) {
 				State:      sessionLockActive,
 				UpdatedAt:  s.now().UTC(),
 			}
+			lease := &sessionLease{store: s, id: id, root: root, file: file, lock: lock, owner: owner}
+			if s.safetyHooks.afterLock != nil {
+				s.safetyHooks.afterLock()
+			}
+			if validateErr := lease.validate("acquire"); validateErr != nil {
+				_ = lock.Unlock()
+				_ = file.Close()
+				_ = root.Close()
+				return nil, validateErr
+			}
 			if writeErr := writeLockOwner(file, owner); writeErr != nil {
 				_ = lock.Unlock()
 				_ = file.Close()
 				_ = root.Close()
-				return nil, nil, writeErr
+				return nil, writeErr
 			}
-			var once sync.Once
-			return root, func() {
-				once.Do(func() {
-					owner.State = sessionLockReleased
-					owner.UpdatedAt = s.now().UTC()
-					_ = writeLockOwner(file, owner)
-					_ = lock.Unlock()
-					_ = file.Close()
-					_ = root.Close()
-				})
-			}, nil
+			return lease, nil
 		}
 		remaining := deadline.Sub(s.now())
 		if remaining <= 0 {

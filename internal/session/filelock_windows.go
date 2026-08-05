@@ -54,3 +54,12 @@ func validateRegularFile(file *os.File) error {
 	}
 	return nil
 }
+
+func validateTrustedDirectory(info os.FileInfo) error {
+	// Windows user-profile ACLs, rather than Unix mode bits, define the
+	// supervisor-private state boundary. os.Root still rejects reparse traversal.
+	if info == nil {
+		return errors.New("directory identity is unavailable")
+	}
+	return nil
+}

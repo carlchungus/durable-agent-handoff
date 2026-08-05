@@ -1,7 +1,9 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -72,15 +74,15 @@ func TestLedgerEventAfterSnapshotRemainsVisible(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	message := Message{ID: "message-1", Sequence: 1, From: "human", Body: "after snapshot", State: MessageQueued, CreatedAt: now}
-	root, release, err := store.acquire(agent.ID)
+	lease, err := store.acquire(agent.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = store.appendLocked(root, agent.ID, Event{SessionID: agent.ID, Type: "message.queued", At: now, Data: message}); err != nil {
-		release()
+	if err = store.appendLocked(lease, agent.ID, Event{SessionID: agent.ID, Type: "message.queued", At: now, Data: message}); err != nil {
+		lease.release()
 		t.Fatal(err)
 	}
-	release()
+	lease.release()
 	loaded, err := store.Load(agent.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -296,6 +298,208 @@ func TestSessionIDsCannotEscapeStateDirectory(t *testing.T) {
 	}
 }
 
+func TestPreOpenIdentitySwapsAreRejected(t *testing.T) {
+	t.Run("store root", func(t *testing.T) {
+		base := t.TempDir()
+		state := filepath.Join(base, "state")
+		if err := os.Mkdir(state, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		store, _ := OpenStore(state)
+		var once sync.Once
+		store.safetyHooks.afterRootPrecheck = func() {
+			once.Do(func() {
+				if err := os.Rename(state, filepath.Join(base, "old-state")); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := os.Mkdir(state, 0o700); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		if _, err := store.openRoot(); err == nil {
+			t.Fatal("store root replacement between Lstat and open was accepted")
+		}
+	})
+
+	t.Run("session directory", func(t *testing.T) {
+		state := t.TempDir()
+		store, _ := OpenStore(state)
+		id := stableID("wf_swap_session", "lead")
+		sessionDir := filepath.Join(state, "sessions", id)
+		if err := os.Mkdir(sessionDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		oldDir := filepath.Join(state, "sessions", id+"-old")
+		var once sync.Once
+		store.safetyHooks.afterChildPrecheck = func(name string) {
+			if name != id {
+				return
+			}
+			once.Do(func() {
+				if err := os.Rename(sessionDir, oldDir); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := os.Mkdir(sessionDir, 0o700); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		if _, err := store.openSessionRoot(id, false); err == nil {
+			t.Fatal("session directory replacement between Lstat and open was accepted")
+		}
+	})
+
+	t.Run("storage file", func(t *testing.T) {
+		state := t.TempDir()
+		store, _ := OpenStore(state)
+		id := stableID("wf_swap_file", "lead")
+		sessionDir := filepath.Join(state, "sessions", id)
+		if err := os.Mkdir(sessionDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(sessionDir, ".write.lock")
+		oldPath := path + ".old"
+		if err := os.WriteFile(path, []byte("first"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		root, err := store.openSessionRoot(id, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		var once sync.Once
+		store.safetyHooks.afterFilePrecheck = func(name string) {
+			if name != ".write.lock" {
+				return
+			}
+			once.Do(func() {
+				if err := os.Rename(path, oldPath); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := os.WriteFile(path, []byte("second"), 0o600); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		if _, err = store.openRegular(root, ".write.lock", os.O_RDWR, 0); err == nil {
+			t.Fatal("file replacement between Lstat and open was accepted")
+		}
+		assertFileContent(t, oldPath, "first")
+		assertFileContent(t, path, "second")
+	})
+}
+
+func TestOpenStoreRejectsGroupWritableRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows uses profile ACLs rather than Unix mode bits")
+	}
+	state := t.TempDir()
+	if err := os.Chmod(state, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenStore(state); err == nil {
+		t.Fatal("OpenStore accepted a group-writable control-plane root")
+	}
+}
+
+func TestPostLockReplacementIsRejectedBeforeOwnerOrLedgerWrite(t *testing.T) {
+	state := t.TempDir()
+	store, _ := OpenStore(state)
+	id := stableID("wf_post_lock_swap", "lead")
+	sessionDir := filepath.Join(state, "sessions", id)
+	if err := os.Mkdir(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(sessionDir, ".write.lock")
+	retired := path + ".retired"
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var swapErr error
+	renameSucceeded := false
+	store.safetyHooks.afterLock = func() {
+		if swapErr = os.Rename(path, retired); swapErr != nil {
+			return
+		}
+		renameSucceeded = true
+		swapErr = os.WriteFile(path, []byte("replacement"), 0o600)
+	}
+	lease, err := store.acquire(id)
+	if !renameSucceeded {
+		if err != nil {
+			t.Fatalf("platform prevented replacement but acquire failed: swap=%v acquire=%v", swapErr, err)
+		}
+		lease.release()
+		return
+	}
+	if swapErr != nil {
+		t.Fatal(swapErr)
+	}
+	if err == nil {
+		lease.release()
+		t.Fatal("post-lock public-entry replacement was accepted")
+	}
+	assertFileContent(t, retired, "original")
+	assertFileContent(t, path, "replacement")
+	if _, err := os.Stat(filepath.Join(sessionDir, "events.jsonl")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ledger was created after lock identity drift: %v", err)
+	}
+}
+
+func TestLockDriftAtMutationBoundaryLeavesStateUnchanged(t *testing.T) {
+	state := t.TempDir()
+	store, _ := OpenStore(state)
+	agent, err := store.Ensure(Descriptor{WorkflowID: "wf_boundary_swap", NodeID: "lead"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionDir := filepath.Join(state, "sessions", agent.ID)
+	lockPath := filepath.Join(sessionDir, ".write.lock")
+	retired := lockPath + ".retired"
+	ledgerPath := filepath.Join(sessionDir, "events.jsonl")
+	statePath := filepath.Join(sessionDir, "state.json")
+	ledgerBefore, _ := os.ReadFile(ledgerPath)
+	stateBefore, _ := os.ReadFile(statePath)
+	var once sync.Once
+	var swapErr error
+	renameSucceeded := false
+	store.safetyHooks.beforeValidation = func(boundary string) {
+		if boundary != "ledger open" {
+			return
+		}
+		once.Do(func() {
+			if swapErr = os.Rename(lockPath, retired); swapErr != nil {
+				return
+			}
+			renameSucceeded = true
+			swapErr = os.WriteFile(lockPath, []byte("replacement"), 0o600)
+		})
+	}
+	_, err = store.Queue(agent.ID, "human", "must not append")
+	if !renameSucceeded {
+		if err != nil {
+			t.Fatalf("platform prevented replacement but queue failed: swap=%v queue=%v", swapErr, err)
+		}
+		return
+	}
+	if swapErr != nil {
+		t.Fatal(swapErr)
+	}
+	if err == nil {
+		t.Fatal("queue continued after lock drift")
+	}
+	assertFileContent(t, lockPath, "replacement")
+	ledgerAfter, _ := os.ReadFile(ledgerPath)
+	stateAfter, _ := os.ReadFile(statePath)
+	if !bytes.Equal(ledgerBefore, ledgerAfter) || !bytes.Equal(stateBefore, stateAfter) {
+		t.Fatal("session state changed after lock drift was detected")
+	}
+}
+
 func TestOpenStoreRejectsLinkedSessionsDirectory(t *testing.T) {
 	state := t.TempDir()
 	outside := t.TempDir()
@@ -320,7 +524,7 @@ func TestStoreRejectsLinkedSessionDirectory(t *testing.T) {
 	}
 	id := stableID("wf_linked_session", "lead")
 	requireSymlink(t, outside, filepath.Join(state, "sessions", id))
-	if _, _, err := store.acquire(id); err == nil {
+	if _, err := store.acquire(id); err == nil {
 		t.Fatal("acquire accepted a linked session directory")
 	}
 	assertFileContent(t, sentinel, "unchanged")
@@ -336,7 +540,7 @@ func TestStoreFilesCannotRedirectOutsideSessionDirectory(t *testing.T) {
 			name:     "lock",
 			filename: ".write.lock",
 			operate: func(_ *testing.T, store *Store, id string) error {
-				_, _, err := store.acquire(id)
+				_, err := store.acquire(id)
 				return err
 			},
 		},
@@ -433,7 +637,7 @@ func TestLockHardLinkCannotTruncateOutsideFile(t *testing.T) {
 	if err := os.Link(sentinel, filepath.Join(sessionDir, ".write.lock")); err != nil {
 		t.Skipf("hard links unavailable: %v", err)
 	}
-	if _, _, err := store.acquire(id); err == nil {
+	if _, err := store.acquire(id); err == nil {
 		t.Fatal("acquire accepted a multiply-linked lock file")
 	}
 	assertFileContent(t, sentinel, "unchanged")
@@ -457,7 +661,7 @@ func TestLockContentionTimesOutWithBoundedBackoff(t *testing.T) {
 		slept += delay
 		current = current.Add(delay)
 	}
-	if _, _, err := store.acquire(stableID("wf_timeout", "lead")); err == nil {
+	if _, err := store.acquire(stableID("wf_timeout", "lead")); err == nil {
 		t.Fatal("persistent contention did not return a timeout")
 	}
 	if attempts != 3 || sleeps != 3 || slept != 25*time.Millisecond {
@@ -472,19 +676,19 @@ func TestSeparateStoresContendOnStableKernelLock(t *testing.T) {
 	waiter.lockTimeout = 25 * time.Millisecond
 	waiter.lockRetry = time.Millisecond
 	id := stableID("wf_process_local", "lead")
-	_, release, err := owner.acquire(id)
+	ownerLease, err := owner.acquire(id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err = waiter.acquire(id); err == nil {
+	if _, err = waiter.acquire(id); err == nil {
 		t.Fatal("a separate Store acquired the same kernel lock")
 	}
-	release()
-	_, nextRelease, err := waiter.acquire(id)
+	ownerLease.release()
+	nextLease, err := waiter.acquire(id)
 	if err != nil {
 		t.Fatalf("released kernel lock was not reacquired: %v", err)
 	}
-	nextRelease()
+	nextLease.release()
 	ownerRecord := readLockOwner(t, filepath.Join(state, "sessions", id, ".write.lock"))
 	if ownerRecord.State != sessionLockReleased || ownerRecord.PID != os.Getpid() {
 		t.Fatalf("release metadata was not durable: %+v", ownerRecord)
@@ -512,13 +716,13 @@ func TestOldReleaseCannotAffectSuccessorLock(t *testing.T) {
 			observed:        observedContention,
 		}
 	}
-	_, oldRelease, err := first.acquire(id)
+	oldLease, err := first.acquire(id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	releaseDone := make(chan struct{})
 	go func() {
-		oldRelease()
+		oldLease.release()
 		close(releaseDone)
 	}()
 	<-beforeUnlock
@@ -527,7 +731,11 @@ func TestOldReleaseCannotAffectSuccessorLock(t *testing.T) {
 		err     error
 	}, 1)
 	go func() {
-		_, release, acquireErr := second.acquire(id)
+		lease, acquireErr := second.acquire(id)
+		var release func()
+		if lease != nil {
+			release = lease.release
+		}
 		successorResult <- struct {
 			release func()
 			err     error
@@ -542,7 +750,7 @@ func TestOldReleaseCannotAffectSuccessorLock(t *testing.T) {
 	}
 	path := filepath.Join(state, "sessions", id, ".write.lock")
 	before := readLockOwner(t, path)
-	oldRelease()
+	oldLease.release()
 	after := readLockOwner(t, path)
 	if before.LeaseID != after.LeaseID || after.State != sessionLockActive {
 		t.Fatalf("old release mutated successor: before=%+v after=%+v", before, after)
@@ -550,7 +758,7 @@ func TestOldReleaseCannotAffectSuccessorLock(t *testing.T) {
 	blocked, _ := OpenStore(state)
 	blocked.lockTimeout = 25 * time.Millisecond
 	blocked.lockRetry = time.Millisecond
-	if _, _, err = blocked.acquire(id); err == nil {
+	if _, err = blocked.acquire(id); err == nil {
 		t.Fatal("old release unlocked the successor's kernel lock")
 	}
 	successor.release()
@@ -590,8 +798,8 @@ func TestKernelLockReleasedWhenOwnerProcessExits(t *testing.T) {
 	store, _ := OpenStore(state)
 	store.lockTimeout = 25 * time.Millisecond
 	store.lockRetry = time.Millisecond
-	if _, unexpectedRelease, err := store.acquire(id); err == nil {
-		unexpectedRelease()
+	if unexpectedLease, err := store.acquire(id); err == nil {
+		unexpectedLease.release()
 		t.Fatal("parent acquired a lock held by a separate process")
 	}
 	if err := command.Process.Kill(); err != nil {
@@ -602,11 +810,11 @@ func TestKernelLockReleasedWhenOwnerProcessExits(t *testing.T) {
 	}
 	waited = true
 	store.lockTimeout = defaultLockTimeout
-	_, release, err := store.acquire(id)
+	lease, err := store.acquire(id)
 	if err != nil {
 		t.Fatalf("process exit did not release kernel lock: %v", err)
 	}
-	release()
+	lease.release()
 }
 
 func TestSessionLockCrashHelper(t *testing.T) {
@@ -617,11 +825,11 @@ func TestSessionLockCrashHelper(t *testing.T) {
 	if err != nil {
 		os.Exit(2)
 	}
-	_, release, err := store.acquire(os.Getenv("HANDOFF_SESSION_LOCK_ID"))
+	lease, err := store.acquire(os.Getenv("HANDOFF_SESSION_LOCK_ID"))
 	if err != nil {
 		os.Exit(3)
 	}
-	_ = release
+	_ = lease
 	if err = os.WriteFile(os.Getenv("HANDOFF_SESSION_LOCK_READY"), []byte("ready\n"), 0o600); err != nil {
 		os.Exit(4)
 	}

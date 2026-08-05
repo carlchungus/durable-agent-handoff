@@ -5,6 +5,7 @@ package session
 import (
 	"errors"
 	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -36,6 +37,23 @@ func validateRegularFile(file *os.File) error {
 	}
 	if info.Mode&unix.S_IFMT != unix.S_IFREG || info.Nlink != 1 {
 		return errors.New("file is not a single-link regular file")
+	}
+	return nil
+}
+
+func validateTrustedDirectory(info os.FileInfo) error {
+	if info == nil {
+		return errors.New("directory identity is unavailable")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("directory ownership is unavailable")
+	}
+	if int(stat.Uid) != os.Geteuid() {
+		return errors.New("directory is not owned by the supervisor user")
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return errors.New("directory is group- or world-writable")
 	}
 	return nil
 }

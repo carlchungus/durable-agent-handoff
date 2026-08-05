@@ -35,7 +35,7 @@ handoff doctor
 
 Release binaries for macOS, Linux, and Windows are attached to tagged GitHub releases. No Node or Python runtime is required. The coding harnesses you choose (`codex`, `claude`, `pi`, or `omp`) must already be installed and authenticated.
 
-State defaults to the OS user-config directory. Set `HANDOFF_HOME` to put it elsewhere.
+State defaults to the OS user-config directory. Set `HANDOFF_HOME` to put it elsewhere. Keep that directory supervisor-private and outside every worker-writable worktree or sandbox mount; do not point it into the repository being edited.
 
 ## Start a workflow
 

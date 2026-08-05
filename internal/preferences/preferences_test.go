@@ -56,7 +56,13 @@ func TestAllCandidatesCoolingReturnsWakeTime(t *testing.T) {
 }
 
 func TestFailureClassificationIsNarrow(t *testing.T) {
-	cases := map[string]string{"You've hit your usage limit": "usage_limit", "429 Too Many Requests": "rate_limit", "tests failed": "runtime_error", "invalid API key": "runtime_error"}
+	cases := map[string]string{
+		"You've hit your usage limit":                           "usage_limit",
+		"You've hit your session limit · resets 8:40am (local)": "usage_limit",
+		"429 Too Many Requests":                                 "rate_limit",
+		"tests failed":                                          "runtime_error",
+		"invalid API key":                                       "runtime_error",
+	}
 	for text, want := range cases {
 		if got := ClassifyFailure(text); got != want {
 			t.Errorf("%q => %s, want %s", text, got, want)

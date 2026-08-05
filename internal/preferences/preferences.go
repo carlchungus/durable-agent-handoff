@@ -153,7 +153,7 @@ func (m *Manager) Reset(key string) error {
 func Key(s core.RuntimeSpec) string { return s.Name + "/" + s.Model }
 func ClassifyFailure(text string) string {
 	v := strings.ToLower(text)
-	for _, p := range []string{"usage limit", "hit your limit", "quota exceeded", "insufficient_quota", "credit balance", "out of extra usage", "five-hour limit", "weekly limit", "monthly limit"} {
+	for _, p := range []string{"usage limit", "session limit", "hit your limit", "quota exceeded", "insufficient_quota", "credit balance", "out of extra usage", "five-hour limit", "weekly limit", "monthly limit"} {
 		if strings.Contains(v, p) {
 			return "usage_limit"
 		}

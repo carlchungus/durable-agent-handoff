@@ -257,6 +257,9 @@ func TestPreOpenIdentitySwapsFailClosed(t *testing.T) {
 }
 
 func TestPostLockReplacementFailsBeforeLedgerWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows denies renaming the open record directory; the replacement window does not exist")
+	}
 	ledger := testLedger(t)
 	record := filepath.Join(ledger.rootPath, "records", "rec_replace")
 	old := record + "-old"

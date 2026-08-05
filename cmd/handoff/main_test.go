@@ -148,7 +148,7 @@ func TestActivityCLIUsesTheDurableProjectionAndOutputCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	item, err := store.Create(activity.Descriptor{ID: "activity_abcdefabcdefabcdefabcdef", Launch: activity.LaunchSpec{Kind: "command", Argv: []string{"tool"}, Cwd: t.TempDir()}})
+	item, err := store.Create(activity.Descriptor{ID: "activity_abcdefabcdefabcdefabcdef", Work: activity.WorkSpec{Kind: "command", Cwd: t.TempDir(), Intent: "test command"}})
 	if err != nil {
 		t.Fatal(err)
 	}

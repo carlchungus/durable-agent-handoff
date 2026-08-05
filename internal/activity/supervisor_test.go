@@ -124,12 +124,9 @@ func TestActivitySupervisorCrashHelper(t *testing.T) {
 	}
 	supervisor := &Supervisor{Store: store, Env: []string{workerHelperEnv + "=1"}}
 	activity, attempt, err := supervisor.Start(Descriptor{
-		ID: "activity_1234567890abcdef12345678",
-		Launch: LaunchSpec{
-			Kind: "command",
-			Argv: []string{os.Args[0], "-test.run=^TestActivityWorkerHelper$"},
-			Cwd:  os.TempDir(),
-		},
+		ID:      "activity_1234567890abcdef12345678",
+		Work:    WorkSpec{Kind: "command", Cwd: os.TempDir(), Intent: "crash recovery test"},
+		Command: []string{os.Args[0], "-test.run=^TestActivityWorkerHelper$"},
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -160,5 +157,60 @@ func TestActivityWorkerHelper(t *testing.T) {
 	fmt.Fprint(os.Stdout, "one\n")
 	for {
 		time.Sleep(time.Hour)
+	}
+}
+
+func TestRecoverFailsPreparedAttemptInsteadOfLeavingStarting(t *testing.T) {
+	store, _ := OpenStore(t.TempDir())
+	created, _ := store.Create(Descriptor{ID: "activity_cccccccccccccccccccccccc", Work: WorkSpec{Kind: "agent", Cwd: t.TempDir(), Intent: "prepared crash"}})
+	_, stdout, stderr, err := store.PrepareAttempt(created.ID, created.Generation, AttemptStart{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stdout.Close()
+	_ = stderr.Close()
+	if _, err = (&Supervisor{Store: store}).Recover(); err != nil {
+		t.Fatal(err)
+	}
+	recovered, _ := store.Load(created.ID)
+	if recovered.State != StateFailed || recovered.Attempts[0].State != StateFailed {
+		t.Fatalf("recovered=%+v", recovered)
+	}
+}
+
+func TestRecoverDoesNotStealFromLiveForeignSupervisor(t *testing.T) {
+	store, _ := OpenStore(t.TempDir())
+	owner := exec.Command(os.Args[0], "-test.run=^TestActivityWorkerHelper$")
+	owner.Env = append(os.Environ(), workerHelperEnv+"=1")
+	ConfigureBackgroundProcess(owner)
+	if err := owner.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.Process.Kill(); _, _ = owner.Process.Wait() })
+	target := exec.Command(os.Args[0], "-test.run=^TestActivityWorkerHelper$")
+	target.Env = append(os.Environ(), workerHelperEnv+"=1")
+	ConfigureBackgroundProcess(target)
+	if err := target.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = target.Process.Kill(); _, _ = target.Process.Wait() })
+	ownerToken := waitForStartToken(owner.Process.Pid, 2*time.Second)
+	targetToken := waitForStartToken(target.Process.Pid, 2*time.Second)
+	created, _ := store.Create(Descriptor{ID: "activity_dddddddddddddddddddddddd", Work: WorkSpec{Kind: "agent", Cwd: t.TempDir(), Intent: "foreign owner"}})
+	attempt, stdout, stderr, _ := store.PrepareAttempt(created.ID, created.Generation, AttemptStart{})
+	_ = stdout.Close()
+	_ = stderr.Close()
+	foreignOwner := fmt.Sprintf("%d:%s", owner.Process.Pid, ownerToken)
+	_, err := store.MarkRunning(created.ID, created.Generation, attempt.ID, ProcessIdentity{PID: target.Process.Pid, ProcessStartToken: targetToken, SupervisorID: foreignOwner, SupervisorGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := (&Supervisor{Store: store}).Recover()
+	if err != nil || len(recovered) != 0 {
+		t.Fatalf("recovered=%+v err=%v", recovered, err)
+	}
+	after, _ := store.Load(created.ID)
+	if after.Generation != created.Generation || after.Attempts[0].SupervisorID != foreignOwner {
+		t.Fatalf("live foreign ownership changed: %+v", after)
 	}
 }

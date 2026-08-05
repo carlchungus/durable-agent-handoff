@@ -21,7 +21,7 @@ authority. A conversation can exist while no process is alive.
 An Activity is independently controllable work: an agent turn, background
 command, verifier, or monitor. It owns:
 
-- a stable harness ID and immutable launch specification;
+- a stable harness ID and immutable logical work specification;
 - its owner Session, selected runtime/model, and lifecycle event ledger;
 - durable stdout/stderr streams and terminal result; and
 - the ordered Attempts made to complete the work.
@@ -56,4 +56,3 @@ PID reuse, or old supervisor generation therefore cannot control newer work.
 The canonical ledgers reduce to one versioned projection. The human TUI,
 machine JSON/JSONL, RPC surface, and PR gates consume that same projection; no
 view scrapes processes or independently invents lifecycle state.
-

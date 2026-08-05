@@ -221,6 +221,19 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 		if n == nil || n.State != core.NodeRunning {
 			continue
 		}
+		activityID := activity.StableID(w.ID, n.ID, fmt.Sprint(n.Attempt))
+		tracked, activityErr := e.Activities.Load(activityID)
+		if activityErr == nil {
+			handled, reconcileErr := e.reconcileActivity(w, n, tracked)
+			if reconcileErr != nil {
+				return reconcileErr
+			}
+			if handled {
+				continue
+			}
+		} else if !errors.Is(activityErr, os.ErrNotExist) {
+			return activityErr
+		}
 		dir := filepath.Join(e.Store.Dir(), "workflows", w.ID, "runs", n.ID, fmt.Sprint(n.Attempt))
 		manifest, manifestErr := runstate.Load(filepath.Join(dir, "attempt.json"))
 		if manifestErr == nil && runstate.ProcessMatches(manifest) {
@@ -255,49 +268,92 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 		if sessionID == "" && manifestErr == nil {
 			sessionID = manifest.SessionID
 		}
-		state := core.NodeWaiting
-		summary := "supervisor lost the worker before a resumable session identity was persisted; human review is required before retrying"
-		if sessionID != "" {
-			state = core.NodeReady
-			summary = "worker process ended after supervisor interruption; resuming the exact persisted runtime session"
-		} else if manifestErr == nil && manifest.RestartSafe {
-			state = core.NodeReady
-			summary = "restart-safe worker ended after supervisor interruption; scheduling a fresh attempt"
-		}
-		deliveryAttempt := 0
-		if n.Kind == "agent" {
-			deliveryAttempt, err = e.dispatchedDeliveryAttempt(w.ID, n.ID)
-			if err != nil {
-				return err
-			}
-		}
-		mutations := []core.Mutation{{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("recovery-%s-%d", n.ID, n.Attempt), NodeID: n.ID, Kind: "recovery", Summary: summary}}}
-		if n.Kind == "agent" {
-			mutations = append(mutations, attemptOutcomeMutation(n, n.Attempt, deliveryAttempt, "runtime_failure", "requeue", summary))
-		}
-		mutations = append(mutations, core.Mutation{Op: "set_state", NodeID: n.ID, State: state})
-		if sessionID != "" && sessionID != n.SessionID {
-			mutations = append([]core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, mutations...)
-		}
-		_, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: mutations, Rationale: "reconcile interrupted runtime attempt"})
-		if err != nil || n.Kind != "agent" {
-			return err
-		}
-		agent, loadErr := e.Sessions.LoadByNode(w.ID, n.ID)
-		if errors.Is(loadErr, os.ErrNotExist) {
-			return nil
-		}
-		if loadErr != nil {
-			return loadErr
-		}
-		if deliveryAttempt > 0 {
-			if err = e.Sessions.Requeue(agent.ID, deliveryAttempt); err != nil {
-				return err
-			}
-		}
-		return e.Sessions.Observe(agent.ID, agentsession.Observation{LogicalState: logicalStateForNode(state), ProcessState: agentsession.ProcessExited})
+		restartSafe := manifestErr == nil && manifest.RestartSafe
+		return e.reconcileInterruptedAgent(w, n, sessionID, restartSafe)
 	}
 	return nil
+}
+
+// reconcileActivity makes the Activity ledger authoritative for all new agent
+// attempts. A legacy attempt.json is consulted only when no Activity exists.
+func (e *Engine) reconcileActivity(w *core.Workflow, n *core.Node, tracked *activity.Activity) (bool, error) {
+	if tracked.State == activity.StateRunning || tracked.State == activity.StateStopping {
+		return true, nil
+	}
+	if len(tracked.Attempts) == 0 {
+		return true, fmt.Errorf("activity %s has no attempt", tracked.ID)
+	}
+	attempt := tracked.Attempts[len(tracked.Attempts)-1]
+	dir := filepath.Join(e.Store.Dir(), "workflows", w.ID, "runs", n.ID, fmt.Sprint(n.Attempt))
+	stdout, _ := os.ReadFile(attempt.Stdout.Path)
+	b, readErr := os.ReadFile(filepath.Join(dir, "last-message.json"))
+	if readErr != nil || len(bytes.TrimSpace(b)) == 0 {
+		b = stdout
+	}
+	if result, parseErr := parseResult(b); parseErr == nil {
+		if tracked.State == activity.StateLost {
+			code := 0
+			identity := activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
+			if err := e.Activities.ResolveLost(tracked.ID, tracked.Generation, identity, activity.ExitResult{State: activity.StateCompleted, ExitCode: &code}); err != nil && !errors.Is(err, activity.ErrFenced) {
+				return true, err
+			}
+		}
+		return true, e.applyAgentResult(w, n, result, extractSessionID(stdout), n.Attempt)
+	}
+	stderr, _ := os.ReadFile(attempt.Stderr.Path)
+	if tracked.State == activity.StateFailed && e.routeAfterLimit(w, n, n.Attempt, 0, attempt.Error, string(stderr), string(stdout)) {
+		return true, nil
+	}
+	sessionID := n.SessionID
+	if sessionID == "" {
+		sessionID = extractSessionID(stdout)
+	}
+	return true, e.reconcileInterruptedAgent(w, n, sessionID, n.Metadata["restart_safe"] == "true")
+}
+
+func (e *Engine) reconcileInterruptedAgent(w *core.Workflow, n *core.Node, sessionID string, restartSafe bool) error {
+	state := core.NodeWaiting
+	summary := "supervisor lost the worker before a resumable session identity was persisted; human review is required before retrying"
+	if sessionID != "" {
+		state = core.NodeReady
+		summary = "worker process ended after supervisor interruption; resuming the exact persisted runtime session"
+	} else if restartSafe {
+		state = core.NodeReady
+		summary = "restart-safe worker ended after supervisor interruption; scheduling a fresh attempt"
+	}
+	deliveryAttempt := 0
+	var err error
+	if n.Kind == "agent" {
+		deliveryAttempt, err = e.dispatchedDeliveryAttempt(w.ID, n.ID)
+		if err != nil {
+			return err
+		}
+	}
+	mutations := []core.Mutation{{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("recovery-%s-%d", n.ID, n.Attempt), NodeID: n.ID, Kind: "recovery", Summary: summary}}}
+	if n.Kind == "agent" {
+		mutations = append(mutations, attemptOutcomeMutation(n, n.Attempt, deliveryAttempt, "runtime_failure", "requeue", summary))
+	}
+	mutations = append(mutations, core.Mutation{Op: "set_state", NodeID: n.ID, State: state})
+	if sessionID != "" && sessionID != n.SessionID {
+		mutations = append([]core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, mutations...)
+	}
+	_, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: mutations, Rationale: "reconcile interrupted runtime attempt"})
+	if err != nil || n.Kind != "agent" {
+		return err
+	}
+	agent, loadErr := e.Sessions.LoadByNode(w.ID, n.ID)
+	if errors.Is(loadErr, os.ErrNotExist) {
+		return nil
+	}
+	if loadErr != nil {
+		return loadErr
+	}
+	if deliveryAttempt > 0 {
+		if err = e.Sessions.Requeue(agent.ID, deliveryAttempt); err != nil {
+			return err
+		}
+	}
+	return e.Sessions.Observe(agent.ID, agentsession.Observation{LogicalState: logicalStateForNode(state), ProcessState: agentsession.ProcessExited})
 }
 
 func attemptOutcomesForNode(w *core.Workflow, nodeID string) []core.Evidence {
@@ -351,6 +407,39 @@ func (e *Engine) RecoverAttempt(id, nodeID string, attempt int) error {
 		return fmt.Errorf("attempt %d is outside recorded range 1..%d", attempt, n.Attempt)
 	}
 	dir := filepath.Join(e.Store.Dir(), "workflows", w.ID, "runs", n.ID, fmt.Sprint(attempt))
+	if e.Activities == nil {
+		e.Activities, err = activity.OpenStore(e.Store.Dir())
+		if err != nil {
+			return err
+		}
+	}
+	tracked, activityErr := e.Activities.Load(activity.StableID(w.ID, n.ID, fmt.Sprint(attempt)))
+	if activityErr == nil {
+		if len(tracked.Attempts) == 0 {
+			return fmt.Errorf("activity %s has no attempt", tracked.ID)
+		}
+		activityAttempt := tracked.Attempts[len(tracked.Attempts)-1]
+		b, readErr := os.ReadFile(filepath.Join(dir, "last-message.json"))
+		stdout, _ := os.ReadFile(activityAttempt.Stdout.Path)
+		if readErr != nil || len(bytes.TrimSpace(b)) == 0 {
+			b = stdout
+		}
+		result, parseErr := parseResult(b)
+		if parseErr != nil {
+			return parseErr
+		}
+		if tracked.State == activity.StateLost {
+			code := 0
+			identity := activity.AttemptIdentity{ID: activityAttempt.ID, PID: activityAttempt.PID, ProcessStartToken: activityAttempt.ProcessStartToken, SupervisorID: activityAttempt.SupervisorID, SupervisorGeneration: activityAttempt.SupervisorGeneration}
+			if err = e.Activities.ResolveLost(tracked.ID, tracked.Generation, identity, activity.ExitResult{State: activity.StateCompleted, ExitCode: &code}); err != nil && !errors.Is(err, activity.ErrFenced) {
+				return err
+			}
+		}
+		return e.applyAgentResult(w, n, result, extractSessionID(stdout), attempt)
+	}
+	if !errors.Is(activityErr, os.ErrNotExist) {
+		return activityErr
+	}
 	b, readErr := os.ReadFile(filepath.Join(dir, "last-message.json"))
 	if readErr != nil || len(bytes.TrimSpace(b)) == 0 {
 		manifest, _ := runstate.Load(filepath.Join(dir, "attempt.json"))
@@ -451,63 +540,45 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	activityRecord, err := e.Activities.Ensure(activity.Descriptor{
 		ID:             activityID,
 		OwnerSessionID: agent.ID,
-		Launch: activity.LaunchSpec{
-			Kind: "agent", Argv: []string{"agent-turn"}, Cwd: workdir(w, n),
+		Work: activity.WorkSpec{
+			Kind: "agent", Cwd: workdir(w, n), Intent: w.ID + "/" + n.ID,
 		},
 	})
 	if err != nil {
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
 	activityAttempt, stdout, stderr, err := e.Activities.PrepareAttempt(activityRecord.ID, activityRecord.Generation, activity.AttemptStart{
-		Runtime: n.Runtime.Name, Model: n.Runtime.Model, LaunchDigest: runstate.CommandDigest(c.Name, c.Args),
+		Runtime: n.Runtime.Name, Model: n.Runtime.Model, CommandDigest: runstate.CommandDigest(c.Name, c.Args),
 	})
 	if err != nil {
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
-	cmd := exec.CommandContext(ctx, c.Name, c.Args...)
-	cmd.Dir = workdir(w, n)
-	activity.ConfigureBackgroundProcess(cmd)
+	var stdin []byte
 	if c.PromptOnStdin {
-		cmd.Stdin = strings.NewReader(prompt)
+		stdin = []byte(prompt)
 	}
-	stdoutPath := activityAttempt.Stdout.Path
-	stderrPath := activityAttempt.Stderr.Path
-	recorder, err := runstate.Create(filepath.Join(dir, "attempt.json"), runstate.Manifest{
-		ID:                fmt.Sprintf("%s/%d", n.ID, n.Attempt+1),
-		WorkflowID:        w.ID,
-		NodeID:            n.ID,
-		Attempt:           n.Attempt + 1,
-		ActivityID:        activityRecord.ID,
-		ActivityAttemptID: activityAttempt.ID,
-		Runtime:           n.Runtime.Name,
-		Model:             n.Runtime.Model,
-		Effort:            n.Runtime.Effort,
-		SessionID:         n.SessionID,
-		CommandDigest:     runstate.CommandDigest(c.Name, c.Args),
-		Worktree:          workdir(w, n),
-		RestartSafe:       n.Metadata["restart_safe"] == "true",
-		StdoutPath:        stdoutPath,
-		StderrPath:        stderrPath,
-	})
+	gated, err := activity.PrepareGatedCommand(append([]string{c.Name}, c.Args...), workdir(w, n), nil, stdin)
 	if err != nil {
 		_ = stdout.Close()
 		_ = stderr.Close()
 		_ = e.Activities.FailPrepared(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, err.Error())
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
+	cmd := gated.Command
+	stdoutPath := activityAttempt.Stdout.Path
+	stderrPath := activityAttempt.Stderr.Path
 	defer stdout.Close()
 	defer stderr.Close()
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err = cmd.Start(); err != nil {
+		gated.Abort()
 		_ = e.Activities.FailPrepared(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, err.Error())
-		_ = recorder.Update(func(m *runstate.Manifest) {
-			m.Status, m.Error, m.FinishedAt = "failed", err.Error(), time.Now().UTC()
-		})
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
 	processToken := waitForProcessStartToken(cmd.Process.Pid, 2*time.Second)
 	if processToken == "" {
+		gated.Abort()
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		failure := "could not establish exact process start token"
@@ -516,50 +587,38 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	}
 	activityAttempt, err = e.Activities.MarkRunning(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, activity.ProcessIdentity{PID: cmd.Process.Pid, ProcessStartToken: processToken, SupervisorID: runstate.SupervisorIdentity(), SupervisorGeneration: 1})
 	if err != nil {
+		gated.Abort()
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
-	_ = e.Sessions.Observe(agent.ID, agentsession.Observation{ProcessState: agentsession.ProcessRunning})
-	_ = recorder.Update(func(m *runstate.Manifest) {
-		m.Status = "running"
-		m.PID = cmd.Process.Pid
-		m.ProcessStartToken = processToken
-	})
-	heartbeatStop := make(chan struct{})
-	heartbeatDone := make(chan struct{})
+	activityIdentity := activity.AttemptIdentity{ID: activityAttempt.ID, PID: activityAttempt.PID, ProcessStartToken: activityAttempt.ProcessStartToken, SupervisorID: activityAttempt.SupervisorID, SupervisorGeneration: activityAttempt.SupervisorGeneration}
+	gated.CompleteActivity(e.Activities.Root(), activityRecord.ID, activityRecord.Generation, activityIdentity)
+	if err = gated.Release(); err != nil {
+		_, _ = (&activity.Supervisor{Store: e.Activities}).StopExpected(activityRecord.ID, activity.ControlRequest{ExpectedGeneration: activityRecord.Generation, ExpectedAttempt: activityIdentity})
+		_ = cmd.Wait()
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", "release gated activity command: "+err.Error())
+	}
+	stopOnContext := make(chan struct{})
 	go func() {
-		defer close(heartbeatDone)
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-heartbeatStop:
-				return
-			case <-ticker.C:
-				_ = recorder.Update(func(m *runstate.Manifest) {
-					if info, statErr := os.Stat(stdoutPath); statErr == nil {
-						m.EventOffset = info.Size()
-					}
-				})
-			}
+		select {
+		case <-ctx.Done():
+			_, _ = (&activity.Supervisor{Store: e.Activities}).StopExpected(activityRecord.ID, activity.ControlRequest{ExpectedGeneration: activityRecord.Generation, ExpectedAttempt: activityIdentity})
+		case <-stopOnContext:
 		}
 	}()
+	_ = e.Sessions.Observe(agent.ID, agentsession.Observation{ProcessState: agentsession.ProcessRunning})
 	stopObserve := make(chan struct{})
 	observed := observeRuntimeEvents(stdoutPath, stopObserve, func(sessionID string) {
 		if sessionID == "" || sessionID == n.SessionID {
-			return
-		}
-		if updateErr := recorder.Update(func(m *runstate.Manifest) { m.SessionID = sessionID }); updateErr != nil {
 			return
 		}
 		_, _ = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, Rationale: "persist runtime session identity before the process exits"})
 		_ = e.Sessions.Observe(agent.ID, agentsession.Observation{RuntimeSessionID: sessionID})
 	})
 	err = cmd.Wait()
+	close(stopOnContext)
 	_ = e.Sessions.Observe(agent.ID, agentsession.Observation{ProcessState: agentsession.ProcessExited})
-	close(heartbeatStop)
-	<-heartbeatDone
 	close(stopObserve)
 	<-observed
 	_ = stdout.Sync()
@@ -576,35 +635,19 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	if cmd.ProcessState != nil {
 		activityExitCode = cmd.ProcessState.ExitCode()
 	}
-	finishActivityErr := e.Activities.FinishAttempt(activityRecord.ID, activityRecord.Generation, activity.AttemptIdentity{ID: activityAttempt.ID, PID: activityAttempt.PID, ProcessStartToken: activityAttempt.ProcessStartToken, SupervisorID: activityAttempt.SupervisorID, SupervisorGeneration: activityAttempt.SupervisorGeneration}, activity.ExitResult{State: activityState, ExitCode: &activityExitCode, Error: activityError})
+	finishActivityErr := e.Activities.FinishAttempt(activityRecord.ID, activityRecord.Generation, activityIdentity, activity.ExitResult{State: activityState, ExitCode: &activityExitCode, Error: activityError})
 	if errors.Is(finishActivityErr, activity.ErrFenced) {
-		return nil
+		if ctx.Err() != nil {
+			return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", "runtime deadline exceeded: "+ctx.Err().Error())
+		}
+		current, loadErr := e.Activities.Load(activityRecord.ID)
+		if loadErr != nil || (current.State != activity.StateCompleted && current.State != activity.StateFailed) {
+			return nil
+		}
+		finishActivityErr = nil
 	}
 	if finishActivityErr != nil {
 		return finishActivityErr
-	}
-	finalRecordErr := recorder.Update(func(m *runstate.Manifest) {
-		m.FinishedAt = time.Now().UTC()
-		m.EventOffset = int64(len(stdoutBytes))
-		code := 0
-		if err != nil {
-			m.Status, m.Error = "failed", err.Error()
-			code = -1
-			if cmd.ProcessState != nil {
-				code = cmd.ProcessState.ExitCode()
-			}
-		} else {
-			m.Status = "completed"
-		}
-		m.ExitCode = &code
-	})
-	if errors.Is(finalRecordErr, runstate.ErrFenced) {
-		// A newer supervisor owns reduction. Leaving the node running lets that
-		// owner observe the completed durable output and apply it exactly once.
-		return nil
-	}
-	if finalRecordErr != nil {
-		return finalRecordErr
 	}
 	if err != nil {
 		failure := fmt.Sprintf("runtime failed: %v: %s %s", err, truncate(string(stderrBytes), 1000), truncate(string(stdoutBytes), 1000))

@@ -88,7 +88,7 @@ new Attempt.
 ## Minimal implementation slice
 
 1. Add a separate Activity store and reducer; do not extend `session.Session`.
-2. Persist immutable launch spec, Attempts, output identities, and monotonic
+2. Persist immutable logical work specs, per-Attempt command digests, output identities, and monotonic
    event sequence.
 3. Expose `activity list`, `activity read`, `activity follow`, and
    generation-fenced `activity stop` from the same projection.
@@ -103,4 +103,3 @@ Substantial copied Pi or Oh My Pi code must retain their MIT notices. Derived
 Codex code must satisfy Apache-2.0 and NOTICE obligations and mark changes. The
 current plan is independent Go implementation of public contracts and concepts,
 with this attribution document as design provenance.
-

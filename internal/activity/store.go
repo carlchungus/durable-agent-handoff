@@ -20,7 +20,10 @@ var activityIdentifier = regexp.MustCompile(`^activity_[a-f0-9]{24}$`)
 
 var ErrFenced = errors.New("activity control was fenced by newer state")
 
-type Store struct{ ledger *secureledger.Ledger }
+type Store struct {
+	ledger *secureledger.Ledger
+	root   string
+}
 
 func OpenStore(root string) (*Store, error) {
 	ledger, err := secureledger.Open(root, secureledger.Options{
@@ -35,12 +38,14 @@ func OpenStore(root string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{ledger: ledger}, nil
+	return &Store{ledger: ledger, root: root}, nil
 }
 
+func (s *Store) Root() string { return s.root }
+
 func (s *Store) Create(descriptor Descriptor) (*Activity, error) {
-	if strings.TrimSpace(descriptor.Launch.Kind) == "" || len(descriptor.Launch.Argv) == 0 || strings.TrimSpace(descriptor.Launch.Argv[0]) == "" {
-		return nil, errors.New("activity launch kind and argv are required")
+	if strings.TrimSpace(descriptor.Work.Kind) == "" {
+		return nil, errors.New("activity work kind is required")
 	}
 	id := descriptor.ID
 	if id == "" {
@@ -50,8 +55,8 @@ func (s *Store) Create(descriptor Descriptor) (*Activity, error) {
 			return nil, err
 		}
 	}
-	launch := cloneLaunch(descriptor.Launch)
-	digest, err := launchDigest(launch)
+	work := descriptor.Work
+	digest, err := workDigest(work)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +68,7 @@ func (s *Store) Create(descriptor Descriptor) (*Activity, error) {
 			return loadErr
 		}
 		now := time.Now().UTC()
-		activity := &Activity{Version: Version, ID: id, OwnerSessionID: descriptor.OwnerSessionID, Launch: launch, LaunchDigest: digest, State: StatePending, Generation: 1, Revision: 1, CreatedAt: now, UpdatedAt: now}
+		activity := &Activity{Version: Version, ID: id, OwnerSessionID: descriptor.OwnerSessionID, Work: work, WorkDigest: digest, State: StatePending, Generation: 1, Revision: 1, CreatedAt: now, UpdatedAt: now}
 		if err := appendEvent(tx, Event{ActivityID: id, Type: "activity.created", At: now, Data: activity}); err != nil {
 			return err
 		}
@@ -87,12 +92,12 @@ func (s *Store) Ensure(descriptor Descriptor) (*Activity, error) {
 	if err != nil {
 		return nil, err
 	}
-	digest, err := launchDigest(cloneLaunch(descriptor.Launch))
+	digest, err := workDigest(descriptor.Work)
 	if err != nil {
 		return nil, err
 	}
-	if existing.OwnerSessionID != descriptor.OwnerSessionID || existing.LaunchDigest != digest {
-		return nil, fmt.Errorf("activity %s immutable launch does not match", descriptor.ID)
+	if existing.OwnerSessionID != descriptor.OwnerSessionID || existing.WorkDigest != digest {
+		return nil, fmt.Errorf("activity %s immutable work definition does not match", descriptor.ID)
 	}
 	return existing, nil
 }
@@ -131,7 +136,7 @@ func (s *Store) PrepareAttempt(id string, expectedGeneration uint64, start Attem
 		}
 		now := time.Now().UTC()
 		attempt = Attempt{
-			ID: attemptID, Ordinal: ordinal, Runtime: start.Runtime, Model: start.Model, LaunchDigest: start.LaunchDigest,
+			ID: attemptID, Ordinal: ordinal, Runtime: start.Runtime, Model: start.Model, CommandDigest: start.CommandDigest,
 			State: StateStarting, StartedAt: now,
 			Stdout: outputRef(id, attemptID, StreamStdout, stdoutName, stdoutPath),
 			Stderr: outputRef(id, attemptID, StreamStderr, stderrName, stderrPath),
@@ -211,7 +216,7 @@ func (s *Store) AdoptAttempt(id string, expectedGeneration uint64, expected Atte
 			return err
 		}
 		current, ok := currentAttempt(activity)
-		if !ok || activity.State != StateRunning || activity.Generation != expectedGeneration || !sameIdentity(current, expected) {
+		if !ok || (activity.State != StateRunning && activity.State != StateStopping) || activity.Generation != expectedGeneration || !sameIdentity(current, expected) {
 			return ErrFenced
 		}
 		now := time.Now().UTC()
@@ -286,6 +291,29 @@ func (s *Store) FinishAttempt(id string, expectedGeneration uint64, identity Att
 		now := time.Now().UTC()
 		data := finishEvent{Identity: identity, Result: result}
 		if err = appendEvent(tx, Event{ActivityID: id, Type: "attempt.finished", At: now, Data: data}); err != nil {
+			return err
+		}
+		applyFinish(activity, data, now)
+		return snapshot(tx, activity)
+	})
+}
+
+func (s *Store) ResolveLost(id string, expectedGeneration uint64, identity AttemptIdentity, result ExitResult) error {
+	if result.State != StateCompleted && result.State != StateFailed {
+		return fmt.Errorf("lost attempt can only resolve to completed or failed, got %q", result.State)
+	}
+	return s.ledger.Update(id, func(tx *secureledger.Txn) error {
+		activity, err := replay(tx.Replay)
+		if err != nil {
+			return err
+		}
+		current, ok := currentAttempt(activity)
+		if !ok || activity.State != StateLost || current.State != StateLost || activity.Generation != expectedGeneration || !sameIdentity(current, identity) {
+			return ErrFenced
+		}
+		now := time.Now().UTC()
+		data := finishEvent{Identity: identity, Result: result}
+		if err = appendEvent(tx, Event{ActivityID: id, Type: "attempt.loss_resolved", At: now, Data: data}); err != nil {
 			return err
 		}
 		applyFinish(activity, data, now)
@@ -426,7 +454,7 @@ func replay(run replayFn) (*Activity, error) {
 			}
 			activity.Revision = event.Sequence
 			activity.UpdatedAt = event.At
-		case "attempt.finished":
+		case "attempt.finished", "attempt.loss_resolved":
 			if activity == nil {
 				return errors.New("finish preceded activity creation")
 			}
@@ -498,8 +526,13 @@ func applyFinish(activity *Activity, data finishEvent, at time.Time) {
 	}
 	for i := range activity.Controls {
 		if activity.Controls[i].Outcome == ControlAccepted && activity.Controls[i].ExpectedAttempt.ID == data.Identity.ID {
-			activity.Controls[i].Outcome = ControlApplied
-			activity.Controls[i].AppliedAt = at
+			if data.Result.State == StateStopped {
+				activity.Controls[i].Outcome = ControlApplied
+				activity.Controls[i].AppliedAt = at
+			} else {
+				activity.Controls[i].Outcome = ControlRejected
+				activity.Controls[i].Reason = "attempt finished before stop was applied"
+			}
 		}
 	}
 	activity.State = data.Result.State
@@ -596,7 +629,7 @@ func outputRef(activityID, attemptID string, stream Stream, fileName, path strin
 	return OutputRef{ID: "output_" + hex.EncodeToString(sum[:12]), Stream: stream, FileName: fileName, Path: path}
 }
 
-func launchDigest(spec LaunchSpec) (string, error) {
+func workDigest(spec WorkSpec) (string, error) {
 	raw, err := json.Marshal(spec)
 	if err != nil {
 		return "", err
@@ -618,14 +651,8 @@ func StableID(parts ...string) string {
 	return "activity_" + hex.EncodeToString(sum[:12])
 }
 
-func cloneLaunch(launch LaunchSpec) LaunchSpec {
-	launch.Argv = append([]string(nil), launch.Argv...)
-	return launch
-}
-
 func cloneActivity(activity *Activity) *Activity {
 	copy := *activity
-	copy.Launch = cloneLaunch(activity.Launch)
 	copy.Attempts = append([]Attempt(nil), activity.Attempts...)
 	copy.Controls = append([]ControlIntent(nil), activity.Controls...)
 	return &copy

@@ -121,7 +121,7 @@ func cmdActivity(args []string, out io.Writer) error {
 		table := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(table, "ACTIVITY\tSTATE\tGEN\tREV\tATTEMPTS\tOWNER\tCOMMAND")
 		for _, item := range activities {
-			fmt.Fprintf(table, "%s\t%s\t%d\t%d\t%d\t%s\t%s\n", item.ID, item.State, item.Generation, item.Revision, len(item.Attempts), item.OwnerSessionID, strings.Join(item.Launch.Argv, " "))
+			fmt.Fprintf(table, "%s\t%s\t%d\t%d\t%d\t%s\t%s\n", item.ID, item.State, item.Generation, item.Revision, len(item.Attempts), item.OwnerSessionID, item.Work.Kind)
 		}
 		return table.Flush()
 	case "read":
@@ -146,7 +146,10 @@ func cmdActivity(args []string, out io.Writer) error {
 			return writeJSON(out, item)
 		}
 		fmt.Fprintf(out, "%s  %s  generation=%d revision=%d\n", item.ID, item.State, item.Generation, item.Revision)
-		fmt.Fprintf(out, "command: %s\n", strings.Join(item.Launch.Argv, " "))
+		fmt.Fprintf(out, "work: %s\n", item.Work.Kind)
+		if item.Work.Intent != "" {
+			fmt.Fprintf(out, "intent: %s\n", item.Work.Intent)
+		}
 		for _, attempt := range item.Attempts {
 			fmt.Fprintf(out, "%s  %s  pid=%d supervisor=%s generation=%d\n", attempt.ID, attempt.State, attempt.PID, attempt.SupervisorID, attempt.SupervisorGeneration)
 			fmt.Fprintf(out, "  stdout: %s  %s\n  stderr: %s  %s\n", attempt.Stdout.ID, attempt.Stdout.Path, attempt.Stderr.ID, attempt.Stderr.Path)

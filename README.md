@@ -40,14 +40,14 @@ For example, install the Apple Silicon archive with the GitHub CLI:
 ```sh
 gh release download v0.4.0 \
   --repo carlchungus/durable-agent-handoff \
-  --pattern 'handoff_Darwin_arm64.tar.gz'
-tar -xzf handoff_Darwin_arm64.tar.gz
+  --pattern 'durable-agent-handoff_0.4.0_darwin_arm64.tar.gz'
+tar -xzf durable-agent-handoff_0.4.0_darwin_arm64.tar.gz
 mkdir -p "$HOME/.local/bin"
 install -m 0755 handoff "$HOME/.local/bin/handoff"
 "$HOME/.local/bin/handoff" doctor
 ```
 
-Use `handoff_Linux_amd64.tar.gz`, `handoff_Linux_arm64.tar.gz`, `handoff_Darwin_amd64.tar.gz`, or the corresponding Windows zip for other platforms. Verify downloads against the release's `checksums.txt` before installation.
+Use the corresponding versioned `durable-agent-handoff_0.4.0_<os>_<arch>` archive for other platforms. GoReleaser uses lowercase OS names (`darwin`, `linux`, `windows`). Verify downloads against the release's `checksums.txt` before installation.
 
 State defaults to the OS user-config directory. Set `HANDOFF_HOME` to put it elsewhere. Keep that directory supervisor-private and outside every worker-writable worktree or sandbox mount; do not point it into the repository being edited.
 
@@ -102,7 +102,7 @@ Fallback changes execution capacity, never authority: sandbox selection takes th
 
 ## Observe and control background work
 
-Activities are the process-lifecycle side of agent Sessions. They retain each runtime attempt, exact process identity, and stdout/stderr even when the scheduler dies.
+Activities are the process-lifecycle side of agent Sessions. They retain each runtime attempt, exact process identity, and stdout/stderr even when the scheduler dies. A gated runner prevents the target from executing until that identity is durable, then records its fenced completion before exiting; new agent turns do not maintain a competing process manifest.
 
 ```sh
 handoff activity list --json

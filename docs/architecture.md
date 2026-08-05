@@ -51,8 +51,6 @@ $HANDOFF_HOME/workflows/WF_ID/
   events.jsonl
   state.json
   runs/NODE_ID/ATTEMPT/
-    events.jsonl
-    stderr.log
     last-message.json
     result.schema.json
 ```
@@ -90,6 +88,16 @@ Attempt process identity (attempt ID, PID plus platform start token, supervisor
 ID, and supervisor generation). A live process is adopted once per supervisor
 incarnation; routine reconciliation by the same owner does not churn fencing
 tokens. Stale controllers and PID reuse fail closed.
+
+Every new Attempt starts through a tiny gated runner. The runner establishes a
+dedicated process tree, but cannot execute the target until the supervisor has
+fsynced the exact PID, birth token, owner, and generation to the Activity
+ledger. Supervisor death before that release closes the inherited gate and the
+target never starts. After release, the runner waits for the target and writes
+its exact completion back through the same fenced Activity transaction before
+exiting. Recovery can therefore adopt a live runner or replay its terminal
+record without a second process-authority file. `attempt.json` is read only as
+legacy compatibility for pre-v0.4 workflows.
 
 The ledger reducer produces the sole Activity projection used by human TUI,
 JSON/JSONL, RPC, and policy. A combined snapshot-and-subscribe operation orders

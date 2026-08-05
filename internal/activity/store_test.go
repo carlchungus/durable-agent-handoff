@@ -16,12 +16,12 @@ func TestActivityAttemptOutputAndFencedStopSurviveSnapshotLoss(t *testing.T) {
 	created, err := store.Create(Descriptor{
 		ID:             "activity_0123456789abcdef01234567",
 		OwnerSessionID: "agent_0123456789abcdef01234567",
-		Launch:         LaunchSpec{Kind: "command", Argv: []string{"tool", "--flag"}, Cwd: "/tmp/work"},
+		Work:           WorkSpec{Kind: "command", Cwd: "/tmp/work", Intent: "test tool"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.State != StatePending || created.Generation != 1 || created.Revision != 1 || created.LaunchDigest == "" {
+	if created.State != StatePending || created.Generation != 1 || created.Revision != 1 || created.WorkDigest == "" {
 		t.Fatalf("created=%+v", created)
 	}
 
@@ -76,14 +76,14 @@ func TestActivityAttemptOutputAndFencedStopSurviveSnapshotLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replayed.State != StateStopped || replayed.Revision != 6 || !replayed.Attempts[0].Stdout.Closed || replayed.Launch.Argv[0] != "tool" {
+	if replayed.State != StateStopped || replayed.Revision != 6 || !replayed.Attempts[0].Stdout.Closed || replayed.Work.Intent != "test tool" {
 		t.Fatalf("replayed=%+v", replayed)
 	}
 }
 
-func TestActivityLaunchIsImmutableAndOutputIdentityIsExact(t *testing.T) {
+func TestActivityWorkIsImmutableAndOutputIdentityIsExact(t *testing.T) {
 	store, _ := OpenStore(t.TempDir())
-	created, _ := store.Create(Descriptor{ID: "activity_aaaaaaaaaaaaaaaaaaaaaaaa", Launch: LaunchSpec{Kind: "command", Argv: []string{"first"}, Cwd: "/tmp"}})
+	created, _ := store.Create(Descriptor{ID: "activity_aaaaaaaaaaaaaaaaaaaaaaaa", Work: WorkSpec{Kind: "command", Cwd: "/tmp", Intent: "first"}})
 	attempt, stdout, stderr, err := store.PrepareAttempt(created.ID, created.Generation, AttemptStart{})
 	if err != nil {
 		t.Fatal(err)
@@ -98,27 +98,77 @@ func TestActivityLaunchIsImmutableAndOutputIdentityIsExact(t *testing.T) {
 		t.Fatal("accepted the wrong output identity")
 	}
 	loaded, _ := store.Load(created.ID)
-	loaded.Launch.Argv[0] = "mutated"
+	loaded.Work.Intent = "mutated"
 	again, _ := store.Load(created.ID)
-	if again.Launch.Argv[0] != "first" {
-		t.Fatalf("caller mutated durable launch: %+v", again.Launch)
+	if again.Work.Intent != "first" {
+		t.Fatalf("caller mutated durable work definition: %+v", again.Work)
 	}
 }
 
-func TestEnsureReusesOnlyTheExactImmutableLaunch(t *testing.T) {
+func TestEnsureReusesOnlyTheExactImmutableWork(t *testing.T) {
 	store, _ := OpenStore(t.TempDir())
-	descriptor := Descriptor{ID: StableID("wf", "node", "1"), OwnerSessionID: "agent_owner", Launch: LaunchSpec{Kind: "agent", Argv: []string{"codex", "exec"}, Cwd: "/tmp", Runtime: "codex", Model: "sol"}}
+	descriptor := Descriptor{ID: StableID("wf", "node", "1"), OwnerSessionID: "agent_owner", Work: WorkSpec{Kind: "agent", Cwd: "/tmp", Intent: "wf/node"}}
 	first, err := store.Ensure(descriptor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	again, err := store.Ensure(descriptor)
-	if err != nil || again.ID != first.ID || again.LaunchDigest != first.LaunchDigest {
+	if err != nil || again.ID != first.ID || again.WorkDigest != first.WorkDigest {
 		t.Fatalf("again=%+v err=%v", again, err)
 	}
-	descriptor.Launch.Model = "other"
+	descriptor.Work.Intent = "other"
 	if _, err = store.Ensure(descriptor); err == nil {
-		t.Fatal("ensure accepted a changed immutable launch")
+		t.Fatal("ensure accepted a changed immutable work definition")
+	}
+}
+
+func TestResolveLostIsExactFencedAndReplayable(t *testing.T) {
+	root := t.TempDir()
+	store, _ := OpenStore(root)
+	created, _ := store.Create(Descriptor{ID: "activity_bbbbbbbbbbbbbbbbbbbbbbbb", Work: WorkSpec{Kind: "agent", Cwd: "/tmp", Intent: "resolve output"}})
+	attempt, stdout, stderr, _ := store.PrepareAttempt(created.ID, created.Generation, AttemptStart{CommandDigest: "digest"})
+	_ = stdout.Close()
+	_ = stderr.Close()
+	attempt, _ = store.MarkRunning(created.ID, created.Generation, attempt.ID, ProcessIdentity{PID: 9001, ProcessStartToken: "birth", SupervisorID: "owner", SupervisorGeneration: 1})
+	identity := identity(attempt)
+	if err := store.FinishAttempt(created.ID, created.Generation, identity, ExitResult{State: StateLost, Error: "supervisor died"}); err != nil {
+		t.Fatal(err)
+	}
+	stale := identity
+	stale.SupervisorGeneration++
+	if err := store.ResolveLost(created.ID, created.Generation, stale, ExitResult{State: StateCompleted}); !errors.Is(err, ErrFenced) {
+		t.Fatalf("stale resolution err=%v", err)
+	}
+	code := 0
+	if err := store.ResolveLost(created.ID, created.Generation, identity, ExitResult{State: StateCompleted, ExitCode: &code}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "activities", created.ID, "state.json")); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := store.Load(created.ID)
+	if err != nil || replayed.State != StateCompleted || replayed.Attempts[0].State != StateCompleted {
+		t.Fatalf("replayed=%+v err=%v", replayed, err)
+	}
+}
+
+func TestNaturalCompletionRacingStopDoesNotClaimControlApplied(t *testing.T) {
+	store, _ := OpenStore(t.TempDir())
+	created, _ := store.Create(Descriptor{ID: "activity_ffffffffffffffffffffffff", Work: WorkSpec{Kind: "command", Cwd: "/tmp", Intent: "stop race"}})
+	attempt, stdout, stderr, _ := store.PrepareAttempt(created.ID, created.Generation, AttemptStart{})
+	_ = stdout.Close()
+	_ = stderr.Close()
+	attempt, _ = store.MarkRunning(created.ID, created.Generation, attempt.ID, ProcessIdentity{PID: 42, ProcessStartToken: "birth", SupervisorID: "owner", SupervisorGeneration: 1})
+	_, stopping, err := store.RequestStop(created.ID, ControlRequest{ExpectedGeneration: created.Generation, ExpectedAttempt: identity(attempt)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.FinishAttempt(created.ID, stopping.Generation, identity(attempt), ExitResult{State: StateCompleted}); err != nil {
+		t.Fatal(err)
+	}
+	finished, _ := store.Load(created.ID)
+	if finished.State != StateCompleted || finished.Controls[0].Outcome != ControlRejected || finished.Controls[0].Reason == "" {
+		t.Fatalf("finished=%+v", finished)
 	}
 }
 

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 )
@@ -36,9 +35,6 @@ func TestRecorderPersistsAtomicUpdates(t *testing.T) {
 }
 
 func TestProcessMatchesUsesStartToken(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows process liveness uses the service manager")
-	}
 	pid := os.Getpid()
 	token := ProcessStartToken(pid)
 	if token == "" {
@@ -49,6 +45,16 @@ func TestProcessMatchesUsesStartToken(t *testing.T) {
 	}
 	if ProcessMatches(Manifest{PID: pid, ProcessStartToken: token + " stale"}) {
 		t.Fatal("PID reuse guard accepted a stale token")
+	}
+}
+
+func TestSupervisorIdentityMatchesOnlyExactLiveProcess(t *testing.T) {
+	identity := SupervisorIdentity()
+	if !SupervisorMatches(identity) {
+		t.Fatalf("current supervisor identity did not match: %q", identity)
+	}
+	if SupervisorMatches(identity + " stale") {
+		t.Fatal("stale supervisor identity matched")
 	}
 }
 

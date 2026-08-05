@@ -293,9 +293,8 @@ func (tx *Txn) ReplaceSnapshot(data []byte) error {
 	if err = validateRegularIdentity(tx.root, "state.json", tmpIdentity); err != nil {
 		return fmt.Errorf("secure ledger snapshot identity changed during rename: %w", err)
 	}
-	if directory, openErr := tx.root.Open("."); openErr == nil {
-		_ = directory.Sync()
-		_ = directory.Close()
+	if err = syncRoot(tx.root); err != nil {
+		return fmt.Errorf("sync secure ledger directory after snapshot rename: %w", err)
 	}
 	return nil
 }
@@ -439,9 +438,17 @@ func (l *Ledger) openRecordRoot(id string, create bool) (*os.Root, error) {
 }
 
 func (l *Ledger) openChildRoot(parent *os.Root, name string, create bool) (*os.Root, error) {
+	created := false
 	if create {
-		if err := parent.Mkdir(name, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		if err := parent.Mkdir(name, 0o700); err == nil {
+			created = true
+		} else if !errors.Is(err, os.ErrExist) {
 			return nil, err
+		}
+	}
+	if created {
+		if err := syncRoot(parent); err != nil {
+			return nil, fmt.Errorf("sync secure ledger parent after creating %q: %w", name, err)
 		}
 	}
 	before, err := parent.Lstat(name)
@@ -579,7 +586,22 @@ func (l *Ledger) openRegular(root *os.Root, name string, flag int, perm os.FileM
 		}
 		return nil, fmt.Errorf("secure ledger file %q changed while opening", name)
 	}
+	if !existed {
+		if err = syncRoot(root); err != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("sync secure ledger directory after creating %q: %w", name, err)
+		}
+	}
 	return file, nil
+}
+
+func syncRoot(root *os.Root) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func (l *Ledger) acquire(id string) (*Txn, error) {

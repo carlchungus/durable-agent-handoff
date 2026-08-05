@@ -7,9 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -180,6 +180,18 @@ func SupervisorIdentity() string {
 	return supervisorIdentity
 }
 
+func SupervisorMatches(identity string) bool {
+	separator := strings.IndexByte(identity, ':')
+	if separator <= 0 || separator == len(identity)-1 {
+		return false
+	}
+	pid, err := strconv.Atoi(identity[:separator])
+	if err != nil {
+		return false
+	}
+	return ProcessMatches(Manifest{PID: pid, ProcessStartToken: identity[separator+1:]})
+}
+
 // ClaimSupervisor adopts an attempt after the prior lease expires. The
 // generation is a fencing token: recorders from older owners can no longer
 // overwrite the manifest after this call succeeds.
@@ -283,8 +295,7 @@ func ProcessMatches(manifest Manifest) bool {
 		return false
 	}
 	if runtime.GOOS == "windows" {
-		out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", manifest.PID), "/FO", "CSV", "/NH").Output()
-		return err == nil && strings.Contains(string(out), fmt.Sprintf("\",\"%d\",", manifest.PID))
+		return manifest.ProcessStartToken != "" && ProcessStartToken(manifest.PID) == manifest.ProcessStartToken
 	}
 	process, err := os.FindProcess(manifest.PID)
 	if err != nil {

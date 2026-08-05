@@ -22,7 +22,7 @@ Read `../../docs/claude-workflows-compatibility.md` before changing these semant
 ## Keep durable identities separate
 
 - A **Session** owns conversation identity, lineage, inbox, workspace, and the exact native runtime resume handle. It never owns a PID or output pipe.
-- An **Activity** owns independently controllable work, its immutable launch specification, durable output, lifecycle ledger, and ordered Attempts.
+- An **Activity** owns independently controllable work, its immutable logical work specification, durable output, lifecycle ledger, and ordered Attempts. Exact command digests belong to Attempts; command arguments are not persisted because they can contain prompts or credentials.
 - An **Attempt** is one immutable process execution with runtime/model, PID plus start token, supervisor generation, output identities, and terminal result.
 - An **Attachment** is only an ephemeral reader at an output identity, byte cursor, and snapshot revision. Disconnecting it must not stop work.
 - A stop, signal, adopt, or restart is a durable control intent fenced by Activity generation and exact Attempt identity. PID-only control fails closed.

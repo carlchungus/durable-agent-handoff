@@ -24,18 +24,21 @@ const (
 	StreamStderr Stream = "stderr"
 )
 
-type LaunchSpec struct {
-	Kind    string   `json:"kind"`
-	Argv    []string `json:"argv"`
-	Cwd     string   `json:"cwd"`
-	Runtime string   `json:"runtime,omitempty"`
-	Model   string   `json:"model,omitempty"`
+type WorkSpec struct {
+	Kind   string `json:"kind"`
+	Cwd    string `json:"cwd"`
+	Intent string `json:"intent,omitempty"`
 }
 
 type Descriptor struct {
 	ID             string
 	OwnerSessionID string
-	Launch         LaunchSpec
+	Work           WorkSpec
+	// Command is transient execution data. It is intentionally excluded from
+	// durable state because argv can contain prompts or credentials.
+	Command []string
+	Runtime string
+	Model   string
 }
 
 type OutputRef struct {
@@ -51,7 +54,7 @@ type Attempt struct {
 	Ordinal              int       `json:"ordinal"`
 	Runtime              string    `json:"runtime,omitempty"`
 	Model                string    `json:"model,omitempty"`
-	LaunchDigest         string    `json:"launch_digest,omitempty"`
+	CommandDigest        string    `json:"command_digest,omitempty"`
 	PID                  int       `json:"pid"`
 	ProcessStartToken    string    `json:"process_start_token"`
 	SupervisorID         string    `json:"supervisor_id"`
@@ -66,9 +69,9 @@ type Attempt struct {
 }
 
 type AttemptStart struct {
-	Runtime      string
-	Model        string
-	LaunchDigest string
+	Runtime       string
+	Model         string
+	CommandDigest string
 }
 
 type ProcessIdentity struct {
@@ -120,8 +123,8 @@ type Activity struct {
 	Version        int             `json:"version"`
 	ID             string          `json:"id"`
 	OwnerSessionID string          `json:"owner_session_id,omitempty"`
-	Launch         LaunchSpec      `json:"launch"`
-	LaunchDigest   string          `json:"launch_digest"`
+	Work           WorkSpec        `json:"work"`
+	WorkDigest     string          `json:"work_digest"`
 	State          State           `json:"state"`
 	Generation     uint64          `json:"generation"`
 	Revision       uint64          `json:"revision"`

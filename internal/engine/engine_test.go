@@ -49,6 +49,51 @@ func TestResultAcceptsObjectAndEncodedMutations(t *testing.T) {
 	}
 }
 
+func TestResultTranslatesTaskShapedAddNodeMutation(t *testing.T) {
+	input := `{"status":"continue","summary":"more work","session_id":"lead","mutations":["{\"kind\":\"add_node\",\"node_id\":\"query_plan\",\"parent_id\":\"lead\",\"priority\":\"P1\",\"task\":\"Verify the access query plan.\",\"authority\":\"worktree_only\"}"],"attestations":[]}`
+	var result Result
+	if err := json.Unmarshal([]byte(input), &result); err != nil {
+		t.Fatal(err)
+	}
+	mutation := result.Mutations[0].Mutation
+	if mutation.Op != "add_node" || mutation.Node == nil || mutation.Node.ID != "query_plan" || mutation.Node.Prompt != "Verify the access query plan." {
+		t.Fatalf("mutation=%+v", mutation)
+	}
+	if len(mutation.Node.DependsOn) != 0 || mutation.Node.Metadata["parent_id"] != "lead" {
+		t.Fatalf("dependencies=%v metadata=%v", mutation.Node.DependsOn, mutation.Node.Metadata)
+	}
+}
+
+func TestApplyResultPrefersRuntimeSessionAndNormalizesLimitedAttestation(t *testing.T) {
+	st, _ := core.OpenStore(t.TempDir())
+	w, _ := st.Create("continue safely", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "codex", Model: "gpt-test"}}
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "lead", State: core.NodeRunning}}})
+	result := Result{
+		Status:    "continue",
+		Summary:   "spawn verifier",
+		SessionID: "lead",
+		Mutations: []encodedMutation{{Mutation: core.Mutation{
+			Op: "add_node",
+			Node: &core.Node{
+				ID: "verify", Title: "verify", Kind: "agent", DependsOn: []string{"lead"},
+			},
+		}}},
+		Attestations: []core.Attestation{{Verifier: "test", Verdict: "pass_with_runtime_limit", Summary: "partial"}},
+	}
+	if err := (&Engine{Store: st}).applyAgentResult(w, w.Nodes["lead"], result, "019fd182-2edc-78a0-b9c0-d4968a5a5cbb", 1); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Load(w.ID)
+	if got.Nodes["lead"].SessionID != "019fd182-2edc-78a0-b9c0-d4968a5a5cbb" {
+		t.Fatalf("session=%q", got.Nodes["lead"].SessionID)
+	}
+	if got.Nodes["verify"].Runtime.Name != "codex" || got.Attestations[0].Verdict != "repair" {
+		t.Fatalf("verify=%+v attestations=%+v", got.Nodes["verify"], got.Attestations)
+	}
+}
+
 func TestRuntimeEventObserverReadsDirectChildOutput(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.jsonl")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
@@ -159,6 +204,35 @@ func TestReconcileResumesOnlyExactPersistedSession(t *testing.T) {
 	got, _ := st.Load(w.ID)
 	if got.Nodes["lead"].State != core.NodeReady || got.Nodes["lead"].SessionID != "019fd17f-f95a-76e2-b0fe-35efee5fabda" {
 		t.Fatalf("node=%+v", got.Nodes["lead"])
+	}
+}
+
+func TestRecoverAttemptReappliesRejectedCompletedResult(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("recover rejected result", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "codex", Model: "gpt-test"}}
+	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "lead", State: core.NodeRunning}}})
+	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "lead", State: core.NodeReady}}})
+	dir := filepath.Join(state, "workflows", w.ID, "runs", "lead", "1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result := `{"status":"continue","summary":"delegate follow-up","session_id":"lead","mutations":["{\"kind\":\"add_node\",\"node_id\":\"query_plan\",\"parent_id\":\"lead\",\"priority\":\"P1\",\"task\":\"Verify the query plan.\",\"authority\":\"worktree_only\"}"],"attestations":[]}`
+	if err := os.WriteFile(filepath.Join(dir, "last-message.json"), []byte(result), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	events := "{\"type\":\"thread.started\",\"thread_id\":\"019fd182-2edc-78a0-b9c0-d4968a5a5cbb\"}\n"
+	if err := os.WriteFile(filepath.Join(dir, "events.jsonl"), []byte(events), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Engine{Store: st}).RecoverAttempt(w.ID, "lead", 1); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Load(w.ID)
+	if got.Nodes["lead"].SessionID != "019fd182-2edc-78a0-b9c0-d4968a5a5cbb" || got.Nodes["query_plan"].State != core.NodeReady {
+		t.Fatalf("lead=%+v query=%+v", got.Nodes["lead"], got.Nodes["query_plan"])
 	}
 }
 

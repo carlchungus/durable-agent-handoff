@@ -57,6 +57,8 @@ func run(args []string, out, errOut io.Writer) error {
 		return cmdEvents(args[1:], out)
 	case "run":
 		return cmdRun(args[1:], out)
+	case "recover":
+		return cmdRecover(args[1:], out)
 	case "serve":
 		return cmdServe(args[1:], out)
 	case "service":
@@ -292,6 +294,32 @@ func cmdRun(args []string, out io.Writer) error {
 			return nil
 		}
 	}
+}
+
+func cmdRecover(args []string, out io.Writer) error {
+	args = reorderFlags(args, map[string]bool{"--state": true, "--node": true, "--attempt": true})
+	fs := flag.NewFlagSet("recover", flag.ContinueOnError)
+	s := common(fs)
+	node := fs.String("node", "lead", "node id")
+	attempt := fs.Int("attempt", 0, "exact recorded attempt number")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 || *attempt < 1 {
+		return errors.New("recover requires workflow id and --attempt N")
+	}
+	st, err := store(*s)
+	if err != nil {
+		return err
+	}
+	if err = (&engine.Engine{Store: st, Preferences: preferences.Open(st.Dir())}).RecoverAttempt(fs.Arg(0), *node, *attempt); err != nil {
+		return err
+	}
+	w, err := st.Load(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	return writeJSON(out, w)
 }
 func cmdServe(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
@@ -626,6 +654,7 @@ Usage:
   handoff create --goal TEXT [--root PATH]
   handoff propose --file proposal.json
   handoff run WORKFLOW_ID [--once]
+  handoff recover WORKFLOW_ID --node NODE --attempt N
   handoff serve [--workers 2]
   handoff service install [--enable]
   handoff status [WORKFLOW_ID] [--json]

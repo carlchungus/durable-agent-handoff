@@ -43,7 +43,32 @@ func (m *encodedMutation) UnmarshalJSON(data []byte) error {
 		}
 		data = []byte(encoded)
 	}
-	return json.Unmarshal(data, &m.Mutation)
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	if _, ok := probe["op"]; ok {
+		return json.Unmarshal(data, &m.Mutation)
+	}
+	// Agent models commonly describe the intuitive task mutation even when the
+	// prompt names the lower-level core mutation. Accept that narrow shape and
+	// translate it at the protocol boundary; unknown kinds still fail closed.
+	var task struct {
+		Kind      string `json:"kind"`
+		NodeID    string `json:"node_id"`
+		ParentID  string `json:"parent_id"`
+		Priority  string `json:"priority"`
+		Task      string `json:"task"`
+		Authority string `json:"authority"`
+	}
+	if err := json.Unmarshal(data, &task); err != nil {
+		return err
+	}
+	if task.Kind != "add_node" || task.NodeID == "" || task.Task == "" {
+		return fmt.Errorf("unsupported encoded mutation kind %q", task.Kind)
+	}
+	m.Mutation = core.Mutation{Op: "add_node", Node: &core.Node{ID: task.NodeID, Title: task.Task, Kind: "agent", Prompt: task.Task, Metadata: map[string]string{"parent_id": task.ParentID, "priority": task.Priority, "authority": task.Authority}}}
+	return nil
 }
 
 type Engine struct {
@@ -150,6 +175,37 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 		return err
 	}
 	return nil
+}
+
+// RecoverAttempt reapplies a completed runtime result that an older or crashed
+// supervisor failed to reduce. It is explicit and attempt-addressed so recovery
+// never guesses which concurrent session produced the result.
+func (e *Engine) RecoverAttempt(id, nodeID string, attempt int) error {
+	w, err := e.Store.Load(id)
+	if err != nil {
+		return err
+	}
+	n := w.Nodes[nodeID]
+	if n == nil {
+		return fmt.Errorf("node %q does not exist", nodeID)
+	}
+	if attempt < 1 || attempt > n.Attempt {
+		return fmt.Errorf("attempt %d is outside recorded range 1..%d", attempt, n.Attempt)
+	}
+	dir := filepath.Join(e.Store.Dir(), "workflows", w.ID, "runs", n.ID, fmt.Sprint(attempt))
+	b, readErr := os.ReadFile(filepath.Join(dir, "last-message.json"))
+	if readErr != nil || len(bytes.TrimSpace(b)) == 0 {
+		b, readErr = os.ReadFile(filepath.Join(dir, "events.jsonl"))
+	}
+	if readErr != nil {
+		return readErr
+	}
+	result, err := parseResult(b)
+	if err != nil {
+		return err
+	}
+	stream, _ := os.ReadFile(filepath.Join(dir, "events.jsonl"))
+	return e.applyAgentResult(w, n, result, extractSessionID(stream), attempt)
 }
 
 func (e *Engine) runFinalize(ctx context.Context, w *core.Workflow, n *core.Node) error {
@@ -329,17 +385,28 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 func (e *Engine) applyAgentResult(w *core.Workflow, n *core.Node, result Result, streamSessionID string, attempt int) error {
 	mut := make([]core.Mutation, 0, len(result.Mutations)+4)
 	for _, proposed := range result.Mutations {
-		mut = append(mut, proposed.Mutation)
+		mutation := proposed.Mutation
+		if mutation.Op == "add_node" && mutation.Node != nil && mutation.Node.Runtime.Name == "" {
+			node := *mutation.Node
+			node.Runtime, node.Role = n.Runtime, n.Role
+			mutation.Node = &node
+		}
+		mut = append(mut, mutation)
 	}
-	sessionID := result.SessionID
+	// Runtime protocol events, unlike the model-authored result, are the source
+	// of truth for exact resume identity.
+	sessionID := streamSessionID
 	if sessionID == "" {
-		sessionID = streamSessionID
+		sessionID = result.SessionID
 	}
 	if sessionID != "" && sessionID != n.SessionID {
 		mut = append(mut, core.Mutation{Op: "set_session", NodeID: n.ID, Reason: sessionID})
 	}
 	for i := range result.Attestations {
 		a := result.Attestations[i]
+		if a.Verdict == "pass_with_runtime_limit" {
+			a.Verdict = "repair"
+		}
 		if a.NodeID == "" {
 			a.NodeID = n.ID
 		}

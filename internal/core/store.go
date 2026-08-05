@@ -88,15 +88,31 @@ func (s *Store) acquireWorkflowLock(id string) (func(), error) {
 	path := filepath.Join(s.dir, "workflows", id, ".write.lock")
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		owner := struct {
+			PID        int       `json:"pid"`
+			StartToken string    `json:"start_token,omitempty"`
+			CreatedAt  time.Time `json:"created_at"`
+		}{PID: os.Getpid(), StartToken: runstate.ProcessStartToken(os.Getpid()), CreatedAt: time.Now().UTC()}
+		candidate := path + "." + newID("owner")
+		b, marshalErr := json.Marshal(owner)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		f, err := os.OpenFile(candidate, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = f.Write(append(b, '\n')); err == nil {
+			err = f.Sync()
+		}
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
 		if err == nil {
-			owner := struct {
-				PID        int       `json:"pid"`
-				StartToken string    `json:"start_token,omitempty"`
-				CreatedAt  time.Time `json:"created_at"`
-			}{PID: os.Getpid(), StartToken: runstate.ProcessStartToken(os.Getpid()), CreatedAt: time.Now().UTC()}
-			_ = json.NewEncoder(f).Encode(owner)
-			_ = f.Close()
+			err = os.Link(candidate, path)
+		}
+		_ = os.Remove(candidate)
+		if err == nil {
 			return func() { _ = os.Remove(path) }, nil
 		}
 		if !errors.Is(err, os.ErrExist) {

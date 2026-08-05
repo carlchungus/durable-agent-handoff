@@ -146,7 +146,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	_ = os.WriteFile(filepath.Join(dir, "stderr.log"), stderr.Bytes(), 0o600)
 	if err != nil {
 		failure := fmt.Sprintf("runtime failed: %v: %s %s", err, truncate(stderr.String(), 1000), truncate(stdout.String(), 1000))
-		if e.routeAfterLimit(w, n, failure) {
+		if e.routeAfterLimit(w, n, failure, stderr.String(), stdout.String()) {
 			return nil
 		}
 		return e.fail(w, n, failure)
@@ -158,7 +158,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	result, err := parseResult(b)
 	if err != nil {
 		failure := err.Error() + ": " + truncate(stderr.String(), 1000) + " " + truncate(stdout.String(), 1000)
-		if e.routeAfterLimit(w, n, failure) {
+		if e.routeAfterLimit(w, n, failure, stderr.String(), stdout.String()) {
 			return nil
 		}
 		return e.fail(w, n, failure)
@@ -199,11 +199,11 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	return nil
 }
 
-func (e *Engine) routeAfterLimit(w *core.Workflow, n *core.Node, failure string) bool {
+func (e *Engine) routeAfterLimit(w *core.Workflow, n *core.Node, failure string, rawOutput ...string) bool {
 	if e.Preferences == nil || n.Role == "" {
 		return false
 	}
-	class := preferences.ClassifyFailure(failure)
+	class := preferences.ClassifyFailure(strings.Join(append([]string{failure}, rawOutput...), " "))
 	if class == "runtime_error" {
 		return false
 	}

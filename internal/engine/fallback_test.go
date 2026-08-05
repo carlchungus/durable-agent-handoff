@@ -15,7 +15,8 @@ func TestUsageLimitFallsThroughConfiguredLadder(t *testing.T) {
 	if os.Getenv("GO_WANT_LADDER_HELPER") == "1" {
 		joined := strings.Join(os.Args, " ")
 		if strings.Contains(joined, "limit-mode") {
-			fmt.Fprintln(os.Stderr, "You've hit your session limit · resets 8:40am (local)")
+			fmt.Fprint(os.Stdout, strings.Repeat("large initialization event ", 100))
+			fmt.Fprintln(os.Stdout, "You've hit your session limit · resets 8:40am (local)")
 			os.Exit(1)
 		}
 		fmt.Println(`{"status":"completed","summary":"backup completed","attestations":[{"verifier":"backup","verdict":"pass","summary":"verified"}]}`)

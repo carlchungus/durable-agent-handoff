@@ -7,6 +7,7 @@ require (
 	charm.land/lipgloss/v2 v2.0.5
 	github.com/aperturerobotics/go-quickjs-wasi-reactor/wazero-quickjs v0.0.0-20260705010951-74676ff0da98
 	github.com/tetratelabs/wazero v1.12.0
+	golang.org/x/sys v0.46.0
 )
 
 require (
@@ -25,5 +26,4 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/sync v0.21.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
 )

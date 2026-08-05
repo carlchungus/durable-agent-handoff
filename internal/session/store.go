@@ -23,9 +23,23 @@ import (
 var sessionIdentifier = regexp.MustCompile(`^agent_[a-f0-9]{24}$`)
 
 type Store struct {
-	dir        string
-	mu         sync.Mutex
-	removeLock func(string) error
+	dir         string
+	mu          sync.Mutex
+	newFileLock func(*os.File) sessionFileLock
+	lockTimeout time.Duration
+	lockRetry   time.Duration
+	now         func() time.Time
+	sleep       func(time.Duration)
+}
+
+const (
+	defaultLockTimeout = 10 * time.Second
+	defaultLockRetry   = 10 * time.Millisecond
+)
+
+type sessionFileLock interface {
+	TryLock() (bool, error)
+	Unlock() error
 }
 
 func OpenStore(dir string) (*Store, error) {
@@ -35,7 +49,14 @@ func OpenStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o700); err != nil {
 		return nil, err
 	}
-	return &Store{dir: dir, removeLock: os.Remove}, nil
+	return &Store{
+		dir:         dir,
+		newFileLock: newPlatformFileLock,
+		lockTimeout: defaultLockTimeout,
+		lockRetry:   defaultLockRetry,
+		now:         time.Now,
+		sleep:       time.Sleep,
+	}, nil
 }
 
 func (s *Store) Ensure(descriptor Descriptor) (*Session, error) {
@@ -524,156 +545,88 @@ func (s *Store) acquire(id string) (func(), error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, ".write.lock")
-	deadline := time.Now().Add(10 * time.Second)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	lock := s.newFileLock(file)
+	deadline := s.now().Add(s.lockTimeout)
+	firstAttempt := true
 	for {
-		leaseID := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
-		owner := sessionLockOwner{PID: os.Getpid(), StartToken: runstate.ProcessStartToken(os.Getpid()), LeaseID: leaseID}
-		candidate := path + "." + leaseID
-		if err := writeLockOwner(candidate, owner); err != nil {
-			return nil, err
-		}
-		err := os.Link(candidate, path)
-		if err == nil {
-			return func() { s.releaseLock(path, candidate) }, nil
-		}
-		_ = os.Remove(candidate)
-		if !errors.Is(err, os.ErrExist) {
-			if _, statErr := os.Stat(path); statErr != nil {
-				return nil, err
-			}
-		}
-		stale, staleOwner := staleLockOwner(path)
-		if stale {
-			if removeErr := os.Remove(path); removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
-				cleanupLockArtifacts(path, staleOwner)
-			}
-			continue
-		}
-		if time.Now().After(deadline) {
+		if !firstAttempt && !s.now().Before(deadline) {
+			_ = file.Close()
 			return nil, fmt.Errorf("timed out waiting for agent session %s lock", id)
 		}
-		time.Sleep(10 * time.Millisecond)
+		firstAttempt = false
+		locked, lockErr := lock.TryLock()
+		if lockErr != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("lock agent session %s: %w", id, lockErr)
+		}
+		if locked {
+			owner := sessionLockOwner{
+				PID:        os.Getpid(),
+				StartToken: runstate.ProcessStartToken(os.Getpid()),
+				LeaseID:    fmt.Sprintf("%d-%d", os.Getpid(), s.now().UnixNano()),
+				State:      sessionLockActive,
+				UpdatedAt:  s.now().UTC(),
+			}
+			if writeErr := writeLockOwner(file, owner); writeErr != nil {
+				_ = lock.Unlock()
+				_ = file.Close()
+				return nil, writeErr
+			}
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					owner.State = sessionLockReleased
+					owner.UpdatedAt = s.now().UTC()
+					_ = writeLockOwner(file, owner)
+					_ = lock.Unlock()
+					_ = file.Close()
+				})
+			}, nil
+		}
+		remaining := deadline.Sub(s.now())
+		if remaining <= 0 {
+			continue
+		}
+		backoff := s.lockRetry
+		if backoff > remaining {
+			backoff = remaining
+		}
+		s.sleep(backoff)
 	}
 }
 
+const (
+	sessionLockActive   = "active"
+	sessionLockReleased = "released"
+)
+
 type sessionLockOwner struct {
-	PID        int    `json:"pid"`
-	StartToken string `json:"start_token,omitempty"`
-	LeaseID    string `json:"lease_id,omitempty"`
+	PID        int       `json:"pid"`
+	StartToken string    `json:"start_token,omitempty"`
+	LeaseID    string    `json:"lease_id"`
+	State      string    `json:"state"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
-var lockLeaseIdentifier = regexp.MustCompile(`^[0-9]+-[0-9]+$`)
-
-func writeLockOwner(path string, owner sessionLockOwner) error {
+func writeLockOwner(file *os.File, owner sessionLockOwner) error {
 	b, err := json.Marshal(owner)
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
+	if err = file.Truncate(0); err != nil {
 		return err
 	}
-	if _, err = f.Write(append(b, '\n')); err == nil {
-		err = f.Sync()
-	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	return err
-}
-
-func (s *Store) releaseLock(path, candidate string) {
-	marker := candidate + ".released"
-	if err := writeReleaseMarker(marker); err != nil {
-		return
-	}
-	deadline := time.Now().Add(250 * time.Millisecond)
-	for {
-		same, known := sameLockFile(path, candidate)
-		if known && !same {
-			_ = os.Remove(marker)
-			_ = os.Remove(candidate)
-			return
-		}
-		if known {
-			err := s.removeLock(path)
-			if err == nil || errors.Is(err, os.ErrNotExist) {
-				_ = os.Remove(marker)
-				_ = os.Remove(candidate)
-				return
-			}
-		}
-		if time.Now().After(deadline) {
-			// The durable marker lets another waiter reclaim the lock even if
-			// Windows still has a transient non-delete-sharing reader open.
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-}
-
-func sameLockFile(path, candidate string) (same, known bool) {
-	lockInfo, err := os.Stat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, true
-	}
-	if err != nil {
-		return false, false
-	}
-	candidateInfo, err := os.Stat(candidate)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, true
-	}
-	if err != nil {
-		return false, false
-	}
-	return os.SameFile(lockInfo, candidateInfo), true
-}
-
-func writeReleaseMarker(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
+	if _, err = file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	if _, err = f.Write([]byte("released\n")); err == nil {
-		err = f.Sync()
+	if _, err = file.Write(append(b, '\n')); err != nil {
+		return err
 	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	return err
-}
-
-func staleLock(path string) bool {
-	stale, _ := staleLockOwner(path)
-	return stale
-}
-
-func staleLockOwner(path string) (bool, sessionLockOwner) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return false, sessionLockOwner{}
-	}
-	var owner sessionLockOwner
-	if json.Unmarshal(b, &owner) == nil && owner.PID > 0 {
-		if lockLeaseIdentifier.MatchString(owner.LeaseID) {
-			if _, markerErr := os.Stat(path + "." + owner.LeaseID + ".released"); markerErr == nil {
-				return true, owner
-			}
-		}
-		return !runstate.ProcessMatches(runstate.Manifest{PID: owner.PID, ProcessStartToken: owner.StartToken}), owner
-	}
-	info, statErr := os.Stat(path)
-	return statErr == nil && time.Since(info.ModTime()) > time.Minute, owner
-}
-
-func cleanupLockArtifacts(path string, owner sessionLockOwner) {
-	if !lockLeaseIdentifier.MatchString(owner.LeaseID) {
-		return
-	}
-	candidate := path + "." + owner.LeaseID
-	_ = os.Remove(candidate + ".released")
-	_ = os.Remove(candidate)
+	return file.Sync()
 }
 
 type ledgerEvent struct {

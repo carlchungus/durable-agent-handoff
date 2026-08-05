@@ -1,15 +1,14 @@
 package session
 
 import (
-	"errors"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 )
 
 func TestDurableAgentReplySurvivesSnapshotLoss(t *testing.T) {
@@ -290,58 +289,241 @@ func TestSessionIDsCannotEscapeStateDirectory(t *testing.T) {
 	}
 }
 
-func TestReleasedLiveOwnerLockIsReclaimable(t *testing.T) {
-	path := filepath.Join(t.TempDir(), ".write.lock")
-	owner := sessionLockOwner{PID: os.Getpid(), StartToken: runstate.ProcessStartToken(os.Getpid()), LeaseID: fmt.Sprintf("%d-1", os.Getpid())}
-	if err := writeLockOwner(path, owner); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeReleaseMarker(path + "." + owner.LeaseID + ".released"); err != nil {
-		t.Fatal(err)
-	}
-	if !staleLock(path) {
-		t.Fatal("a durably released lock remained fenced by its live former owner")
-	}
-}
-
-func TestDeleteFailureLeavesReclaimableReleasedLock(t *testing.T) {
-	state := t.TempDir()
-	ownerStore, _ := OpenStore(state)
-	waiterStore, _ := OpenStore(state)
-	id := stableID("wf_windows", "lead")
-	release, err := ownerStore.acquire(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ownerStore.removeLock = func(string) error { return errors.New("simulated Windows sharing violation") }
-	release()
-
-	nextRelease, err := waiterStore.acquire(id)
-	if err != nil {
-		t.Fatalf("released lock was not reclaimable: %v", err)
-	}
-	nextRelease()
-}
-
-func TestOldReleaseCannotRemoveSuccessorLock(t *testing.T) {
+func TestLockContentionTimesOutWithBoundedBackoff(t *testing.T) {
 	state := t.TempDir()
 	store, _ := OpenStore(state)
-	id := stableID("wf_fenced", "lead")
-	release, err := store.acquire(id)
+	current := time.Unix(100, 0)
+	attempts := 0
+	sleeps := 0
+	slept := time.Duration(0)
+	store.newFileLock = func(*os.File) sessionFileLock {
+		return &alwaysContendedLock{attempts: &attempts}
+	}
+	store.lockTimeout = 25 * time.Millisecond
+	store.lockRetry = 10 * time.Millisecond
+	store.now = func() time.Time { return current }
+	store.sleep = func(delay time.Duration) {
+		sleeps++
+		slept += delay
+		current = current.Add(delay)
+	}
+	if _, err := store.acquire(stableID("wf_timeout", "lead")); err == nil {
+		t.Fatal("persistent contention did not return a timeout")
+	}
+	if attempts != 3 || sleeps != 3 || slept != 25*time.Millisecond {
+		t.Fatalf("attempts=%d sleeps=%d slept=%s", attempts, sleeps, slept)
+	}
+}
+
+func TestSeparateStoresContendOnStableKernelLock(t *testing.T) {
+	state := t.TempDir()
+	owner, _ := OpenStore(state)
+	waiter, _ := OpenStore(state)
+	waiter.lockTimeout = 25 * time.Millisecond
+	waiter.lockRetry = time.Millisecond
+	id := stableID("wf_process_local", "lead")
+	release, err := owner.acquire(id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(state, "sessions", id, ".write.lock")
-	if err = os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	successor := sessionLockOwner{PID: os.Getpid(), StartToken: runstate.ProcessStartToken(os.Getpid()), LeaseID: fmt.Sprintf("%d-999", os.Getpid())}
-	if err = writeLockOwner(path, successor); err != nil {
-		t.Fatal(err)
+	if _, err = waiter.acquire(id); err == nil {
+		t.Fatal("a separate Store acquired the same kernel lock")
 	}
 	release()
-	_, got := staleLockOwner(path)
-	if got.LeaseID != successor.LeaseID {
-		t.Fatalf("old release removed or replaced successor: %+v", got)
+	nextRelease, err := waiter.acquire(id)
+	if err != nil {
+		t.Fatalf("released kernel lock was not reacquired: %v", err)
 	}
+	nextRelease()
+	ownerRecord := readLockOwner(t, filepath.Join(state, "sessions", id, ".write.lock"))
+	if ownerRecord.State != sessionLockReleased || ownerRecord.PID != os.Getpid() {
+		t.Fatalf("release metadata was not durable: %+v", ownerRecord)
+	}
+}
+
+func TestOldReleaseCannotAffectSuccessorLock(t *testing.T) {
+	state := t.TempDir()
+	first, _ := OpenStore(state)
+	second, _ := OpenStore(state)
+	id := stableID("wf_fenced", "lead")
+	beforeUnlock := make(chan struct{})
+	allowUnlock := make(chan struct{})
+	first.newFileLock = func(file *os.File) sessionFileLock {
+		return &barrierUnlockLock{
+			sessionFileLock: newPlatformFileLock(file),
+			beforeUnlock:    beforeUnlock,
+			allowUnlock:     allowUnlock,
+		}
+	}
+	observedContention := make(chan struct{})
+	second.newFileLock = func(file *os.File) sessionFileLock {
+		return &contentionObserverLock{
+			sessionFileLock: newPlatformFileLock(file),
+			observed:        observedContention,
+		}
+	}
+	oldRelease, err := first.acquire(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseDone := make(chan struct{})
+	go func() {
+		oldRelease()
+		close(releaseDone)
+	}()
+	<-beforeUnlock
+	successorResult := make(chan struct {
+		release func()
+		err     error
+	}, 1)
+	go func() {
+		release, acquireErr := second.acquire(id)
+		successorResult <- struct {
+			release func()
+			err     error
+		}{release: release, err: acquireErr}
+	}()
+	<-observedContention
+	close(allowUnlock)
+	<-releaseDone
+	successor := <-successorResult
+	if successor.err != nil {
+		t.Fatal(successor.err)
+	}
+	path := filepath.Join(state, "sessions", id, ".write.lock")
+	before := readLockOwner(t, path)
+	oldRelease()
+	after := readLockOwner(t, path)
+	if before.LeaseID != after.LeaseID || after.State != sessionLockActive {
+		t.Fatalf("old release mutated successor: before=%+v after=%+v", before, after)
+	}
+	blocked, _ := OpenStore(state)
+	blocked.lockTimeout = 25 * time.Millisecond
+	blocked.lockRetry = time.Millisecond
+	if _, err = blocked.acquire(id); err == nil {
+		t.Fatal("old release unlocked the successor's kernel lock")
+	}
+	successor.release()
+}
+
+func TestKernelLockReleasedWhenOwnerProcessExits(t *testing.T) {
+	state := t.TempDir()
+	id := stableID("wf_crash", "lead")
+	ready := filepath.Join(state, "lock-ready")
+	command := exec.Command(os.Args[0], "-test.run=^TestSessionLockCrashHelper$")
+	command.Env = append(os.Environ(),
+		"HANDOFF_SESSION_LOCK_CRASH_HELPER=1",
+		"HANDOFF_SESSION_LOCK_STATE="+state,
+		"HANDOFF_SESSION_LOCK_ID="+id,
+		"HANDOFF_SESSION_LOCK_READY="+ready,
+	)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	t.Cleanup(func() {
+		if !waited {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("crash helper did not acquire the lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	store, _ := OpenStore(state)
+	store.lockTimeout = 25 * time.Millisecond
+	store.lockRetry = time.Millisecond
+	if unexpectedRelease, err := store.acquire(id); err == nil {
+		unexpectedRelease()
+		t.Fatal("parent acquired a lock held by a separate process")
+	}
+	if err := command.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err == nil {
+		t.Fatal("killed crash helper exited successfully")
+	}
+	waited = true
+	store.lockTimeout = defaultLockTimeout
+	release, err := store.acquire(id)
+	if err != nil {
+		t.Fatalf("process exit did not release kernel lock: %v", err)
+	}
+	release()
+}
+
+func TestSessionLockCrashHelper(t *testing.T) {
+	if os.Getenv("HANDOFF_SESSION_LOCK_CRASH_HELPER") != "1" {
+		return
+	}
+	store, err := OpenStore(os.Getenv("HANDOFF_SESSION_LOCK_STATE"))
+	if err != nil {
+		os.Exit(2)
+	}
+	release, err := store.acquire(os.Getenv("HANDOFF_SESSION_LOCK_ID"))
+	if err != nil {
+		os.Exit(3)
+	}
+	_ = release
+	if err = os.WriteFile(os.Getenv("HANDOFF_SESSION_LOCK_READY"), []byte("ready\n"), 0o600); err != nil {
+		os.Exit(4)
+	}
+	time.Sleep(time.Hour)
+}
+
+type alwaysContendedLock struct {
+	attempts *int
+}
+
+func (l *alwaysContendedLock) TryLock() (bool, error) {
+	(*l.attempts)++
+	return false, nil
+}
+
+func (l *alwaysContendedLock) Unlock() error { return nil }
+
+type barrierUnlockLock struct {
+	sessionFileLock
+	beforeUnlock chan struct{}
+	allowUnlock  chan struct{}
+}
+
+func (l *barrierUnlockLock) Unlock() error {
+	close(l.beforeUnlock)
+	<-l.allowUnlock
+	return l.sessionFileLock.Unlock()
+}
+
+type contentionObserverLock struct {
+	sessionFileLock
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (l *contentionObserverLock) TryLock() (bool, error) {
+	locked, err := l.sessionFileLock.TryLock()
+	if !locked && err == nil {
+		l.once.Do(func() { close(l.observed) })
+	}
+	return locked, err
+}
+
+func readLockOwner(t *testing.T, path string) sessionLockOwner {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var owner sessionLockOwner
+	if err = json.Unmarshal(b, &owner); err != nil {
+		t.Fatal(err)
+	}
+	return owner
 }

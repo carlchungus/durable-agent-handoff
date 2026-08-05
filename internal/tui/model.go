@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -12,12 +13,14 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/engine"
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
+	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 )
 
 type tickMsg time.Time
 type loadMsg struct {
 	workflows []*core.Workflow
 	events    []core.Event
+	attempts  map[string]runstate.Manifest
 	err       error
 }
 type runMsg struct{ err error }
@@ -26,6 +29,7 @@ type Model struct {
 	store     *core.Store
 	workflows []*core.Workflow
 	events    []core.Event
+	attempts  map[string]runstate.Manifest
 	cursor    int
 	width     int
 	height    int
@@ -57,6 +61,7 @@ func Snapshot(store *core.Store) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		m.attempts = loadAttempts(store, ws[0])
 	}
 	return m.RenderPlain(), nil
 }
@@ -68,14 +73,31 @@ func (m Model) load() tea.Cmd {
 	return func() tea.Msg {
 		ws, err := m.store.List()
 		var events []core.Event
+		attempts := map[string]runstate.Manifest{}
 		if err == nil && len(ws) > 0 {
-			events, err = m.store.Events(ws[min(m.cursor, len(ws)-1)].ID, 0)
+			selected := ws[min(m.cursor, len(ws)-1)]
+			events, err = m.store.Events(selected.ID, 0)
 			if len(events) > 12 {
 				events = events[len(events)-12:]
 			}
+			attempts = loadAttempts(m.store, selected)
 		}
-		return loadMsg{ws, events, err}
+		return loadMsg{ws, events, attempts, err}
 	}
+}
+
+func loadAttempts(store *core.Store, workflow *core.Workflow) map[string]runstate.Manifest {
+	attempts := map[string]runstate.Manifest{}
+	for _, n := range workflow.Nodes {
+		if n.State != core.NodeRunning || n.Attempt < 1 {
+			continue
+		}
+		path := filepath.Join(store.Dir(), "workflows", workflow.ID, "runs", n.ID, fmt.Sprint(n.Attempt), "attempt.json")
+		if attempt, err := runstate.Load(path); err == nil {
+			attempts[n.ID] = attempt
+		}
+	}
+	return attempts
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -114,6 +136,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case loadMsg:
 		m.workflows = v.workflows
 		m.events = v.events
+		m.attempts = v.attempts
 		m.err = v.err
 		if m.cursor >= len(m.workflows) {
 			m.cursor = max(0, len(m.workflows)-1)
@@ -214,7 +237,18 @@ func (m Model) detail(width int) string {
 				runtime += fmt.Sprintf(" [%s #%d]", n.Role, n.CandidateIndex+1)
 			}
 		}
-		lines = append(lines, fmt.Sprintf(" %s %-18s %s%s", nodeGlyph(n.State), truncate(n.Title, 18), lipgloss.NewStyle().Foreground(muted).Render(string(n.State)+runtime), lipgloss.NewStyle().Foreground(muted).Render(deps)))
+		lines = append(lines, fmt.Sprintf(" %s %-18s %s%s", m.nodeGlyph(n.State), truncate(n.Title, 18), lipgloss.NewStyle().Foreground(muted).Render(string(n.State)+runtime), lipgloss.NewStyle().Foreground(muted).Render(deps)))
+		if attempt, ok := m.attempts[n.ID]; ok {
+			heartbeat := time.Since(attempt.HeartbeatAt).Round(time.Second)
+			if heartbeat < 0 {
+				heartbeat = 0
+			}
+			session := attempt.SessionID
+			if len(session) > 12 {
+				session = session[:12] + "…"
+			}
+			lines = append(lines, lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("    ↳ pid %d · heartbeat %s · %s · %.1f KB", attempt.PID, heartbeat, session, float64(attempt.EventOffset)/1024)))
+		}
 	}
 	lines = append(lines, "", title.Render("EVENTS"))
 	for _, e := range m.events {
@@ -242,12 +276,12 @@ func statusDot(s core.WorkflowStatus) string {
 		return lipgloss.NewStyle().Foreground(cyan).Render("●")
 	}
 }
-func nodeGlyph(s core.NodeState) string {
+func (m Model) nodeGlyph(s core.NodeState) string {
 	switch s {
 	case core.NodeCompleted:
 		return lipgloss.NewStyle().Foreground(green).Render("✓")
 	case core.NodeRunning:
-		return lipgloss.NewStyle().Foreground(cyan).Render("◆")
+		return lipgloss.NewStyle().Foreground(cyan).Render([]string{"◆", "◇", "◆", "◇", "◆", "◇", "◆", "◇"}[m.frame])
 	case core.NodeFailed:
 		return lipgloss.NewStyle().Foreground(red).Render("×")
 	case core.NodeWaiting:

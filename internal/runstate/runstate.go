@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -269,14 +268,10 @@ func staleFileLock(path string) bool {
 }
 
 func ProcessStartToken(pid int) string {
-	if pid <= 0 || runtime.GOOS == "windows" {
+	if pid <= 0 {
 		return ""
 	}
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
+	return platformProcessStartToken(pid)
 }
 
 func ProcessMatches(manifest Manifest) bool {

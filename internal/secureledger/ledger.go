@@ -24,6 +24,7 @@ const (
 )
 
 var namespacePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
+var blobNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,190}$`)
 
 type Options struct {
 	Namespace      string
@@ -169,6 +170,13 @@ type Txn struct {
 	once   sync.Once
 }
 
+type BlobChunk struct {
+	Data  []byte
+	Start int64
+	End   int64
+	Size  int64
+}
+
 func (tx *Txn) Replay(visit func(sequence uint64, raw []byte) error) error {
 	if err := tx.validate("ledger replay"); err != nil {
 		return err
@@ -270,6 +278,72 @@ func (tx *Txn) ReplaceSnapshot(data []byte) error {
 		_ = directory.Close()
 	}
 	return nil
+}
+
+func (tx *Txn) CreateBlob(name string) (*os.File, error) {
+	if !validBlobName(name) {
+		return nil, fmt.Errorf("invalid secure ledger blob name %q", name)
+	}
+	if err := tx.validate("blob create"); err != nil {
+		return nil, err
+	}
+	return tx.ledger.openRegular(tx.root, name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+}
+
+func (l *Ledger) ReadBlob(id, name string, after int64, maxBytes int) (BlobChunk, error) {
+	if err := l.validateID(id); err != nil {
+		return BlobChunk{}, err
+	}
+	if !validBlobName(name) {
+		return BlobChunk{}, fmt.Errorf("invalid secure ledger blob name %q", name)
+	}
+	if after < 0 {
+		return BlobChunk{}, errors.New("blob cursor cannot be negative")
+	}
+	if maxBytes <= 0 {
+		maxBytes = 64 << 10
+	}
+	if maxBytes > 1<<20 {
+		return BlobChunk{}, errors.New("blob read exceeds 1 MiB")
+	}
+	root, err := l.openRecordRoot(id, false)
+	if err != nil {
+		return BlobChunk{}, err
+	}
+	defer root.Close()
+	file, err := l.openRegular(root, name, os.O_RDONLY, 0)
+	if err != nil {
+		return BlobChunk{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return BlobChunk{}, err
+	}
+	if after > info.Size() {
+		return BlobChunk{}, fmt.Errorf("blob cursor %d exceeds size %d", after, info.Size())
+	}
+	data := make([]byte, min(int64(maxBytes), info.Size()-after))
+	n, err := file.ReadAt(data, after)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return BlobChunk{}, err
+	}
+	data = data[:n]
+	return BlobChunk{Data: data, Start: after, End: after + int64(n), Size: info.Size()}, nil
+}
+
+func (l *Ledger) BlobPath(id, name string) (string, error) {
+	if err := l.validateID(id); err != nil {
+		return "", err
+	}
+	if !validBlobName(name) {
+		return "", fmt.Errorf("invalid secure ledger blob name %q", name)
+	}
+	return fmt.Sprintf("%s%c%s%c%s%c%s", l.rootPath, os.PathSeparator, l.namespace, os.PathSeparator, id, os.PathSeparator, name), nil
+}
+
+func validBlobName(name string) bool {
+	return blobNamePattern.MatchString(name) && name != "events.jsonl" && name != "state.json" && name != ".write.lock"
 }
 
 func (l *Ledger) openRoot() (*os.Root, error) {

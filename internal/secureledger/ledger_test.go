@@ -365,3 +365,38 @@ func TestRejectsGroupWritableRootOnUnix(t *testing.T) {
 		t.Fatal("accepted group-writable root")
 	}
 }
+
+func TestBlobCursorReadsStableRecordLocalOutput(t *testing.T) {
+	ledger := testLedger(t)
+	var output *os.File
+	if err := ledger.Update("rec_output", func(tx *Txn) error {
+		var err error
+		output, err = tx.CreateBlob("attempt_1_stdout.log")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := output.WriteString("one\ntwo\n"); err == nil {
+		err = output.Sync()
+	}
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	first, err := ledger.ReadBlob("rec_output", "attempt_1_stdout.log", 0, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first.Data) != "one\n" || first.Start != 0 || first.End != 4 || first.Size != 8 {
+		t.Fatalf("first=%+v", first)
+	}
+	second, err := ledger.ReadBlob("rec_output", "attempt_1_stdout.log", first.End, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second.Data) != "two\n" || second.Start != 4 || second.End != 8 {
+		t.Fatalf("second=%+v", second)
+	}
+	if _, err := ledger.ReadBlob("rec_output", "../outside", 0, 10); err == nil {
+		t.Fatal("accepted unsafe blob name")
+	}
+}

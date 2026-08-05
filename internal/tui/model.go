@@ -247,7 +247,7 @@ func (m Model) detail(width int) string {
 			if len(session) > 12 {
 				session = session[:12] + "…"
 			}
-			lines = append(lines, lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("    ↳ pid %d · heartbeat %s · %s · %.1f KB", attempt.PID, heartbeat, session, float64(attempt.EventOffset)/1024)))
+			lines = append(lines, lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("    ↳ pid %d · supervisor g%d · heartbeat %s · %s · %.1f KB", attempt.PID, attempt.SupervisorGeneration, heartbeat, session, float64(attempt.EventOffset)/1024)))
 		}
 	}
 	lines = append(lines, "", title.Render("EVENTS"))

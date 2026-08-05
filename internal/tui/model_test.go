@@ -62,7 +62,7 @@ func TestSnapshotShowsDurableAttemptHealth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"pid 4242", "heartbeat", "session-obse…", "4.0 KB"} {
+	for _, want := range []string{"pid 4242", "supervisor g1", "heartbeat", "session-", "obse…", "4.0 KB"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("missing %q in\n%s", want, view)
 		}

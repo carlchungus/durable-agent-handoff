@@ -138,6 +138,17 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 		dir := filepath.Join(e.Store.Dir(), "workflows", w.ID, "runs", n.ID, fmt.Sprint(n.Attempt))
 		manifest, manifestErr := runstate.Load(filepath.Join(dir, "attempt.json"))
 		if manifestErr == nil && runstate.ProcessMatches(manifest) {
+			_, claimed, claimErr := runstate.ClaimSupervisor(filepath.Join(dir, "attempt.json"), runstate.SupervisorIdentity(), runstate.SupervisorLeaseDuration)
+			if claimErr != nil {
+				return claimErr
+			}
+			if claimed && n.SessionID == "" {
+				if stream, readErr := os.ReadFile(filepath.Join(dir, "events.jsonl")); readErr == nil {
+					if sessionID := extractSessionID(stream); sessionID != "" {
+						_, _ = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, Rationale: "adopt live attempt and preserve exact runtime session"})
+					}
+				}
+			}
 			continue
 		}
 
@@ -333,7 +344,9 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		if sessionID == "" || sessionID == n.SessionID {
 			return
 		}
-		_ = recorder.Update(func(m *runstate.Manifest) { m.SessionID = sessionID })
+		if updateErr := recorder.Update(func(m *runstate.Manifest) { m.SessionID = sessionID }); updateErr != nil {
+			return
+		}
 		_, _ = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, Rationale: "persist runtime session identity before the process exits"})
 	})
 	err = cmd.Wait()
@@ -345,7 +358,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	_ = stderr.Sync()
 	stdoutBytes, _ := os.ReadFile(stdoutPath)
 	stderrBytes, _ := os.ReadFile(stderrPath)
-	_ = recorder.Update(func(m *runstate.Manifest) {
+	finalRecordErr := recorder.Update(func(m *runstate.Manifest) {
 		m.FinishedAt = time.Now().UTC()
 		m.EventOffset = int64(len(stdoutBytes))
 		code := 0
@@ -360,6 +373,14 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		}
 		m.ExitCode = &code
 	})
+	if errors.Is(finalRecordErr, runstate.ErrFenced) {
+		// A newer supervisor owns reduction. Leaving the node running lets that
+		// owner observe the completed durable output and apply it exactly once.
+		return nil
+	}
+	if finalRecordErr != nil {
+		return finalRecordErr
+	}
 	if err != nil {
 		failure := fmt.Sprintf("runtime failed: %v: %s %s", err, truncate(string(stderrBytes), 1000), truncate(string(stdoutBytes), 1000))
 		if e.routeAfterLimit(w, n, failure, string(stderrBytes), string(stdoutBytes)) {

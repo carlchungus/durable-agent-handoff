@@ -1,0 +1,22 @@
+{
+  "workflow_id": "wf_replace_me",
+  "actor": "lead",
+  "rationale": "The implementation needs an independent boundary review.",
+  "mutations": [
+    {
+      "op": "add_node",
+      "node": {
+        "id": "verify-boundary",
+        "title": "Verify the package boundary",
+        "kind": "agent",
+        "depends_on": ["lead"],
+        "prompt": "Inspect the live diff and test the public contract independently.",
+        "runtime": {
+          "name": "pi",
+          "model": "openrouter/deepseek/deepseek-v4-flash",
+          "effort": "xhigh"
+        }
+      }
+    }
+  ]
+}

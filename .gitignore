@@ -1,0 +1,5 @@
+/handoff
+/dist/
+/.handoff/
+*.log
+.DS_Store

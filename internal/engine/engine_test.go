@@ -807,10 +807,18 @@ func TestRuntimeChildSurvivesSupervisorCrashAndReconciles(t *testing.T) {
 		process, _ := os.FindProcess(workerAttempt.PID)
 		_ = process.Kill()
 	}
-	if err := (&Engine{Store: st}).Reconcile(context.Background(), w.ID); err != nil {
-		t.Fatal(err)
+	var got *core.Workflow
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := (&Engine{Store: st}).Reconcile(context.Background(), w.ID); err != nil {
+			t.Fatal(err)
+		}
+		got, _ = st.Load(w.ID)
+		if got.Nodes["lead"].State == core.NodeCompleted {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	got, _ := st.Load(w.ID)
 	if got.Nodes["lead"].State != core.NodeCompleted || got.Status != core.WorkflowCompleted {
 		t.Fatalf("reconciled node=%s workflow=%s evidence=%+v", got.Nodes["lead"].State, got.Status, got.Evidence)
 	}

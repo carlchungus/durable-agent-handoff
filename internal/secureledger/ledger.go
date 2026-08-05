@@ -595,15 +595,6 @@ func (l *Ledger) openRegular(root *os.Root, name string, flag int, perm os.FileM
 	return file, nil
 }
 
-func syncRoot(root *os.Root) error {
-	directory, err := root.Open(".")
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
-}
-
 func (l *Ledger) acquire(id string) (*Txn, error) {
 	root, err := l.openRecordRoot(id, true)
 	if err != nil {

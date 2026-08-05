@@ -113,6 +113,9 @@ single-link regular files, pinned identities, locks, fsync, and replay repair
 fail closed on accidental or uncoordinated path replacement. They do not claim
 to isolate an actively malicious unsandboxed process running as the supervisor's
 same OS user; such a process can also inspect or signal the supervisor directly.
+Windows fsyncs ledger files but exposes no POSIX directory-fsync contract through
+Go's directory handles; process-crash recovery is covered, while metadata
+durability across sudden power loss remains filesystem-defined on Windows.
 
 ## Scheduling
 

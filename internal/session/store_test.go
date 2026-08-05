@@ -65,6 +65,31 @@ func TestDurableAgentReplySurvivesSnapshotLoss(t *testing.T) {
 	}
 }
 
+func TestExistingSessionLedgerBytesRemainReadable(t *testing.T) {
+	state := t.TempDir()
+	id := stableID("wf_legacy", "researcher")
+	dir := filepath.Join(state, "sessions", id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ledger := fmt.Sprintf("{\"sequence\":1,\"session_id\":%q,\"type\":\"session.created\",\"at\":\"2026-08-05T12:00:00Z\",\"data\":{\"version\":1,\"id\":%q,\"workflow_id\":\"wf_legacy\",\"node_id\":\"researcher\",\"name\":\"Legacy researcher\",\"runtime\":\"codex\",\"runtime_session_id\":\"thread-exact\",\"worktree\":\"/tmp/legacy\",\"logical_state\":\"needs_input\",\"process_state\":\"exited\",\"created_at\":\"2026-08-05T12:00:00Z\",\"updated_at\":\"2026-08-05T12:00:00Z\"}}\n", id, id)
+	if err := os.WriteFile(filepath.Join(dir, "events.jsonl"), []byte(ledger), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenStore(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != id || got.RuntimeSessionID != "thread-exact" || got.LogicalState != LogicalNeedsInput {
+		t.Fatalf("legacy ledger changed meaning: %+v", got)
+	}
+}
+
 func TestLedgerEventAfterSnapshotRemainsVisible(t *testing.T) {
 	state := t.TempDir()
 	store, _ := OpenStore(state)

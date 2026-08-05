@@ -504,6 +504,7 @@ func (e *Engine) routeAfterLimit(w *core.Workflow, n *core.Node, failure string,
 	next, index, routeErr := e.Preferences.Resolve(n.Role, n.Runtime)
 	mutations := []core.Mutation{
 		{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("limit-%s-%d", n.ID, n.Attempt+1), NodeID: n.ID, Kind: "provider_limit", Summary: fmt.Sprintf("%s hit %s; %s", preferences.Key(n.Runtime), class, truncate(failure, 500))}},
+		{Op: "refund_attempt", NodeID: n.ID},
 		{Op: "set_state", NodeID: n.ID, State: core.NodeReady},
 	}
 	if routeErr == nil {

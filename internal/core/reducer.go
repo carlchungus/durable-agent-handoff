@@ -94,7 +94,7 @@ func validateMutation(w *Workflow, actor string, m Mutation) error {
 				return fmt.Errorf("dependency %q does not exist", dep)
 			}
 		}
-	case "set_state", "supersede", "set_session", "set_runtime":
+	case "set_state", "supersede", "set_session", "set_runtime", "refund_attempt":
 		n := w.Nodes[m.NodeID]
 		if n == nil {
 			return fmt.Errorf("node %q does not exist", m.NodeID)
@@ -107,6 +107,12 @@ func validateMutation(w *Workflow, actor string, m Mutation) error {
 		}
 		if m.Op == "set_runtime" && (m.Runtime == nil || m.Runtime.Name == "") {
 			return errors.New("set_runtime requires a runtime")
+		}
+		if m.Op == "refund_attempt" && actor != "supervisor" {
+			return errors.New("only the supervisor may refund an attempt")
+		}
+		if m.Op == "refund_attempt" && n.Attempt < 1 {
+			return errors.New("cannot refund an attempt before one has started")
 		}
 	case "add_evidence":
 		if m.Evidence == nil || w.Nodes[m.Evidence.NodeID] == nil {
@@ -190,6 +196,10 @@ func applyMutation(w *Workflow, m Mutation, at time.Time) {
 		n := w.Nodes[m.NodeID]
 		n.Runtime = *m.Runtime
 		n.CandidateIndex = m.CandidateIndex
+		n.UpdatedAt = at
+	case "refund_attempt":
+		n := w.Nodes[m.NodeID]
+		n.Attempt--
 		n.UpdatedAt = at
 	case "add_evidence":
 		e := *m.Evidence

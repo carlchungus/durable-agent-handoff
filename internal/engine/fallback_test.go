@@ -42,11 +42,17 @@ func TestUsageLimitFallsThroughConfiguredLadder(t *testing.T) {
 	if afterLimit.Nodes["plan"].Runtime.Model != "backup" || afterLimit.Nodes["plan"].State != core.NodeReady {
 		t.Fatalf("after limit=%#v", afterLimit.Nodes["plan"])
 	}
+	if afterLimit.Nodes["plan"].Attempt != 0 {
+		t.Fatalf("provider routing consumed a task attempt: %d", afterLimit.Nodes["plan"].Attempt)
+	}
 	if _, err := eng.RunOne(context.Background(), w.ID); err != nil {
 		t.Fatal(err)
 	}
 	done, _ := st.Load(w.ID)
 	if done.Status != core.WorkflowCompleted {
 		t.Fatalf("status=%s evidence=%#v", done.Status, done.Evidence)
+	}
+	if done.Nodes["plan"].Attempt != 1 {
+		t.Fatalf("successful backup should be the first task attempt: %d", done.Nodes["plan"].Attempt)
 	}
 }

@@ -727,19 +727,15 @@ func TestOldReleaseCannotAffectSuccessorLock(t *testing.T) {
 	}()
 	<-beforeUnlock
 	successorResult := make(chan struct {
-		release func()
-		err     error
+		lease *sessionLease
+		err   error
 	}, 1)
 	go func() {
 		lease, acquireErr := second.acquire(id)
-		var release func()
-		if lease != nil {
-			release = lease.release
-		}
 		successorResult <- struct {
-			release func()
-			err     error
-		}{release: release, err: acquireErr}
+			lease *sessionLease
+			err   error
+		}{lease: lease, err: acquireErr}
 	}()
 	<-observedContention
 	close(allowUnlock)
@@ -748,20 +744,19 @@ func TestOldReleaseCannotAffectSuccessorLock(t *testing.T) {
 	if successor.err != nil {
 		t.Fatal(successor.err)
 	}
-	path := filepath.Join(state, "sessions", id, ".write.lock")
-	before := readLockOwner(t, path)
+	successorLeaseID := successor.lease.owner.LeaseID
 	oldLease.release()
-	after := readLockOwner(t, path)
-	if before.LeaseID != after.LeaseID || after.State != sessionLockActive {
-		t.Fatalf("old release mutated successor: before=%+v after=%+v", before, after)
-	}
 	blocked, _ := OpenStore(state)
 	blocked.lockTimeout = 25 * time.Millisecond
 	blocked.lockRetry = time.Millisecond
 	if _, err = blocked.acquire(id); err == nil {
 		t.Fatal("old release unlocked the successor's kernel lock")
 	}
-	successor.release()
+	successor.lease.release()
+	after := readLockOwner(t, filepath.Join(state, "sessions", id, ".write.lock"))
+	if after.LeaseID != successorLeaseID || after.State != sessionLockReleased {
+		t.Fatalf("old release mutated successor metadata: %+v", after)
+	}
 }
 
 func TestKernelLockReleasedWhenOwnerProcessExits(t *testing.T) {

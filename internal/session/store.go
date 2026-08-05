@@ -89,6 +89,10 @@ func (s *Store) openRoot() (*os.Root, error) {
 	if err = validateTrustedDirectory(before); err != nil {
 		return nil, fmt.Errorf("unsafe session store root %q: %w", s.dir, err)
 	}
+	beforeIdentity, err := identifyRootPath(s.dir)
+	if err != nil {
+		return nil, err
+	}
 	if s.safetyHooks.afterRootPrecheck != nil {
 		s.safetyHooks.afterRootPrecheck()
 	}
@@ -97,22 +101,26 @@ func (s *Store) openRoot() (*os.Root, error) {
 		return nil, err
 	}
 	after, pathErr := os.Lstat(s.dir)
-	opened, openedErr := root.Stat(".")
-	afterTrustErr := validateTrustedDirectory(after)
-	openedTrustErr := validateTrustedDirectory(opened)
-	if pathErr != nil || openedErr != nil || afterTrustErr != nil || openedTrustErr != nil || !actualDirectory(after) || !actualDirectory(opened) || !os.SameFile(before, after) || !os.SameFile(before, opened) {
+	if pathErr != nil || !actualDirectory(after) {
 		_ = root.Close()
 		if pathErr != nil {
 			return nil, pathErr
 		}
+		return nil, fmt.Errorf("session store root %q is not an actual directory", s.dir)
+	}
+	if err = validateTrustedDirectory(after); err != nil {
+		_ = root.Close()
+		return nil, err
+	}
+	openedIdentity, openedErr := identifyRoot(root)
+	afterIdentity, afterErr := identifyRootPath(s.dir)
+	if openedErr != nil || afterErr != nil || !sameStorageIdentity(beforeIdentity, openedIdentity) || !sameStorageIdentity(beforeIdentity, afterIdentity) {
+		_ = root.Close()
 		if openedErr != nil {
 			return nil, openedErr
 		}
-		if afterTrustErr != nil {
-			return nil, afterTrustErr
-		}
-		if openedTrustErr != nil {
-			return nil, openedTrustErr
+		if afterErr != nil {
+			return nil, afterErr
 		}
 		return nil, fmt.Errorf("session store root %q changed while opening", s.dir)
 	}
@@ -158,6 +166,10 @@ func (s *Store) openChildRoot(parent *os.Root, name string, create bool) (*os.Ro
 	if err = validateTrustedDirectory(before); err != nil {
 		return nil, fmt.Errorf("unsafe session storage component %q: %w", name, err)
 	}
+	beforeIdentity, err := identifyChildRoot(parent, name)
+	if err != nil {
+		return nil, err
+	}
 	if s.safetyHooks.afterChildPrecheck != nil {
 		s.safetyHooks.afterChildPrecheck(name)
 	}
@@ -166,22 +178,26 @@ func (s *Store) openChildRoot(parent *os.Root, name string, create bool) (*os.Ro
 		return nil, err
 	}
 	after, pathErr := parent.Lstat(name)
-	opened, openedErr := child.Stat(".")
-	afterTrustErr := validateTrustedDirectory(after)
-	openedTrustErr := validateTrustedDirectory(opened)
-	if pathErr != nil || openedErr != nil || afterTrustErr != nil || openedTrustErr != nil || !actualDirectory(after) || !actualDirectory(opened) || !os.SameFile(before, after) || !os.SameFile(before, opened) {
+	if pathErr != nil || !actualDirectory(after) {
 		_ = child.Close()
 		if pathErr != nil {
 			return nil, pathErr
 		}
+		return nil, fmt.Errorf("session storage component %q is not an actual directory", name)
+	}
+	if err = validateTrustedDirectory(after); err != nil {
+		_ = child.Close()
+		return nil, err
+	}
+	openedIdentity, openedErr := identifyRoot(child)
+	afterIdentity, afterErr := identifyChildRoot(parent, name)
+	if openedErr != nil || afterErr != nil || !sameStorageIdentity(beforeIdentity, openedIdentity) || !sameStorageIdentity(beforeIdentity, afterIdentity) {
+		_ = child.Close()
 		if openedErr != nil {
 			return nil, openedErr
 		}
-		if afterTrustErr != nil {
-			return nil, afterTrustErr
-		}
-		if openedTrustErr != nil {
-			return nil, openedTrustErr
+		if afterErr != nil {
+			return nil, afterErr
 		}
 		return nil, fmt.Errorf("session storage component %q changed while opening", name)
 	}
@@ -192,12 +208,56 @@ func actualDirectory(info os.FileInfo) bool {
 	return info != nil && info.Mode().Type() == os.ModeDir
 }
 
+func identifyRootPath(path string) (storageIdentity, error) {
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return storageIdentity{}, err
+	}
+	defer root.Close()
+	return identifyRoot(root)
+}
+
+func identifyChildRoot(parent *os.Root, name string) (storageIdentity, error) {
+	root, err := parent.OpenRoot(name)
+	if err != nil {
+		return storageIdentity{}, err
+	}
+	defer root.Close()
+	return identifyRoot(root)
+}
+
+func identifyRoot(root *os.Root) (storageIdentity, error) {
+	file, err := root.Open(".")
+	if err != nil {
+		return storageIdentity{}, err
+	}
+	defer file.Close()
+	return identifyStorageFile(file)
+}
+
+func identifyRegularPath(root *os.Root, name string) (storageIdentity, error) {
+	file, err := root.OpenFile(name, os.O_RDONLY, 0)
+	if err != nil {
+		return storageIdentity{}, err
+	}
+	defer file.Close()
+	if err = validateRegularFile(file); err != nil {
+		return storageIdentity{}, err
+	}
+	return identifyStorageFile(file)
+}
+
 func (s *Store) openRegular(root *os.Root, name string, flag int, perm os.FileMode) (*os.File, error) {
 	before, err := root.Lstat(name)
 	existed := err == nil
+	var beforeIdentity storageIdentity
 	if err == nil {
 		if !before.Mode().IsRegular() {
 			return nil, fmt.Errorf("session storage file %q is not a regular file", name)
+		}
+		beforeIdentity, err = identifyRegularPath(root, name)
+		if err != nil {
+			return nil, err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) || flag&os.O_CREATE == 0 {
 		return nil, err
@@ -210,18 +270,26 @@ func (s *Store) openRegular(root *os.Root, name string, flag int, perm os.FileMo
 		return nil, err
 	}
 	after, pathErr := root.Lstat(name)
-	opened, openedErr := file.Stat()
 	safetyErr := validateRegularFile(file)
-	if pathErr != nil || openedErr != nil || safetyErr != nil || !after.Mode().IsRegular() || !opened.Mode().IsRegular() || !os.SameFile(after, opened) || existed && (!os.SameFile(before, after) || !os.SameFile(before, opened)) {
+	if pathErr != nil || safetyErr != nil || !after.Mode().IsRegular() {
 		_ = file.Close()
 		if pathErr != nil {
 			return nil, pathErr
 		}
+		if safetyErr != nil {
+			return nil, fmt.Errorf("unsafe session storage file %q: %w", name, safetyErr)
+		}
+		return nil, fmt.Errorf("session storage file %q is not a regular file", name)
+	}
+	openedIdentity, openedErr := identifyStorageFile(file)
+	afterIdentity, afterErr := identifyRegularPath(root, name)
+	if openedErr != nil || afterErr != nil || !sameStorageIdentity(openedIdentity, afterIdentity) || existed && !sameStorageIdentity(beforeIdentity, openedIdentity) {
+		_ = file.Close()
 		if openedErr != nil {
 			return nil, openedErr
 		}
-		if safetyErr != nil {
-			return nil, fmt.Errorf("unsafe session storage file %q: %w", name, safetyErr)
+		if afterErr != nil {
+			return nil, afterErr
 		}
 		return nil, fmt.Errorf("session storage file %q changed while opening", name)
 	}
@@ -767,10 +835,10 @@ func (l *sessionLease) validate(boundary string) error {
 	if err != nil {
 		return fmt.Errorf("validate session storage at %s: %w", boundary, err)
 	}
-	currentInfo, currentErr := current.Stat(".")
-	pinnedInfo, pinnedErr := l.root.Stat(".")
+	currentIdentity, currentErr := identifyRoot(current)
+	pinnedIdentity, pinnedErr := identifyRoot(l.root)
 	_ = current.Close()
-	if currentErr != nil || pinnedErr != nil || !actualDirectory(currentInfo) || !actualDirectory(pinnedInfo) || !os.SameFile(currentInfo, pinnedInfo) {
+	if currentErr != nil || pinnedErr != nil || !sameStorageIdentity(currentIdentity, pinnedIdentity) {
 		if currentErr != nil {
 			return currentErr
 		}
@@ -803,11 +871,18 @@ func validatePinnedRegular(root *os.Root, name string, pinned *os.File) error {
 	if err != nil {
 		return err
 	}
-	opened, err := pinned.Stat()
+	if !current.Mode().IsRegular() {
+		return errors.New("public entry is not a regular file")
+	}
+	currentIdentity, err := identifyRegularPath(root, name)
 	if err != nil {
 		return err
 	}
-	if !current.Mode().IsRegular() || !opened.Mode().IsRegular() || !os.SameFile(current, opened) {
+	pinnedIdentity, err := identifyStorageFile(pinned)
+	if err != nil {
+		return err
+	}
+	if !sameStorageIdentity(currentIdentity, pinnedIdentity) {
 		return errors.New("public entry no longer names the pinned regular file")
 	}
 	return validateRegularFile(pinned)

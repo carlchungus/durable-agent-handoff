@@ -14,6 +14,21 @@ type unixSessionFileLock struct {
 	file *os.File
 }
 
+type storageIdentity struct {
+	device uint64
+	inode  uint64
+}
+
+func identifyStorageFile(file *os.File) (storageIdentity, error) {
+	var info unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &info); err != nil {
+		return storageIdentity{}, err
+	}
+	return storageIdentity{device: uint64(info.Dev), inode: uint64(info.Ino)}, nil
+}
+
+func sameStorageIdentity(left, right storageIdentity) bool { return left == right }
+
 func newPlatformFileLock(file *os.File) sessionFileLock {
 	return &unixSessionFileLock{file: file}
 }

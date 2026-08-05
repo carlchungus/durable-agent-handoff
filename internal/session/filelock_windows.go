@@ -14,6 +14,22 @@ type windowsSessionFileLock struct {
 	overlapped windows.Overlapped
 }
 
+type storageIdentity struct {
+	volume uint32
+	high   uint32
+	low    uint32
+}
+
+func identifyStorageFile(file *os.File) (storageIdentity, error) {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(file.Fd()), &info); err != nil {
+		return storageIdentity{}, err
+	}
+	return storageIdentity{volume: info.VolumeSerialNumber, high: info.FileIndexHigh, low: info.FileIndexLow}, nil
+}
+
+func sameStorageIdentity(left, right storageIdentity) bool { return left == right }
+
 func newPlatformFileLock(file *os.File) sessionFileLock {
 	return &windowsSessionFileLock{file: file}
 }

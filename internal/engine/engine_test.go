@@ -440,6 +440,47 @@ func TestReconcileRequeuesReplyFromInterruptedRuntimeAttempt(t *testing.T) {
 	}
 }
 
+func TestReconcileAcknowledgesReducedResultForEveryStatus(t *testing.T) {
+	states := []core.NodeState{core.NodeReady, core.NodeWaiting, core.NodeFailed, core.NodeCompleted}
+	for _, reducedState := range states {
+		t.Run(string(reducedState), func(t *testing.T) {
+			state := t.TempDir()
+			st, _ := core.OpenStore(state)
+			sessions, _ := agentsession.OpenStore(state)
+			w, _ := st.Create("recover result ack", t.TempDir(), core.DefaultBudget())
+			n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "claude"}, SessionID: "session-exact-123"}
+			w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+			w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: n.ID, State: core.NodeRunning}}})
+			agent, _ := sessions.Ensure(agentsession.Descriptor{WorkflowID: w.ID, NodeID: n.ID, RuntimeSessionID: n.SessionID})
+			_, _ = sessions.Queue(agent.ID, "human", "continue")
+			_, _ = sessions.Dispatch(agent.ID, 1)
+			_, err := st.Apply(core.Proposal{WorkflowID: w.ID, Actor: n.ID, Mutations: []core.Mutation{
+				{Op: "add_evidence", Evidence: &core.Evidence{ID: "result-lead-1", NodeID: n.ID, Kind: "agent", Summary: "valid result reduced"}},
+				{Op: "set_state", NodeID: n.ID, State: reducedState},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = (&Engine{Store: st, Sessions: sessions}).Reconcile(context.Background(), w.ID); err != nil {
+				t.Fatal(err)
+			}
+			agent, _ = sessions.Load(agent.ID)
+			if agent.Inbox[0].State != agentsession.MessageDelivered || agent.Inbox[0].DeliveryAttempt != 1 {
+				t.Fatalf("state=%s session=%+v", reducedState, agent)
+			}
+			wantLogical := agentsession.LogicalWorking
+			if reducedState == core.NodeWaiting {
+				wantLogical = agentsession.LogicalNeedsInput
+			} else if reducedState == core.NodeFailed || reducedState == core.NodeCompleted {
+				wantLogical = agentsession.LogicalCompleted
+			}
+			if agent.LogicalState != wantLogical || agent.ProcessState != agentsession.ProcessExited {
+				t.Fatalf("state=%s logical=%s process=%s", reducedState, agent.LogicalState, agent.ProcessState)
+			}
+		})
+	}
+}
+
 func TestRecoverAttemptReappliesRejectedCompletedResult(t *testing.T) {
 	state := t.TempDir()
 	st, _ := core.OpenStore(state)

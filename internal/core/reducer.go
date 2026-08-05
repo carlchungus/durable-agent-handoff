@@ -127,6 +127,12 @@ func validateMutation(w *Workflow, actor string, m Mutation) error {
 		if m.Op == "set_runtime" && actor != "supervisor" {
 			return errors.New("only the supervisor may route runtimes")
 		}
+		if m.Op == "set_session" && actor != "supervisor" && actor != n.ID {
+			return errors.New("an agent may only persist its own session; cross-node session writes require the supervisor")
+		}
+		if m.Op == "set_session" && strings.TrimSpace(m.Reason) == "" {
+			return errors.New("set_session requires an exact non-empty session id")
+		}
 		if m.Op == "set_runtime" && (m.Runtime == nil || m.Runtime.Name == "") {
 			return errors.New("set_runtime requires a runtime")
 		}

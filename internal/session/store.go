@@ -2,6 +2,7 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -310,92 +311,71 @@ func (s *Store) List() ([]*Session, error) {
 }
 
 func (s *Store) loadLocked(id string) (*Session, error) {
-	b, err := os.ReadFile(filepath.Join(s.dir, "sessions", id, "state.json"))
-	if err == nil {
-		var agent Session
-		if json.Unmarshal(b, &agent) == nil && agent.Version == Version && agent.ID == id {
-			return clone(&agent), nil
-		}
-	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
+	// The snapshot is only a replaceable view. The fsynced ledger is always
+	// authoritative, including events appended just before a process crash.
 	return s.replayLocked(id)
 }
 
 func (s *Store) replayLocked(id string) (*Session, error) {
-	f, err := os.Open(filepath.Join(s.dir, "sessions", id, "events.jsonl"))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
 	var agent *Session
-	dec := json.NewDecoder(f)
-	for {
-		var raw struct {
-			Type string          `json:"type"`
-			At   time.Time       `json:"at"`
-			Data json.RawMessage `json:"data"`
-		}
-		if err = dec.Decode(&raw); errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("replay agent session ledger: %w", err)
-		}
+	_, err := walkLedger(filepath.Join(s.dir, "sessions", id, "events.jsonl"), true, func(raw ledgerEvent) error {
 		switch raw.Type {
 		case "session.created":
 			var created Session
-			if err = json.Unmarshal(raw.Data, &created); err != nil {
-				return nil, err
+			if decodeErr := json.Unmarshal(raw.Data, &created); decodeErr != nil {
+				return decodeErr
 			}
 			agent = &created
 		case "message.queued":
 			if agent == nil {
-				return nil, errors.New("message event preceded session creation")
+				return errors.New("message event preceded session creation")
 			}
 			var message Message
-			if err = json.Unmarshal(raw.Data, &message); err != nil {
-				return nil, err
+			if decodeErr := json.Unmarshal(raw.Data, &message); decodeErr != nil {
+				return decodeErr
 			}
 			applyMessageQueued(agent, message, raw.At)
 		case "messages.dispatched":
 			if agent == nil {
-				return nil, errors.New("delivery event preceded session creation")
+				return errors.New("delivery event preceded session creation")
 			}
 			var delivery deliveryEvent
-			if err = json.Unmarshal(raw.Data, &delivery); err != nil {
-				return nil, err
+			if decodeErr := json.Unmarshal(raw.Data, &delivery); decodeErr != nil {
+				return decodeErr
 			}
 			applyMessagesDispatched(agent, delivery.Attempt, raw.At)
 		case "messages.delivered":
 			if agent == nil {
-				return nil, errors.New("delivery event preceded session creation")
+				return errors.New("delivery event preceded session creation")
 			}
 			var delivery deliveryEvent
-			if err = json.Unmarshal(raw.Data, &delivery); err != nil {
-				return nil, err
+			if decodeErr := json.Unmarshal(raw.Data, &delivery); decodeErr != nil {
+				return decodeErr
 			}
 			applyMessagesDelivered(agent, delivery.Attempt, raw.At)
 		case "messages.requeued":
 			if agent == nil {
-				return nil, errors.New("delivery event preceded session creation")
+				return errors.New("delivery event preceded session creation")
 			}
 			var delivery deliveryEvent
-			if err = json.Unmarshal(raw.Data, &delivery); err != nil {
-				return nil, err
+			if decodeErr := json.Unmarshal(raw.Data, &delivery); decodeErr != nil {
+				return decodeErr
 			}
 			applyMessagesRequeued(agent, delivery.Attempt, raw.At)
 		case "session.observed":
 			if agent == nil {
-				return nil, errors.New("observation event preceded session creation")
+				return errors.New("observation event preceded session creation")
 			}
 			var observation Observation
-			if err = json.Unmarshal(raw.Data, &observation); err != nil {
-				return nil, err
+			if decodeErr := json.Unmarshal(raw.Data, &observation); decodeErr != nil {
+				return decodeErr
 			}
 			applyObservation(agent, observation, raw.At)
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("replay agent session ledger: %w", err)
 	}
 	if agent == nil {
 		return nil, errors.New("agent session ledger has no creation event")
@@ -475,7 +455,7 @@ func (s *Store) appendLocked(id string, event Event) error {
 		return err
 	}
 	path := filepath.Join(dir, "events.jsonl")
-	sequence, err := lastSequence(path)
+	sequence, err := repairLedgerTail(path)
 	if err != nil {
 		return err
 	}
@@ -584,26 +564,119 @@ func staleLock(path string) bool {
 	return statErr == nil && time.Since(info.ModTime()) > time.Minute
 }
 
-func lastSequence(path string) (uint64, error) {
+type ledgerEvent struct {
+	Sequence  uint64          `json:"sequence"`
+	SessionID string          `json:"session_id"`
+	Type      string          `json:"type"`
+	At        time.Time       `json:"at"`
+	Data      json.RawMessage `json:"data"`
+}
+
+const maxLedgerEventBytes = 4 << 20
+
+func walkLedger(path string, toleratePartialTail bool, visit func(ledgerEvent) error) (uint64, error) {
 	f, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
-	}
 	if err != nil {
 		return 0, err
 	}
 	defer f.Close()
+	reader := bufio.NewReaderSize(f, 64<<10)
 	var sequence uint64
-	scan := bufio.NewScanner(f)
-	scan.Buffer(make([]byte, 4096), 4<<20)
-	for scan.Scan() {
-		var event Event
-		if err = json.Unmarshal(scan.Bytes(), &event); err != nil {
-			return 0, err
+	for {
+		line, readErr := readLedgerLine(reader)
+		if len(line) > 0 {
+			complete := line[len(line)-1] == '\n'
+			line = bytes.TrimSpace(line)
+			if len(line) > 0 {
+				var event ledgerEvent
+				decodeErr := json.Unmarshal(line, &event)
+				if decodeErr != nil && !complete && errors.Is(readErr, io.EOF) && toleratePartialTail {
+					return sequence, nil
+				}
+				if decodeErr != nil {
+					return 0, decodeErr
+				}
+				if event.Sequence != sequence+1 {
+					return 0, fmt.Errorf("event sequence %d followed %d", event.Sequence, sequence)
+				}
+				if err = visit(event); err != nil {
+					return 0, err
+				}
+				sequence = event.Sequence
+			}
 		}
-		sequence = event.Sequence
+		if errors.Is(readErr, io.EOF) {
+			return sequence, nil
+		}
+		if readErr != nil {
+			return 0, readErr
+		}
 	}
-	return sequence, scan.Err()
+}
+
+func repairLedgerTail(path string) (uint64, error) {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	reader := bufio.NewReaderSize(f, 64<<10)
+	var sequence uint64
+	var goodOffset int64
+	for {
+		line, readErr := readLedgerLine(reader)
+		if len(line) > 0 {
+			complete := line[len(line)-1] == '\n'
+			var event ledgerEvent
+			decodeErr := json.Unmarshal(bytes.TrimSpace(line), &event)
+			if decodeErr != nil && !complete && errors.Is(readErr, io.EOF) {
+				if err = f.Truncate(goodOffset); err == nil {
+					err = f.Sync()
+				}
+				return sequence, err
+			}
+			if decodeErr != nil {
+				return 0, decodeErr
+			}
+			if event.Sequence != sequence+1 {
+				return 0, fmt.Errorf("event sequence %d followed %d", event.Sequence, sequence)
+			}
+			sequence = event.Sequence
+			goodOffset += int64(len(line))
+			if !complete && errors.Is(readErr, io.EOF) {
+				if _, err = f.WriteAt([]byte{'\n'}, goodOffset); err == nil {
+					err = f.Sync()
+				}
+				return sequence, err
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return sequence, nil
+		}
+		if readErr != nil {
+			return 0, readErr
+		}
+	}
+}
+
+func readLedgerLine(reader *bufio.Reader) ([]byte, error) {
+	var line []byte
+	for {
+		part, err := reader.ReadSlice('\n')
+		line = append(line, part...)
+		if len(line) > maxLedgerEventBytes {
+			return nil, errors.New("agent session ledger event exceeds 4 MiB")
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return line, err
+	}
 }
 
 func stableID(workflowID, nodeID string) string {

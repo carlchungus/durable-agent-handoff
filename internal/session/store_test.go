@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestDurableAgentReplySurvivesSnapshotLoss(t *testing.T) {
@@ -56,6 +57,64 @@ func TestDurableAgentReplySurvivesSnapshotLoss(t *testing.T) {
 	}
 	if again.ID != agent.ID || len(again.Inbox) != 1 {
 		t.Fatalf("ensure changed identity or state: %+v", again)
+	}
+}
+
+func TestLedgerEventAfterSnapshotRemainsVisible(t *testing.T) {
+	state := t.TempDir()
+	store, _ := OpenStore(state)
+	agent, err := store.Ensure(Descriptor{WorkflowID: "wf_alpha", NodeID: "researcher"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	message := Message{ID: "message-1", Sequence: 1, From: "human", Body: "after snapshot", State: MessageQueued, CreatedAt: now}
+	if err = store.appendLocked(agent.ID, Event{SessionID: agent.ID, Type: "message.queued", At: now, Data: message}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Inbox) != 1 || loaded.Inbox[0].Body != "after snapshot" {
+		t.Fatalf("ledger event hidden by stale snapshot: %+v", loaded.Inbox)
+	}
+}
+
+func TestAppendRepairsPartialLedgerTail(t *testing.T) {
+	state := t.TempDir()
+	store, _ := OpenStore(state)
+	agent, err := store.Ensure(Descriptor{WorkflowID: "wf_alpha", NodeID: "researcher"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(state, "sessions", agent.ID, "events.jsonl")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.WriteString(`{"sequence":2,"session_id":"`); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	message, err := store.Queue(agent.ID, "human", "survives torn tail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Sequence != 1 {
+		t.Fatalf("message sequence=%d", message.Sequence)
+	}
+	loaded, err := store.Load(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Inbox) != 1 || loaded.Inbox[0].Body != "survives torn tail" {
+		t.Fatalf("loaded=%+v", loaded.Inbox)
 	}
 }
 

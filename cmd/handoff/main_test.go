@@ -132,4 +132,11 @@ func TestAgentReplyInboxAndViewAreMachineReadable(t *testing.T) {
 	if view[0].LogicalState != agentsession.LogicalNeedsInput || view[0].ProcessState != agentsession.ProcessExited || view[0].RuntimeSessionID != "session-exact-123" {
 		t.Fatalf("view=%+v", view[0])
 	}
+	out.Reset()
+	if err := run([]string{"agents", "--state", state, "--workflow", w.ID}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if json.Valid(out.Bytes()) || !bytes.Contains(out.Bytes(), []byte("LOGICAL")) || !bytes.Contains(out.Bytes(), []byte("needs_input")) || !bytes.Contains(out.Bytes(), []byte("session-exact-123")) {
+		t.Fatalf("human agent view=%q", out.String())
+	}
 }

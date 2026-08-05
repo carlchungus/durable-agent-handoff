@@ -141,3 +141,27 @@ func TestReopenAgentRequiresExactPersistedSessionAndHumanAuthority(t *testing.T)
 		t.Fatal("agent reopened itself")
 	}
 }
+
+func TestSetSessionIsScopedToSupervisorOrOwningAgent(t *testing.T) {
+	w := fixtureWorkflow(t)
+	w.Nodes["lead"] = &Node{ID: "lead", Title: "lead", Kind: "agent", State: NodeRunning}
+	w.Nodes["review"] = &Node{ID: "review", Title: "review", Kind: "agent", State: NodeRunning, SessionID: "review-original"}
+	w.Order = append(w.Order, "lead", "review")
+
+	err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "lead", Mutations: []Mutation{{Op: "set_session", NodeID: "review", Reason: "forged-session"}}}, time.Now().UTC())
+	if err == nil || !strings.Contains(err.Error(), "own session") {
+		t.Fatalf("cross-node session overwrite result=%v", err)
+	}
+	if w.Nodes["review"].SessionID != "review-original" {
+		t.Fatalf("rejected overwrite mutated target: %+v", w.Nodes["review"])
+	}
+	if err = ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "lead", Mutations: []Mutation{{Op: "set_session", NodeID: "lead", Reason: "lead-exact"}}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err = ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []Mutation{{Op: "set_session", NodeID: "review", Reason: "review-exact"}}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if w.Nodes["lead"].SessionID != "lead-exact" || w.Nodes["review"].SessionID != "review-exact" {
+		t.Fatalf("lead=%+v review=%+v", w.Nodes["lead"], w.Nodes["review"])
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -176,7 +177,7 @@ func cmdAgents(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("agents", flag.ContinueOnError)
 	state := common(fs)
 	workflow := fs.String("workflow", "", "filter by workflow id")
-	_ = fs.Bool("json", false, "emit JSON")
+	jsonOut := fs.Bool("json", false, "emit JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -197,7 +198,15 @@ func cmdAgents(args []string, out io.Writer) error {
 		}
 		agents = filtered
 	}
-	return writeJSON(out, agents)
+	if *jsonOut {
+		return writeJSON(out, agents)
+	}
+	table := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(table, "AGENT\tLOGICAL\tPROCESS\tRUNTIME\tRUNTIME SESSION\tWORKFLOW:NODE")
+	for _, agent := range agents {
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s:%s\n", agent.ID, agent.LogicalState, agent.ProcessState, agent.Runtime, agent.RuntimeSessionID, agent.WorkflowID, agent.NodeID)
+	}
+	return table.Flush()
 }
 
 func agentWorktree(w *core.Workflow, n *core.Node) string {

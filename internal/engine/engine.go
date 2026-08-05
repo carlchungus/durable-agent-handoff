@@ -152,7 +152,7 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 	}
 	for _, nodeID := range w.Order {
 		n := w.Nodes[nodeID]
-		if n == nil || n.Kind != "agent" || n.SessionID == "" || (n.State != core.NodeCompleted && n.State != core.NodeWaiting && n.State != core.NodeFailed) {
+		if n == nil || n.Kind != "agent" || n.SessionID == "" || n.State == core.NodeRunning {
 			continue
 		}
 		agent, loadErr := e.Sessions.LoadByNode(w.ID, n.ID)
@@ -162,7 +162,7 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 		if loadErr != nil {
 			return loadErr
 		}
-		if n.State == core.NodeCompleted {
+		if hasEvidence(w, fmt.Sprintf("result-%s-%d", n.ID, n.Attempt)) {
 			for _, message := range agent.Inbox {
 				if message.State == agentsession.MessageDispatched && message.DeliveryAttempt == n.Attempt {
 					if err = e.Sessions.Deliver(agent.ID, n.Attempt); err != nil {
@@ -175,12 +175,19 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 					break
 				}
 			}
+			if err = e.Sessions.Observe(agent.ID, agentsession.Observation{LogicalState: logicalStateForNode(n.State), ProcessState: agentsession.ProcessExited}); err != nil {
+				return err
+			}
+			agent, err = e.Sessions.Load(agent.ID)
+			if err != nil {
+				return err
+			}
 		}
 		queued := false
 		for _, message := range agent.Inbox {
 			queued = queued || message.State == agentsession.MessageQueued
 		}
-		if queued {
+		if queued && (n.State == core.NodeCompleted || n.State == core.NodeWaiting || n.State == core.NodeFailed) {
 			if _, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "reopen_agent", NodeID: n.ID}}, Rationale: "recover queued durable reply after supervisor interruption"}); err != nil {
 				return err
 			}
@@ -249,6 +256,26 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 		return err
 	}
 	return nil
+}
+
+func hasEvidence(w *core.Workflow, id string) bool {
+	for _, evidence := range w.Evidence {
+		if evidence.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func logicalStateForNode(state core.NodeState) agentsession.LogicalState {
+	switch state {
+	case core.NodeWaiting:
+		return agentsession.LogicalNeedsInput
+	case core.NodeFailed, core.NodeCompleted:
+		return agentsession.LogicalCompleted
+	default:
+		return agentsession.LogicalWorking
+	}
 }
 
 func (e *Engine) requeueInterruptedAttempt(w *core.Workflow, n *core.Node, attempt int, next core.NodeState) error {

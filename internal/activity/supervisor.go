@@ -61,7 +61,15 @@ func (s *Supervisor) Start(descriptor Descriptor) (*Activity, Attempt, error) {
 		_ = s.Store.FailPrepared(activity.ID, activity.Generation, attempt.ID, "could not establish exact process start token")
 		return nil, Attempt{}, errors.New("could not establish exact process start token")
 	}
-	attempt, err = s.Store.MarkRunning(activity.ID, activity.Generation, attempt.ID, ProcessIdentity{PID: command.Process.Pid, ProcessStartToken: token, SupervisorID: s.ownerID(), SupervisorGeneration: 1})
+	treeID, treeErr := BindProcessTree(command.Process.Pid, token)
+	if treeErr != nil {
+		gated.Abort()
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		_ = s.Store.FailPrepared(activity.ID, activity.Generation, attempt.ID, treeErr.Error())
+		return nil, Attempt{}, treeErr
+	}
+	attempt, err = s.Store.MarkRunning(activity.ID, activity.Generation, attempt.ID, ProcessIdentity{PID: command.Process.Pid, ProcessStartToken: token, ProcessTreeID: treeID, SupervisorID: s.ownerID(), SupervisorGeneration: 1})
 	if err != nil {
 		gated.Abort()
 		_ = command.Process.Kill()
@@ -239,7 +247,7 @@ func waitForStartToken(pid int, timeout time.Duration) string {
 }
 
 func identityOf(attempt Attempt) AttemptIdentity {
-	return AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
+	return AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, ProcessTreeID: attempt.ProcessTreeID, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
 }
 
 func processMatches(identity AttemptIdentity) bool {

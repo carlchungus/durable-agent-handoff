@@ -269,7 +269,7 @@ func selectActivityOutput(item *activity.Activity, stream activity.Stream, reque
 func activityAttemptIdentity(item *activity.Activity, attemptID string) (activity.AttemptIdentity, error) {
 	for _, attempt := range item.Attempts {
 		if attempt.ID == attemptID {
-			return activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}, nil
+			return activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, ProcessTreeID: attempt.ProcessTreeID, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}, nil
 		}
 	}
 	return activity.AttemptIdentity{}, fmt.Errorf("attempt %q was not found", attemptID)

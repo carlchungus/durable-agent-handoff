@@ -127,11 +127,36 @@ func runGatedTarget(input io.Reader, stdout, stderr io.Writer) (int, error) {
 		if openErr != nil {
 			return code, fmt.Errorf("open completion store: %w", openErr)
 		}
-		if finishErr := store.FinishAttempt(request.Completion.ActivityID, request.Completion.Generation, request.Completion.Identity, ExitResult{State: state, ExitCode: &code, Error: errorText}); finishErr != nil {
+		if finishErr := finishRunnerAttempt(store, request.Completion, ExitResult{State: state, ExitCode: &code, Error: errorText}); finishErr != nil {
 			return code, fmt.Errorf("persist completion: %w", finishErr)
 		}
 	}
 	return code, nil
+}
+
+// finishRunnerAttempt permits a recovered supervisor to advance ownership
+// while the same exact runner continues. The runner retries with the current
+// owner fence only when attempt ID, PID, and birth token still name itself.
+func finishRunnerAttempt(store *Store, completion *runnerCompletion, result ExitResult) error {
+	for range 4 {
+		current, err := store.Load(completion.ActivityID)
+		if err != nil {
+			return err
+		}
+		if terminal(current.State) {
+			return nil
+		}
+		attempt, ok := currentAttempt(current)
+		if !ok || attempt.ID != completion.Identity.ID || attempt.PID != os.Getpid() || attempt.PID != completion.Identity.PID || attempt.ProcessStartToken != completion.Identity.ProcessStartToken || attempt.ProcessTreeID != completion.Identity.ProcessTreeID || !processMatches(identityOf(attempt)) {
+			return ErrFenced
+		}
+		if err = store.FinishAttempt(current.ID, current.Generation, identityOf(attempt), result); err == nil {
+			return nil
+		} else if !errors.Is(err, ErrFenced) {
+			return err
+		}
+	}
+	return ErrFenced
 }
 
 func withoutRunnerEnvironment(env []string) []string {

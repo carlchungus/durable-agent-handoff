@@ -172,6 +172,34 @@ func TestNaturalCompletionRacingStopDoesNotClaimControlApplied(t *testing.T) {
 	}
 }
 
+func TestPrepareAttemptRecoversOrphanBlobsBeforePreparedEvent(t *testing.T) {
+	root := t.TempDir()
+	store, _ := OpenStore(root)
+	created, _ := store.Create(Descriptor{ID: "activity_111111111111111111111111", Work: WorkSpec{Kind: "agent", Cwd: "/tmp", Intent: "orphan recovery"}})
+	recordDir := filepath.Join(root, "activities", created.ID)
+	if err := os.WriteFile(filepath.Join(recordDir, "attempt_1_stdout.log"), []byte("orphan stdout"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(recordDir, "attempt_1_stderr.log"), []byte("orphan stderr"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	attempt, stdout, stderr, err := store.PrepareAttempt(created.ID, created.Generation, AttemptStart{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stdout.Close()
+	_ = stderr.Close()
+	if attempt.ID != "attempt_1" {
+		t.Fatalf("attempt=%+v", attempt)
+	}
+	for _, path := range []string{attempt.Stdout.Path, attempt.Stderr.Path} {
+		info, statErr := os.Stat(path)
+		if statErr != nil || info.Size() != 0 {
+			t.Fatalf("orphan blob was not replaced: path=%s info=%+v err=%v", path, info, statErr)
+		}
+	}
+}
+
 func identity(attempt Attempt) AttemptIdentity {
-	return AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
+	return AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, ProcessTreeID: attempt.ProcessTreeID, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
 }

@@ -125,6 +125,15 @@ func (s *Store) PrepareAttempt(id string, expectedGeneration uint64, start Attem
 		if err != nil {
 			return err
 		}
+		// These names are derived from the next event-backed ordinal. Existing
+		// files at this ordinal cannot belong to a committed Attempt; they are
+		// crash debris from blob creation before attempt.prepared.
+		if err = tx.RemoveBlob(stdoutName); err != nil {
+			return err
+		}
+		if err = tx.RemoveBlob(stderrName); err != nil {
+			return err
+		}
 		stdout, err = tx.CreateBlob(stdoutName)
 		if err != nil {
 			return err
@@ -132,6 +141,7 @@ func (s *Store) PrepareAttempt(id string, expectedGeneration uint64, start Attem
 		stderr, err = tx.CreateBlob(stderrName)
 		if err != nil {
 			_ = stdout.Close()
+			_ = tx.RemoveBlob(stdoutName)
 			return err
 		}
 		now := time.Now().UTC()
@@ -545,6 +555,7 @@ func applyRunning(activity *Activity, data runningEvent, at time.Time) {
 		if activity.Attempts[i].ID == data.AttemptID {
 			activity.Attempts[i].PID = data.Process.PID
 			activity.Attempts[i].ProcessStartToken = data.Process.ProcessStartToken
+			activity.Attempts[i].ProcessTreeID = data.Process.ProcessTreeID
 			activity.Attempts[i].SupervisorID = data.Process.SupervisorID
 			activity.Attempts[i].SupervisorGeneration = data.Process.SupervisorGeneration
 			activity.Attempts[i].State = StateRunning
@@ -613,7 +624,7 @@ func selectOutput(attempt Attempt, stream Stream) (OutputRef, error) {
 }
 
 func sameIdentity(attempt Attempt, identity AttemptIdentity) bool {
-	return attempt.ID == identity.ID && attempt.PID == identity.PID && attempt.ProcessStartToken == identity.ProcessStartToken && attempt.SupervisorID == identity.SupervisorID && attempt.SupervisorGeneration == identity.SupervisorGeneration
+	return attempt.ID == identity.ID && attempt.PID == identity.PID && attempt.ProcessStartToken == identity.ProcessStartToken && attempt.ProcessTreeID == identity.ProcessTreeID && attempt.SupervisorID == identity.SupervisorID && attempt.SupervisorGeneration == identity.SupervisorGeneration
 }
 
 func canStart(state State) bool {

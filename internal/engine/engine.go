@@ -290,10 +290,14 @@ func (e *Engine) reconcileActivity(w *core.Workflow, n *core.Node, tracked *acti
 	if readErr != nil || len(bytes.TrimSpace(b)) == 0 {
 		b = stdout
 	}
-	if result, parseErr := parseResult(b); parseErr == nil {
+	if (tracked.State == activity.StateCompleted || tracked.State == activity.StateLost) && len(bytes.TrimSpace(b)) > 0 {
+		result, parseErr := parseResult(b)
+		if parseErr != nil {
+			return true, e.reconcileInterruptedAgent(w, n, extractSessionID(stdout), n.Metadata["restart_safe"] == "true")
+		}
 		if tracked.State == activity.StateLost {
 			code := 0
-			identity := activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
+			identity := activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, ProcessTreeID: attempt.ProcessTreeID, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
 			if err := e.Activities.ResolveLost(tracked.ID, tracked.Generation, identity, activity.ExitResult{State: activity.StateCompleted, ExitCode: &code}); err != nil && !errors.Is(err, activity.ErrFenced) {
 				return true, err
 			}
@@ -301,14 +305,36 @@ func (e *Engine) reconcileActivity(w *core.Workflow, n *core.Node, tracked *acti
 		return true, e.applyAgentResult(w, n, result, extractSessionID(stdout), n.Attempt)
 	}
 	stderr, _ := os.ReadFile(attempt.Stderr.Path)
-	if tracked.State == activity.StateFailed && e.routeAfterLimit(w, n, n.Attempt, 0, attempt.Error, string(stderr), string(stdout)) {
-		return true, nil
+	if tracked.State == activity.StateFailed {
+		deliveryAttempt, deliveryErr := e.dispatchedDeliveryAttempt(w.ID, n.ID)
+		if deliveryErr != nil {
+			return true, deliveryErr
+		}
+		if e.routeAfterLimit(w, n, n.Attempt, deliveryAttempt, attempt.Error, string(stderr), string(stdout)) {
+			return true, e.requeueDelivery(w.ID, n.ID, deliveryAttempt)
+		}
+		failure := attempt.Error + ": " + truncate(string(stderr), 1000) + " " + truncate(string(stdout), 1000)
+		if failErr := e.failAgentAttempt(w, n, n.Attempt, deliveryAttempt, "runtime_failure", failure); failErr != nil {
+			return true, failErr
+		}
+		return true, e.requeueDelivery(w.ID, n.ID, deliveryAttempt)
 	}
 	sessionID := n.SessionID
 	if sessionID == "" {
 		sessionID = extractSessionID(stdout)
 	}
 	return true, e.reconcileInterruptedAgent(w, n, sessionID, n.Metadata["restart_safe"] == "true")
+}
+
+func (e *Engine) requeueDelivery(workflowID, nodeID string, deliveryAttempt int) error {
+	if deliveryAttempt == 0 {
+		return nil
+	}
+	agent, err := e.Sessions.LoadByNode(workflowID, nodeID)
+	if err != nil {
+		return err
+	}
+	return e.Sessions.Requeue(agent.ID, deliveryAttempt)
 }
 
 func (e *Engine) reconcileInterruptedAgent(w *core.Workflow, n *core.Node, sessionID string, restartSafe bool) error {
@@ -430,7 +456,7 @@ func (e *Engine) RecoverAttempt(id, nodeID string, attempt int) error {
 		}
 		if tracked.State == activity.StateLost {
 			code := 0
-			identity := activity.AttemptIdentity{ID: activityAttempt.ID, PID: activityAttempt.PID, ProcessStartToken: activityAttempt.ProcessStartToken, SupervisorID: activityAttempt.SupervisorID, SupervisorGeneration: activityAttempt.SupervisorGeneration}
+			identity := activity.AttemptIdentity{ID: activityAttempt.ID, PID: activityAttempt.PID, ProcessStartToken: activityAttempt.ProcessStartToken, ProcessTreeID: activityAttempt.ProcessTreeID, SupervisorID: activityAttempt.SupervisorID, SupervisorGeneration: activityAttempt.SupervisorGeneration}
 			if err = e.Activities.ResolveLost(tracked.ID, tracked.Generation, identity, activity.ExitResult{State: activity.StateCompleted, ExitCode: &code}); err != nil && !errors.Is(err, activity.ErrFenced) {
 				return err
 			}
@@ -585,14 +611,22 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		_ = e.Activities.FailPrepared(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, failure)
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", failure)
 	}
-	activityAttempt, err = e.Activities.MarkRunning(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, activity.ProcessIdentity{PID: cmd.Process.Pid, ProcessStartToken: processToken, SupervisorID: runstate.SupervisorIdentity(), SupervisorGeneration: 1})
+	treeID, treeErr := activity.BindProcessTree(cmd.Process.Pid, processToken)
+	if treeErr != nil {
+		gated.Abort()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		_ = e.Activities.FailPrepared(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, treeErr.Error())
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", treeErr.Error())
+	}
+	activityAttempt, err = e.Activities.MarkRunning(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, activity.ProcessIdentity{PID: cmd.Process.Pid, ProcessStartToken: processToken, ProcessTreeID: treeID, SupervisorID: runstate.SupervisorIdentity(), SupervisorGeneration: 1})
 	if err != nil {
 		gated.Abort()
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
-	activityIdentity := activity.AttemptIdentity{ID: activityAttempt.ID, PID: activityAttempt.PID, ProcessStartToken: activityAttempt.ProcessStartToken, SupervisorID: activityAttempt.SupervisorID, SupervisorGeneration: activityAttempt.SupervisorGeneration}
+	activityIdentity := activity.AttemptIdentity{ID: activityAttempt.ID, PID: activityAttempt.PID, ProcessStartToken: activityAttempt.ProcessStartToken, ProcessTreeID: activityAttempt.ProcessTreeID, SupervisorID: activityAttempt.SupervisorID, SupervisorGeneration: activityAttempt.SupervisorGeneration}
 	gated.CompleteActivity(e.Activities.Root(), activityRecord.ID, activityRecord.Generation, activityIdentity)
 	if err = gated.Release(); err != nil {
 		_, _ = (&activity.Supervisor{Store: e.Activities}).StopExpected(activityRecord.ID, activity.ControlRequest{ExpectedGeneration: activityRecord.Generation, ExpectedAttempt: activityIdentity})
@@ -956,7 +990,7 @@ func (e *Engine) dispatchedDeliveryAttempt(workflowID, nodeID string) (int, erro
 
 func (e *Engine) failAgentAttempt(w *core.Workflow, n *core.Node, attempt, deliveryAttempt int, outcome, reason string) error {
 	state := core.NodeFailed
-	if n.Attempt+1 < n.MaxAttempts {
+	if attempt < n.MaxAttempts {
 		state = core.NodeReady
 	}
 	_, err := e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{

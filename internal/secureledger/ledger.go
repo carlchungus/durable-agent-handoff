@@ -309,6 +309,32 @@ func (tx *Txn) CreateBlob(name string) (*os.File, error) {
 	return tx.ledger.openRegular(tx.root, name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 }
 
+// RemoveBlob removes only a regular blob inside the pinned record directory.
+// It is used to clear pre-event files left by a crashed transaction; redirects
+// and non-regular replacements fail closed instead of being followed.
+func (tx *Txn) RemoveBlob(name string) error {
+	if !validBlobName(name) {
+		return fmt.Errorf("invalid secure ledger blob name %q", name)
+	}
+	if err := tx.validate("blob remove"); err != nil {
+		return err
+	}
+	info, err := tx.root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("secure ledger blob %q is not a regular file", name)
+	}
+	if err = tx.root.Remove(name); err != nil {
+		return err
+	}
+	return syncRoot(tx.root)
+}
+
 func (l *Ledger) ReadBlob(id, name string, after int64, maxBytes int) (BlobChunk, error) {
 	if err := l.validateID(id); err != nil {
 		return BlobChunk{}, err

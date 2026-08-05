@@ -353,6 +353,72 @@ func TestSnapshotReplacesDestinationSymlinkButRejectsPlantedTemporaryLink(t *tes
 	}
 }
 
+func TestAppendRejectsEventFileReplacementAfterOpen(t *testing.T) {
+	ledger := testLedger(t)
+	appendOne := func() error {
+		return ledger.Update("rec_event_swap", func(tx *Txn) error {
+			_, err := tx.Append(func(next uint64) ([]byte, error) {
+				return []byte(fmt.Sprintf(`{"sequence":%d}`, next)), nil
+			})
+			return err
+		})
+	}
+	if err := appendOne(); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(ledger.rootPath, "records", "rec_event_swap")
+	swapped := false
+	ledger.safetyHooks.beforeValidation = func(boundary string) {
+		if boundary != "ledger append" || swapped {
+			return
+		}
+		swapped = true
+		if err := os.Rename(filepath.Join(record, "events.jsonl"), filepath.Join(record, "displaced.jsonl")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(record, "events.jsonl"), []byte("replacement\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := appendOne(); err == nil {
+		t.Fatal("accepted event file replacement after opening the pinned file")
+	}
+	if got, err := os.ReadFile(filepath.Join(record, "events.jsonl")); err != nil || string(got) != "replacement\n" {
+		t.Fatalf("replacement was mutated: %q err=%v", got, err)
+	}
+}
+
+func TestSnapshotRejectsTemporaryFileReplacementBeforeRename(t *testing.T) {
+	ledger := testLedger(t)
+	if err := ledger.Update("rec_snapshot_swap", func(tx *Txn) error { return tx.ReplaceSnapshot([]byte("old\n")) }); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(ledger.rootPath, "records", "rec_snapshot_swap")
+	swapped := false
+	ledger.safetyHooks.beforeValidation = func(boundary string) {
+		if boundary != "snapshot rename" || swapped {
+			return
+		}
+		swapped = true
+		matches, err := filepath.Glob(filepath.Join(record, ".state.json.tmp-*"))
+		if err != nil || len(matches) != 1 {
+			t.Fatalf("temporary snapshots=%v err=%v", matches, err)
+		}
+		if err = os.Rename(matches[0], matches[0]+".displaced"); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(matches[0], []byte("attacker\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ledger.Update("rec_snapshot_swap", func(tx *Txn) error { return tx.ReplaceSnapshot([]byte("new\n")) }); err == nil {
+		t.Fatal("accepted snapshot temporary-file replacement before rename")
+	}
+	if got, err := os.ReadFile(filepath.Join(record, "state.json")); err != nil || string(got) != "old\n" {
+		t.Fatalf("canonical snapshot changed: %q err=%v", got, err)
+	}
+}
+
 func TestRejectsGroupWritableRootOnUnix(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix permission contract")

@@ -238,8 +238,14 @@ func (tx *Txn) Append(encode func(nextSequence uint64) ([]byte, error)) (_ uint6
 	if err = tx.validate("ledger append"); err != nil {
 		return 0, err
 	}
+	if err = validatePinnedRegular(tx.root, "events.jsonl", file); err != nil {
+		return 0, fmt.Errorf("secure ledger event file changed before append: %w", err)
+	}
 	if _, err = file.Write(append(raw, '\n')); err == nil {
 		err = file.Sync()
+	}
+	if err == nil {
+		err = validatePinnedRegular(tx.root, "events.jsonl", file)
 	}
 	return next, err
 }
@@ -253,6 +259,11 @@ func (tx *Txn) ReplaceSnapshot(data []byte) error {
 	if err != nil {
 		return err
 	}
+	tmpIdentity, err := identifyStorageFile(file)
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
 	defer tx.root.Remove(tmp)
 	if err = tx.validate("snapshot write"); err != nil {
 		_ = file.Close()
@@ -260,6 +271,9 @@ func (tx *Txn) ReplaceSnapshot(data []byte) error {
 	}
 	if _, err = file.Write(data); err == nil {
 		err = file.Sync()
+	}
+	if err == nil {
+		err = validatePinnedRegular(tx.root, tmp, file)
 	}
 	if closeErr := file.Close(); err == nil {
 		err = closeErr
@@ -270,8 +284,14 @@ func (tx *Txn) ReplaceSnapshot(data []byte) error {
 	if err = tx.validate("snapshot rename"); err != nil {
 		return err
 	}
+	if err = validateRegularIdentity(tx.root, tmp, tmpIdentity); err != nil {
+		return fmt.Errorf("secure ledger snapshot temporary file changed before rename: %w", err)
+	}
 	if err = tx.root.Rename(tmp, "state.json"); err != nil {
 		return err
+	}
+	if err = validateRegularIdentity(tx.root, "state.json", tmpIdentity); err != nil {
+		return fmt.Errorf("secure ledger snapshot identity changed during rename: %w", err)
 	}
 	if directory, openErr := tx.root.Open("."); openErr == nil {
 		_ = directory.Sync()
@@ -679,6 +699,24 @@ func validatePinnedRegular(root *os.Root, name string, pinned *os.File) error {
 		return errors.New("public entry no longer names the pinned regular file")
 	}
 	return validateRegularFile(pinned)
+}
+
+func validateRegularIdentity(root *os.Root, name string, expected storageIdentity) error {
+	current, err := root.Lstat(name)
+	if err != nil {
+		return err
+	}
+	if !current.Mode().IsRegular() {
+		return errors.New("public entry is not a regular file")
+	}
+	identity, err := identifyRegularPath(root, name)
+	if err != nil {
+		return err
+	}
+	if !sameStorageIdentity(identity, expected) {
+		return errors.New("public entry no longer names the expected regular file")
+	}
+	return nil
 }
 
 const (

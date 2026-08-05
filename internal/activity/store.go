@@ -154,8 +154,8 @@ func (s *Store) PrepareAttempt(id string, expectedGeneration uint64, start Attem
 }
 
 func (s *Store) MarkRunning(id string, expectedGeneration uint64, attemptID string, process ProcessIdentity) (Attempt, error) {
-	if process.PID <= 0 || strings.TrimSpace(process.ProcessStartToken) == "" || process.SupervisorGeneration == 0 {
-		return Attempt{}, errors.New("running attempt requires exact pid, process start token, and supervisor generation")
+	if process.PID <= 0 || strings.TrimSpace(process.ProcessStartToken) == "" || strings.TrimSpace(process.SupervisorID) == "" || process.SupervisorGeneration == 0 {
+		return Attempt{}, errors.New("running attempt requires exact pid, process start token, supervisor id, and supervisor generation")
 	}
 	var result Attempt
 	err := s.ledger.Update(id, func(tx *secureledger.Txn) error {
@@ -199,7 +199,10 @@ func (s *Store) FailPrepared(id string, expectedGeneration uint64, attemptID, re
 	})
 }
 
-func (s *Store) AdoptAttempt(id string, expectedGeneration uint64, expected AttemptIdentity) (Attempt, *Activity, error) {
+func (s *Store) AdoptAttempt(id string, expectedGeneration uint64, expected AttemptIdentity, supervisorID string) (Attempt, *Activity, error) {
+	if strings.TrimSpace(supervisorID) == "" {
+		return Attempt{}, nil, errors.New("adopting supervisor id is required")
+	}
 	var adopted Attempt
 	var result *Activity
 	err := s.ledger.Update(id, func(tx *secureledger.Txn) error {
@@ -212,7 +215,7 @@ func (s *Store) AdoptAttempt(id string, expectedGeneration uint64, expected Atte
 			return ErrFenced
 		}
 		now := time.Now().UTC()
-		data := adoptEvent{Expected: expected, Generation: activity.Generation + 1, SupervisorGeneration: current.SupervisorGeneration + 1}
+		data := adoptEvent{Expected: expected, Generation: activity.Generation + 1, SupervisorID: supervisorID, SupervisorGeneration: current.SupervisorGeneration + 1}
 		if err = appendEvent(tx, Event{ActivityID: id, Type: "attempt.adopted", At: now, Data: data}); err != nil {
 			return err
 		}
@@ -456,6 +459,7 @@ type runningEvent struct {
 type adoptEvent struct {
 	Expected             AttemptIdentity `json:"expected"`
 	Generation           uint64          `json:"generation"`
+	SupervisorID         string          `json:"supervisor_id"`
 	SupervisorGeneration uint64          `json:"supervisor_generation"`
 }
 
@@ -508,6 +512,7 @@ func applyRunning(activity *Activity, data runningEvent, at time.Time) {
 		if activity.Attempts[i].ID == data.AttemptID {
 			activity.Attempts[i].PID = data.Process.PID
 			activity.Attempts[i].ProcessStartToken = data.Process.ProcessStartToken
+			activity.Attempts[i].SupervisorID = data.Process.SupervisorID
 			activity.Attempts[i].SupervisorGeneration = data.Process.SupervisorGeneration
 			activity.Attempts[i].State = StateRunning
 			break
@@ -521,6 +526,7 @@ func applyRunning(activity *Activity, data runningEvent, at time.Time) {
 func applyAdopt(activity *Activity, data adoptEvent, at time.Time) {
 	for i := range activity.Attempts {
 		if activity.Attempts[i].ID == data.Expected.ID {
+			activity.Attempts[i].SupervisorID = data.SupervisorID
 			activity.Attempts[i].SupervisorGeneration = data.SupervisorGeneration
 			break
 		}
@@ -574,7 +580,7 @@ func selectOutput(attempt Attempt, stream Stream) (OutputRef, error) {
 }
 
 func sameIdentity(attempt Attempt, identity AttemptIdentity) bool {
-	return attempt.ID == identity.ID && attempt.PID == identity.PID && attempt.ProcessStartToken == identity.ProcessStartToken && attempt.SupervisorGeneration == identity.SupervisorGeneration
+	return attempt.ID == identity.ID && attempt.PID == identity.PID && attempt.ProcessStartToken == identity.ProcessStartToken && attempt.SupervisorID == identity.SupervisorID && attempt.SupervisorGeneration == identity.SupervisorGeneration
 }
 
 func canStart(state State) bool {

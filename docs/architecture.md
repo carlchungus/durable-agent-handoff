@@ -73,9 +73,8 @@ Independently controllable work uses a separate Activity ledger:
 $HANDOFF_HOME/activities/ACTIVITY_ID/
   events.jsonl
   state.json
-  attempts/ATTEMPT_ID/
-    stdout.log
-    stderr.log
+  ATTEMPT_ID_stdout.log
+  ATTEMPT_ID_stderr.log
 ```
 
 A Session owns conversational identity; an Activity owns work lifecycle and
@@ -87,8 +86,10 @@ processes.
 An attachment is an ephemeral reader over an Activity revision and byte cursor.
 Disconnecting it has no lifecycle effect. Stop, signal, adopt, and restart are
 durable control intents that include the expected Activity generation and exact
-Attempt process identity (PID plus platform start token). Stale controllers and
-PID reuse fail closed.
+Attempt process identity (attempt ID, PID plus platform start token, supervisor
+ID, and supervisor generation). A live process is adopted once per supervisor
+incarnation; routine reconciliation by the same owner does not churn fencing
+tokens. Stale controllers and PID reuse fail closed.
 
 The ledger reducer produces the sole Activity projection used by human TUI,
 JSON/JSONL, RPC, and policy. A combined snapshot-and-subscribe operation orders
@@ -97,6 +98,13 @@ between snapshot and follow. The prior-art evidence and license boundary are in
 [`prior-art-codex-pi-omp.md`](prior-art-codex-pi-omp.md); the domain decision is
 recorded in
 [`ADR 0001`](adr/0001-separate-sessions-and-activities.md).
+
+The ledger root is a supervisor-private trust boundary and must remain outside
+worker-writable sandboxes. Descriptor-relative opens, ownership/mode checks,
+single-link regular files, pinned identities, locks, fsync, and replay repair
+fail closed on accidental or uncoordinated path replacement. They do not claim
+to isolate an actively malicious unsandboxed process running as the supervisor's
+same OS user; such a process can also inspect or signal the supervisor directly.
 
 ## Scheduling
 

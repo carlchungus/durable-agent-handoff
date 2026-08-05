@@ -513,7 +513,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		_ = e.Activities.FailPrepared(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, failure)
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", failure)
 	}
-	activityAttempt, err = e.Activities.MarkRunning(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, activity.ProcessIdentity{PID: cmd.Process.Pid, ProcessStartToken: processToken, SupervisorGeneration: 1})
+	activityAttempt, err = e.Activities.MarkRunning(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, activity.ProcessIdentity{PID: cmd.Process.Pid, ProcessStartToken: processToken, SupervisorID: runstate.SupervisorIdentity(), SupervisorGeneration: 1})
 	if err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -575,7 +575,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	if cmd.ProcessState != nil {
 		activityExitCode = cmd.ProcessState.ExitCode()
 	}
-	finishActivityErr := e.Activities.FinishAttempt(activityRecord.ID, activityRecord.Generation, activity.AttemptIdentity{ID: activityAttempt.ID, PID: activityAttempt.PID, ProcessStartToken: activityAttempt.ProcessStartToken, SupervisorGeneration: activityAttempt.SupervisorGeneration}, activity.ExitResult{State: activityState, ExitCode: &activityExitCode, Error: activityError})
+	finishActivityErr := e.Activities.FinishAttempt(activityRecord.ID, activityRecord.Generation, activity.AttemptIdentity{ID: activityAttempt.ID, PID: activityAttempt.PID, ProcessStartToken: activityAttempt.ProcessStartToken, SupervisorID: activityAttempt.SupervisorID, SupervisorGeneration: activityAttempt.SupervisorGeneration}, activity.ExitResult{State: activityState, ExitCode: &activityExitCode, Error: activityError})
 	if errors.Is(finishActivityErr, activity.ErrFenced) {
 		return nil
 	}

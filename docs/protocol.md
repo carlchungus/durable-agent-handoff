@@ -47,6 +47,16 @@ Fields are additive during the `0.x` series. Consumers must ignore unknown JSON 
 
 Provider health is available through `handoff preference health`. Each entry includes the runtime/model key, classified limit type, redacted reason, observation time, and cooldown deadline.
 
+Preference resolution intersects the node and candidate sandboxes across every ladder step. A provider/model fallback cannot widen `read-only` work to `workspace-write`, even when a configured candidate explicitly requests wider access.
+
+## Activity protocol
+
+`handoff activity list --json` and `handoff activity read ACTIVITY_ID --json` return the canonical Activity projection. An Activity owns a stable logical launch and ordered Attempts; each Attempt records runtime, model, command digest, exact process identity, supervisor ownership, output identities, and terminal result.
+
+`handoff activity follow ACTIVITY_ID --stream stdout|stderr --output OUTPUT_ID --after BYTE --json` emits cursor-addressed chunks. Reconnect clients must retain `output_id` and `end`; a changed output identity fails closed instead of silently attaching to a fallback or restarted Attempt. Attachments have no lifecycle authority.
+
+`handoff activity stop ACTIVITY_ID --if-generation GENERATION --if-attempt ATTEMPT_ID --json` records and applies an exact fenced control intent. Automation must provide both fences. A human may omit them to request a stop against the projection current at command time. PID-only control is never accepted.
+
 ## Durable agent session protocol
 
 Background agent identity and inbox state use a separate append-only ledger at `$HANDOFF_HOME/sessions/AGENT_ID/events.jsonl`; a replaceable `state.json` snapshot is rebuilt from that ledger after loss. The stable harness agent ID is derived from workflow and node identity. `runtime_session_id` is the exact opaque runtime identity and is never replaced by a global or most-recent session.

@@ -83,6 +83,14 @@ func TestSupervisorCrashReattachesByCursorAndFencesStaleStop(t *testing.T) {
 	if !ok || after.Generation != 2 || current.ID != ready.Attempt.ID || current.SupervisorGeneration != 2 || current.Stdout.ID != ready.Attempt.Stdout.ID {
 		t.Fatalf("adopted=%+v", after)
 	}
+	owned, err := supervisor.Recover()
+	if err != nil || len(owned) != 0 {
+		t.Fatalf("same supervisor re-adopted activity: recovered=%+v err=%v", owned, err)
+	}
+	unchanged, err := store.Load(after.ID)
+	if err != nil || unchanged.Generation != after.Generation || unchanged.Attempts[0].SupervisorGeneration != current.SupervisorGeneration {
+		t.Fatalf("same-owner recovery changed fencing tokens: activity=%+v err=%v", unchanged, err)
+	}
 	chunk, err := store.ReadOutput(after.ID, OutputCursor{AttemptID: current.ID, Stream: StreamStdout, OutputID: current.Stdout.ID, After: 0}, 64<<10)
 	if err != nil || !strings.Contains(string(chunk.Data), "one\n") {
 		t.Fatalf("chunk=%q err=%v", chunk.Data, err)

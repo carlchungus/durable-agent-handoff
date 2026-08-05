@@ -29,7 +29,7 @@ func TestActivityAttemptOutputAndFencedStopSurviveSnapshotLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attempt, err = store.MarkRunning(created.ID, 1, attempt.ID, ProcessIdentity{PID: 4242, ProcessStartToken: "token-a", SupervisorGeneration: 7})
+	attempt, err = store.MarkRunning(created.ID, 1, attempt.ID, ProcessIdentity{PID: 4242, ProcessStartToken: "token-a", SupervisorID: "supervisor-a", SupervisorGeneration: 7})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestActivityLaunchIsImmutableAndOutputIdentityIsExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attempt, err = store.MarkRunning(created.ID, created.Generation, attempt.ID, ProcessIdentity{PID: 7, ProcessStartToken: "token", SupervisorGeneration: 1})
+	attempt, err = store.MarkRunning(created.ID, created.Generation, attempt.ID, ProcessIdentity{PID: 7, ProcessStartToken: "token", SupervisorID: "supervisor-a", SupervisorGeneration: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,5 +123,5 @@ func TestEnsureReusesOnlyTheExactImmutableLaunch(t *testing.T) {
 }
 
 func identity(attempt Attempt) AttemptIdentity {
-	return AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorGeneration: attempt.SupervisorGeneration}
+	return AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
 }

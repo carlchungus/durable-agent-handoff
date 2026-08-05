@@ -34,6 +34,7 @@ func TestUsageLimitFallsThroughConfiguredLadder(t *testing.T) {
 	st, _ := core.OpenStore(state)
 	sessions, _ := agentsession.OpenStore(state)
 	w, _ := st.Create("fallback", t.TempDir(), core.DefaultBudget())
+	primary.Sandbox = "workspace-write"
 	n := &core.Node{ID: "plan", Title: "plan", Kind: "agent", Role: "planner", Runtime: primary}
 	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
 	agent, _ := sessions.Ensure(agentsession.Descriptor{WorkflowID: w.ID, NodeID: n.ID})
@@ -43,7 +44,7 @@ func TestUsageLimitFallsThroughConfiguredLadder(t *testing.T) {
 		t.Fatal(err)
 	}
 	afterLimit, _ := st.Load(w.ID)
-	if afterLimit.Nodes["plan"].Runtime.Model != "backup" || afterLimit.Nodes["plan"].State != core.NodeReady {
+	if afterLimit.Nodes["plan"].Runtime.Model != "backup" || afterLimit.Nodes["plan"].Runtime.Sandbox != "workspace-write" || afterLimit.Nodes["plan"].State != core.NodeReady {
 		t.Fatalf("after limit=%#v", afterLimit.Nodes["plan"])
 	}
 	if afterLimit.Nodes["plan"].Attempt != 0 {

@@ -148,8 +148,8 @@ func cmdActivity(args []string, out io.Writer) error {
 		fmt.Fprintf(out, "%s  %s  generation=%d revision=%d\n", item.ID, item.State, item.Generation, item.Revision)
 		fmt.Fprintf(out, "command: %s\n", strings.Join(item.Launch.Argv, " "))
 		for _, attempt := range item.Attempts {
-			fmt.Fprintf(out, "%s  %s  pid=%d supervisor=%d\n", attempt.ID, attempt.State, attempt.PID, attempt.SupervisorGeneration)
-			fmt.Fprintf(out, "  stdout: %s\n  stderr: %s\n", attempt.Stdout.Path, attempt.Stderr.Path)
+			fmt.Fprintf(out, "%s  %s  pid=%d supervisor=%s generation=%d\n", attempt.ID, attempt.State, attempt.PID, attempt.SupervisorID, attempt.SupervisorGeneration)
+			fmt.Fprintf(out, "  stdout: %s  %s\n  stderr: %s  %s\n", attempt.Stdout.ID, attempt.Stdout.Path, attempt.Stderr.ID, attempt.Stderr.Path)
 		}
 		return nil
 	case "follow":
@@ -266,7 +266,7 @@ func selectActivityOutput(item *activity.Activity, stream activity.Stream, reque
 func activityAttemptIdentity(item *activity.Activity, attemptID string) (activity.AttemptIdentity, error) {
 	for _, attempt := range item.Attempts {
 		if attempt.ID == attemptID {
-			return activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorGeneration: attempt.SupervisorGeneration}, nil
+			return activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}, nil
 		}
 	}
 	return activity.AttemptIdentity{}, fmt.Errorf("attempt %q was not found", attemptID)

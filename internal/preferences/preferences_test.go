@@ -40,6 +40,34 @@ func TestLadderSkipsCoolingCandidateAndPersists(t *testing.T) {
 	}
 }
 
+func TestLadderFallbackPreservesExplicitSandbox(t *testing.T) {
+	m := Open(t.TempDir())
+	primary := core.RuntimeSpec{Name: "claude", Model: "opus"}
+	backup := core.RuntimeSpec{Name: "codex", Model: "gpt-5.6-luna"}
+	if err := m.Set("planner", []core.RuntimeSpec{primary, backup}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Record(primary, "usage_limit", "usage limit"); err != nil {
+		t.Fatal(err)
+	}
+	got, index, err := m.Resolve("planner", core.RuntimeSpec{Name: "claude", Model: "opus", Sandbox: "read-only"})
+	if err != nil || index != 1 || got.Name != "codex" || got.Sandbox != "read-only" {
+		t.Fatalf("fallback=%+v index=%d err=%v", got, index, err)
+	}
+}
+
+func TestLadderCandidateCannotWidenReadOnlyJob(t *testing.T) {
+	m := Open(t.TempDir())
+	candidate := core.RuntimeSpec{Name: "codex", Model: "gpt-5.6-luna", Sandbox: "workspace-write"}
+	if err := m.Set("verifier", []core.RuntimeSpec{candidate}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := m.Resolve("verifier", core.RuntimeSpec{Name: "claude", Model: "opus", Sandbox: "read-only"})
+	if err != nil || got.Sandbox != "read-only" {
+		t.Fatalf("candidate widened read-only job: got=%+v err=%v", got, err)
+	}
+}
+
 func TestAllCandidatesCoolingReturnsWakeTime(t *testing.T) {
 	m := Open(t.TempDir())
 	m.now = func() time.Time { return time.Unix(1000, 0).UTC() }

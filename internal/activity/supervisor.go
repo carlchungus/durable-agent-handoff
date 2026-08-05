@@ -15,6 +15,8 @@ type Supervisor struct {
 	Env   []string
 }
 
+func (s *Supervisor) ownerID() string { return runstate.SupervisorIdentity() }
+
 func (s *Supervisor) Start(descriptor Descriptor) (*Activity, Attempt, error) {
 	if s == nil || s.Store == nil {
 		return nil, Attempt{}, errors.New("activity supervisor store is required")
@@ -49,7 +51,7 @@ func (s *Supervisor) Start(descriptor Descriptor) (*Activity, Attempt, error) {
 		_ = command.Wait()
 		return nil, Attempt{}, errors.New("could not establish exact process start token")
 	}
-	attempt, err = s.Store.MarkRunning(activity.ID, activity.Generation, attempt.ID, ProcessIdentity{PID: command.Process.Pid, ProcessStartToken: token, SupervisorGeneration: 1})
+	attempt, err = s.Store.MarkRunning(activity.ID, activity.Generation, attempt.ID, ProcessIdentity{PID: command.Process.Pid, ProcessStartToken: token, SupervisorID: s.ownerID(), SupervisorGeneration: 1})
 	if err != nil {
 		_ = command.Process.Kill()
 		_ = command.Wait()
@@ -84,7 +86,10 @@ func (s *Supervisor) Recover() ([]*Activity, error) {
 			}
 			continue
 		}
-		_, adopted, adoptErr := s.Store.AdoptAttempt(activity.ID, activity.Generation, identity)
+		if attempt.SupervisorID == s.ownerID() {
+			continue
+		}
+		_, adopted, adoptErr := s.Store.AdoptAttempt(activity.ID, activity.Generation, identity, s.ownerID())
 		if adoptErr != nil {
 			return nil, adoptErr
 		}
@@ -179,7 +184,7 @@ func waitForStartToken(pid int, timeout time.Duration) string {
 }
 
 func identityOf(attempt Attempt) AttemptIdentity {
-	return AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorGeneration: attempt.SupervisorGeneration}
+	return AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
 }
 
 func processMatches(identity AttemptIdentity) bool {

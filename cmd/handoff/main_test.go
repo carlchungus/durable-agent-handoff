@@ -156,7 +156,7 @@ func TestActivityCLIUsesTheDurableProjectionAndOutputCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attempt, err = store.MarkRunning(item.ID, item.Generation, attempt.ID, activity.ProcessIdentity{PID: 123, ProcessStartToken: "exact", SupervisorGeneration: 1})
+	attempt, err = store.MarkRunning(item.ID, item.Generation, attempt.ID, activity.ProcessIdentity{PID: 123, ProcessStartToken: "exact", SupervisorID: "supervisor-a", SupervisorGeneration: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestActivityCLIUsesTheDurableProjectionAndOutputCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorGeneration: attempt.SupervisorGeneration}
+	identity := activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
 	if err = store.FinishAttempt(item.ID, item.Generation, identity, activity.ExitResult{State: activity.StateCompleted}); err != nil {
 		t.Fatal(err)
 	}
@@ -188,6 +188,13 @@ func TestActivityCLIUsesTheDurableProjectionAndOutputCursor(t *testing.T) {
 	var read activity.Activity
 	if err = json.Unmarshal(out.Bytes(), &read); err != nil || read.State != activity.StateCompleted {
 		t.Fatalf("read=%+v err=%v", read, err)
+	}
+	out.Reset()
+	if err = run([]string{"activity", "read", "--state", state, item.ID}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte(attempt.Stdout.ID)) || !bytes.Contains(out.Bytes(), []byte("supervisor-a")) {
+		t.Fatalf("human activity read omitted reconnect identity: %q", out.String())
 	}
 	out.Reset()
 	if err = run([]string{"activity", "follow", "--state", state, item.ID, "--stream", "stdout", "--output", attempt.Stdout.ID, "--after", "0"}, &out, &errOut); err != nil {

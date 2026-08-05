@@ -84,6 +84,27 @@ When a limit is observed, `handoff` records the provider/model cooldown durably,
 
 Claude's own headless `--fallback-model` can still be useful within Claude for overload, but the external ladder is what crosses harness and billing boundaries. Model names are deliberately not hardcoded; inspect the live runtime catalog (for example, `pi --list-models kimi`) before choosing aliases.
 
+Fallback changes execution capacity, never authority: sandbox selection takes the narrower of the job and candidate, so a `read-only` job remains read-only even if a configured candidate requests workspace-write.
+
+## Observe and control background work
+
+Activities are the process-lifecycle side of agent Sessions. They retain each runtime attempt, exact process identity, and stdout/stderr even when the scheduler dies.
+
+```sh
+handoff activity list --json
+handoff activity read ACTIVITY_ID --json
+
+# Reattach to an exact output at a durable byte cursor.
+handoff activity follow ACTIVITY_ID \
+  --stream stdout --output OUTPUT_ID --after BYTE_OFFSET --json
+
+# Automation should fence control with values returned by read/list.
+handoff activity stop ACTIVITY_ID \
+  --if-generation GENERATION --if-attempt ATTEMPT_ID --json
+```
+
+`read` returns lifecycle metadata; `follow` reads output. Omitting `--output` follows the newest attempt, which is convenient for humans but not a safe reconnect contract for automation. Disconnecting a follower never stops the worker. A fenced stop is rejected if recovery, fallback, or another controller changed the Activity generation or exact Attempt.
+
 ## Recover stopped Claude Code work
 
 Discovery reads only recent local transcripts and emits sanitized text metadata. Tool inputs and outputs are skipped.

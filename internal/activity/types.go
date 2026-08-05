@@ -54,6 +54,7 @@ type Attempt struct {
 	LaunchDigest         string    `json:"launch_digest,omitempty"`
 	PID                  int       `json:"pid"`
 	ProcessStartToken    string    `json:"process_start_token"`
+	SupervisorID         string    `json:"supervisor_id"`
 	SupervisorGeneration uint64    `json:"supervisor_generation"`
 	State                State     `json:"state"`
 	Stdout               OutputRef `json:"stdout"`
@@ -73,6 +74,7 @@ type AttemptStart struct {
 type ProcessIdentity struct {
 	PID                  int
 	ProcessStartToken    string
+	SupervisorID         string
 	SupervisorGeneration uint64
 }
 
@@ -80,6 +82,7 @@ type AttemptIdentity struct {
 	ID                   string `json:"id"`
 	PID                  int    `json:"pid"`
 	ProcessStartToken    string `json:"process_start_token"`
+	SupervisorID         string `json:"supervisor_id"`
 	SupervisorGeneration uint64 `json:"supervisor_generation"`
 }
 

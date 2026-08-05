@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -71,9 +72,15 @@ func TestLedgerEventAfterSnapshotRemainsVisible(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	message := Message{ID: "message-1", Sequence: 1, From: "human", Body: "after snapshot", State: MessageQueued, CreatedAt: now}
-	if err = store.appendLocked(agent.ID, Event{SessionID: agent.ID, Type: "message.queued", At: now, Data: message}); err != nil {
+	root, release, err := store.acquire(agent.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if err = store.appendLocked(root, agent.ID, Event{SessionID: agent.ID, Type: "message.queued", At: now, Data: message}); err != nil {
+		release()
+		t.Fatal(err)
+	}
+	release()
 	loaded, err := store.Load(agent.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -289,6 +296,149 @@ func TestSessionIDsCannotEscapeStateDirectory(t *testing.T) {
 	}
 }
 
+func TestOpenStoreRejectsLinkedSessionsDirectory(t *testing.T) {
+	state := t.TempDir()
+	outside := t.TempDir()
+	sentinel := filepath.Join(outside, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requireSymlink(t, outside, filepath.Join(state, "sessions"))
+	if _, err := OpenStore(state); err == nil {
+		t.Fatal("OpenStore accepted a linked sessions directory")
+	}
+	assertFileContent(t, sentinel, "unchanged")
+}
+
+func TestStoreRejectsLinkedSessionDirectory(t *testing.T) {
+	state := t.TempDir()
+	store, _ := OpenStore(state)
+	outside := t.TempDir()
+	sentinel := filepath.Join(outside, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id := stableID("wf_linked_session", "lead")
+	requireSymlink(t, outside, filepath.Join(state, "sessions", id))
+	if _, _, err := store.acquire(id); err == nil {
+		t.Fatal("acquire accepted a linked session directory")
+	}
+	assertFileContent(t, sentinel, "unchanged")
+}
+
+func TestStoreFilesCannotRedirectOutsideSessionDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		filename string
+		operate  func(*testing.T, *Store, string) error
+	}{
+		{
+			name:     "lock",
+			filename: ".write.lock",
+			operate: func(_ *testing.T, store *Store, id string) error {
+				_, _, err := store.acquire(id)
+				return err
+			},
+		},
+		{
+			name:     "ledger",
+			filename: "events.jsonl",
+			operate: func(_ *testing.T, store *Store, _ string) error {
+				_, err := store.Ensure(Descriptor{WorkflowID: "wf_linked_file", NodeID: "lead"})
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := t.TempDir()
+			store, _ := OpenStore(state)
+			id := stableID("wf_linked_file", "lead")
+			sessionDir := filepath.Join(state, "sessions", id)
+			if err := os.Mkdir(sessionDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			outside := t.TempDir()
+			sentinel := filepath.Join(outside, "sentinel")
+			if err := os.WriteFile(sentinel, []byte("unchanged"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			requireSymlink(t, sentinel, filepath.Join(sessionDir, tc.filename))
+			if err := tc.operate(t, store, id); err == nil {
+				t.Fatalf("operation accepted linked %s", tc.filename)
+			}
+			assertFileContent(t, sentinel, "unchanged")
+		})
+	}
+}
+
+func TestSnapshotCannotFollowStateOrTemporaryLink(t *testing.T) {
+	t.Run("state destination", func(t *testing.T) {
+		state := t.TempDir()
+		store, _ := OpenStore(state)
+		id := stableID("wf_state_link", "lead")
+		sessionDir := filepath.Join(state, "sessions", id)
+		if err := os.Mkdir(sessionDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		sentinel := filepath.Join(t.TempDir(), "sentinel")
+		if err := os.WriteFile(sentinel, []byte("unchanged"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		requireSymlink(t, sentinel, filepath.Join(sessionDir, "state.json"))
+		if _, err := store.Ensure(Descriptor{WorkflowID: "wf_state_link", NodeID: "lead"}); err != nil {
+			t.Fatal(err)
+		}
+		assertFileContent(t, sentinel, "unchanged")
+		info, err := os.Lstat(filepath.Join(sessionDir, "state.json"))
+		if err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("snapshot did not replace link with a regular file: info=%v err=%v", info, err)
+		}
+	})
+
+	t.Run("temporary file", func(t *testing.T) {
+		state := t.TempDir()
+		store, _ := OpenStore(state)
+		fixed := time.Unix(123, 456)
+		store.now = func() time.Time { return fixed }
+		id := stableID("wf_temp_link", "lead")
+		sessionDir := filepath.Join(state, "sessions", id)
+		if err := os.Mkdir(sessionDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		sentinel := filepath.Join(t.TempDir(), "sentinel")
+		if err := os.WriteFile(sentinel, []byte("unchanged"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		tmp := fmt.Sprintf(".state.json.tmp-%d-%d", os.Getpid(), fixed.UnixNano())
+		requireSymlink(t, sentinel, filepath.Join(sessionDir, tmp))
+		if _, err := store.Ensure(Descriptor{WorkflowID: "wf_temp_link", NodeID: "lead"}); err == nil {
+			t.Fatal("snapshot accepted a planted temporary-file link")
+		}
+		assertFileContent(t, sentinel, "unchanged")
+	})
+}
+
+func TestLockHardLinkCannotTruncateOutsideFile(t *testing.T) {
+	state := t.TempDir()
+	store, _ := OpenStore(state)
+	id := stableID("wf_hard_link", "lead")
+	sessionDir := filepath.Join(state, "sessions", id)
+	if err := os.Mkdir(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(t.TempDir(), "sentinel")
+	if err := os.WriteFile(sentinel, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(sentinel, filepath.Join(sessionDir, ".write.lock")); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	if _, _, err := store.acquire(id); err == nil {
+		t.Fatal("acquire accepted a multiply-linked lock file")
+	}
+	assertFileContent(t, sentinel, "unchanged")
+}
+
 func TestLockContentionTimesOutWithBoundedBackoff(t *testing.T) {
 	state := t.TempDir()
 	store, _ := OpenStore(state)
@@ -307,7 +457,7 @@ func TestLockContentionTimesOutWithBoundedBackoff(t *testing.T) {
 		slept += delay
 		current = current.Add(delay)
 	}
-	if _, err := store.acquire(stableID("wf_timeout", "lead")); err == nil {
+	if _, _, err := store.acquire(stableID("wf_timeout", "lead")); err == nil {
 		t.Fatal("persistent contention did not return a timeout")
 	}
 	if attempts != 3 || sleeps != 3 || slept != 25*time.Millisecond {
@@ -322,15 +472,15 @@ func TestSeparateStoresContendOnStableKernelLock(t *testing.T) {
 	waiter.lockTimeout = 25 * time.Millisecond
 	waiter.lockRetry = time.Millisecond
 	id := stableID("wf_process_local", "lead")
-	release, err := owner.acquire(id)
+	_, release, err := owner.acquire(id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = waiter.acquire(id); err == nil {
+	if _, _, err = waiter.acquire(id); err == nil {
 		t.Fatal("a separate Store acquired the same kernel lock")
 	}
 	release()
-	nextRelease, err := waiter.acquire(id)
+	_, nextRelease, err := waiter.acquire(id)
 	if err != nil {
 		t.Fatalf("released kernel lock was not reacquired: %v", err)
 	}
@@ -362,7 +512,7 @@ func TestOldReleaseCannotAffectSuccessorLock(t *testing.T) {
 			observed:        observedContention,
 		}
 	}
-	oldRelease, err := first.acquire(id)
+	_, oldRelease, err := first.acquire(id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +527,7 @@ func TestOldReleaseCannotAffectSuccessorLock(t *testing.T) {
 		err     error
 	}, 1)
 	go func() {
-		release, acquireErr := second.acquire(id)
+		_, release, acquireErr := second.acquire(id)
 		successorResult <- struct {
 			release func()
 			err     error
@@ -400,7 +550,7 @@ func TestOldReleaseCannotAffectSuccessorLock(t *testing.T) {
 	blocked, _ := OpenStore(state)
 	blocked.lockTimeout = 25 * time.Millisecond
 	blocked.lockRetry = time.Millisecond
-	if _, err = blocked.acquire(id); err == nil {
+	if _, _, err = blocked.acquire(id); err == nil {
 		t.Fatal("old release unlocked the successor's kernel lock")
 	}
 	successor.release()
@@ -440,7 +590,7 @@ func TestKernelLockReleasedWhenOwnerProcessExits(t *testing.T) {
 	store, _ := OpenStore(state)
 	store.lockTimeout = 25 * time.Millisecond
 	store.lockRetry = time.Millisecond
-	if unexpectedRelease, err := store.acquire(id); err == nil {
+	if _, unexpectedRelease, err := store.acquire(id); err == nil {
 		unexpectedRelease()
 		t.Fatal("parent acquired a lock held by a separate process")
 	}
@@ -452,7 +602,7 @@ func TestKernelLockReleasedWhenOwnerProcessExits(t *testing.T) {
 	}
 	waited = true
 	store.lockTimeout = defaultLockTimeout
-	release, err := store.acquire(id)
+	_, release, err := store.acquire(id)
 	if err != nil {
 		t.Fatalf("process exit did not release kernel lock: %v", err)
 	}
@@ -467,7 +617,7 @@ func TestSessionLockCrashHelper(t *testing.T) {
 	if err != nil {
 		os.Exit(2)
 	}
-	release, err := store.acquire(os.Getenv("HANDOFF_SESSION_LOCK_ID"))
+	_, release, err := store.acquire(os.Getenv("HANDOFF_SESSION_LOCK_ID"))
 	if err != nil {
 		os.Exit(3)
 	}
@@ -526,4 +676,25 @@ func readLockOwner(t *testing.T, path string) sessionLockOwner {
 		t.Fatal(err)
 	}
 	return owner
+}
+
+func requireSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("creating links requires Windows Developer Mode or elevation: %v", err)
+		}
+		t.Fatal(err)
+	}
+}
+
+func assertFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != want {
+		t.Fatalf("%s content=%q, want %q", path, b, want)
+	}
 }

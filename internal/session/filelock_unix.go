@@ -28,3 +28,14 @@ func (l *unixSessionFileLock) TryLock() (bool, error) {
 func (l *unixSessionFileLock) Unlock() error {
 	return unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
 }
+
+func validateRegularFile(file *os.File) error {
+	var info unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &info); err != nil {
+		return err
+	}
+	if info.Mode&unix.S_IFMT != unix.S_IFREG || info.Nlink != 1 {
+		return errors.New("file is not a single-link regular file")
+	}
+	return nil
+}

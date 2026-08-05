@@ -36,3 +36,21 @@ func (l *windowsSessionFileLock) TryLock() (bool, error) {
 func (l *windowsSessionFileLock) Unlock() error {
 	return windows.UnlockFileEx(windows.Handle(l.file.Fd()), 0, 1, 0, &l.overlapped)
 }
+
+func validateRegularFile(file *os.File) error {
+	handle := windows.Handle(file.Fd())
+	fileType, err := windows.GetFileType(handle)
+	if err != nil {
+		return err
+	}
+	var info windows.ByHandleFileInformation
+	if err = windows.GetFileInformationByHandle(handle, &info); err != nil {
+		return err
+	}
+	if fileType != windows.FILE_TYPE_DISK ||
+		info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+		info.NumberOfLinks != 1 {
+		return errors.New("file is not a single-link regular disk file")
+	}
+	return nil
+}

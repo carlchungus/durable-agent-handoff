@@ -466,6 +466,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	}
 	cmd := exec.CommandContext(ctx, c.Name, c.Args...)
 	cmd.Dir = workdir(w, n)
+	activity.ConfigureBackgroundProcess(cmd)
 	if c.PromptOnStdin {
 		cmd.Stdin = strings.NewReader(prompt)
 	}

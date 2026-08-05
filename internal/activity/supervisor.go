@@ -37,7 +37,7 @@ func (s *Supervisor) Start(descriptor Descriptor) (*Activity, Attempt, error) {
 	command.Env = append(os.Environ(), s.Env...)
 	command.Stdout = stdout
 	command.Stderr = stderr
-	configureBackgroundProcess(command)
+	ConfigureBackgroundProcess(command)
 	if err = command.Start(); err != nil {
 		_ = stdout.Close()
 		_ = stderr.Close()

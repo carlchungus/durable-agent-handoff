@@ -742,6 +742,10 @@ func TestRuntimeChildSurvivesSupervisorCrashAndReconciles(t *testing.T) {
 		_ = supervisor.Process.Kill()
 		t.Fatalf("worker identity was not persisted before crash: %+v", manifest)
 	}
+	if !workerIsDetached(supervisor.Process.Pid, manifest.PID) {
+		_ = supervisor.Process.Kill()
+		t.Fatalf("worker %d shares supervisor %d process group", manifest.PID, supervisor.Process.Pid)
+	}
 	if err := supervisor.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}

@@ -35,6 +35,20 @@ handoff doctor
 
 Release binaries for macOS, Linux, and Windows are attached to tagged GitHub releases. No Node or Python runtime is required. The coding harnesses you choose (`codex`, `claude`, `pi`, or `omp`) must already be installed and authenticated.
 
+For example, install the Apple Silicon archive with the GitHub CLI:
+
+```sh
+gh release download v0.4.0 \
+  --repo carlchungus/durable-agent-handoff \
+  --pattern 'handoff_Darwin_arm64.tar.gz'
+tar -xzf handoff_Darwin_arm64.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 0755 handoff "$HOME/.local/bin/handoff"
+"$HOME/.local/bin/handoff" doctor
+```
+
+Use `handoff_Linux_amd64.tar.gz`, `handoff_Linux_arm64.tar.gz`, `handoff_Darwin_amd64.tar.gz`, or the corresponding Windows zip for other platforms. Verify downloads against the release's `checksums.txt` before installation.
+
 State defaults to the OS user-config directory. Set `HANDOFF_HOME` to put it elsewhere. Keep that directory supervisor-private and outside every worker-writable worktree or sandbox mount; do not point it into the repository being edited.
 
 ## Start a workflow

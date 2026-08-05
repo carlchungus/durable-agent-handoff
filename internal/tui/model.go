@@ -14,11 +14,13 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/engine"
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
 	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
+	coord "github.com/carlchungus/durable-agent-handoff/internal/team"
 )
 
 type tickMsg time.Time
 type loadMsg struct {
 	workflows []*core.Workflow
+	teams     []*coord.Team
 	events    []core.Event
 	attempts  map[string]runstate.Manifest
 	err       error
@@ -26,15 +28,19 @@ type loadMsg struct {
 type runMsg struct{ err error }
 
 type Model struct {
-	store     *core.Store
-	workflows []*core.Workflow
-	events    []core.Event
-	attempts  map[string]runstate.Manifest
-	cursor    int
-	width     int
-	height    int
-	frame     int
-	err       error
+	store      *core.Store
+	teamStore  *coord.Store
+	workflows  []*core.Workflow
+	teams      []*coord.Team
+	events     []core.Event
+	attempts   map[string]runstate.Manifest
+	cursor     int
+	teamCursor int
+	mode       string
+	width      int
+	height     int
+	frame      int
+	err        error
 }
 
 var (
@@ -48,7 +54,10 @@ var (
 	title  = lipgloss.NewStyle().Bold(true).Foreground(cyan)
 )
 
-func New(store *core.Store) Model { return Model{store: store, width: 100, height: 30} }
+func New(store *core.Store) Model {
+	teamStore, _ := coord.OpenStore(store.Dir())
+	return Model{store: store, teamStore: teamStore, mode: "workflows", width: 100, height: 30}
+}
 func Snapshot(store *core.Store) (string, error) {
 	m := New(store)
 	ws, err := store.List()
@@ -56,6 +65,9 @@ func Snapshot(store *core.Store) (string, error) {
 		return "", err
 	}
 	m.workflows = ws
+	if m.teamStore != nil {
+		m.teams, _ = m.teamStore.List()
+	}
 	if len(ws) > 0 {
 		m.events, err = store.Events(ws[0].ID, 0)
 		if err != nil {
@@ -72,6 +84,10 @@ func tick() tea.Cmd {
 func (m Model) load() tea.Cmd {
 	return func() tea.Msg {
 		ws, err := m.store.List()
+		var teams []*coord.Team
+		if err == nil && m.teamStore != nil {
+			teams, err = m.teamStore.List()
+		}
 		var events []core.Event
 		attempts := map[string]runstate.Manifest{}
 		if err == nil && len(ws) > 0 {
@@ -82,7 +98,7 @@ func (m Model) load() tea.Cmd {
 			}
 			attempts = loadAttempts(m.store, selected)
 		}
-		return loadMsg{ws, events, attempts, err}
+		return loadMsg{workflows: ws, teams: teams, events: events, attempts: attempts, err: err}
 	}
 }
 
@@ -107,15 +123,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "up", "k":
-			if m.cursor > 0 {
+			if m.mode == "teams" && m.teamCursor > 0 {
+				m.teamCursor--
+				return m, m.load()
+			}
+			if m.mode == "workflows" && m.cursor > 0 {
 				m.cursor--
 				return m, m.load()
 			}
 		case "down", "j":
-			if m.cursor+1 < len(m.workflows) {
+			if m.mode == "teams" && m.teamCursor+1 < len(m.teams) {
+				m.teamCursor++
+				return m, m.load()
+			}
+			if m.mode == "workflows" && m.cursor+1 < len(m.workflows) {
 				m.cursor++
 				return m, m.load()
 			}
+		case "tab":
+			if m.mode == "workflows" {
+				m.mode = "teams"
+			} else {
+				m.mode = "workflows"
+			}
+			return m, m.load()
 		case "r":
 			return m, m.load()
 		case "space":
@@ -135,11 +166,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(tick(), m.load())
 	case loadMsg:
 		m.workflows = v.workflows
+		m.teams = v.teams
 		m.events = v.events
 		m.attempts = v.attempts
 		m.err = v.err
 		if m.cursor >= len(m.workflows) {
 			m.cursor = max(0, len(m.workflows)-1)
+		}
+		if m.teamCursor >= len(m.teams) {
+			m.teamCursor = max(0, len(m.teams)-1)
 		}
 	case runMsg:
 		if v.err != nil && !strings.Contains(v.err.Error(), "no runnable node") {
@@ -168,11 +203,106 @@ func (m Model) render() string {
 	leftWidth := clamp(m.width/3, 28, 48)
 	rightWidth := max(36, m.width-leftWidth-3)
 	bodyHeight := max(10, m.height-5)
-	left := panel.Width(leftWidth - 2).Height(bodyHeight).Render(m.workflowList(leftWidth - 6))
-	right := panel.Width(rightWidth - 2).Height(bodyHeight).Render(m.detail(rightWidth - 6))
+	leftContent, rightContent := m.workflowList(leftWidth-6), m.detail(rightWidth-6)
+	if m.mode == "teams" {
+		leftContent, rightContent = m.teamList(leftWidth-6), m.teamDetail(rightWidth-6)
+	}
+	left := panel.Width(leftWidth - 2).Height(bodyHeight).Render(leftContent)
+	right := panel.Width(rightWidth - 2).Height(bodyHeight).Render(rightContent)
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
-	footer := lipgloss.NewStyle().Foreground(muted).Render("↑/↓ select  •  space run next  •  p pause/resume  •  r refresh  •  q quit  •  agent API: status --json / events --follow")
+	footer := lipgloss.NewStyle().Foreground(muted).Render("tab workflows/teams  •  ↑/↓ select  •  space run next  •  p pause/resume  •  r refresh  •  q quit  •  agent API: status --json / events --follow")
 	return lipgloss.NewStyle().Padding(1, 1).Render(header + "\n\n" + body + "\n" + footer)
+}
+
+func (m Model) teamList(width int) string {
+	if len(m.teams) == 0 {
+		return title.Render("TEAMS") + "\n\nNo teams yet.\n\n  handoff team create --name \"…\""
+	}
+	lines := []string{title.Render("TEAMS"), ""}
+	for i, tm := range m.teams {
+		cursor := "  "
+		if i == m.teamCursor {
+			cursor = "› "
+		}
+		working, needsInput := 0, 0
+		for _, member := range tm.Members {
+			if member.State == coord.MemberWorking {
+				working++
+			}
+			if member.State == coord.MemberNeedsInput {
+				needsInput++
+			}
+		}
+		line := fmt.Sprintf("%s%s %s", cursor, statusDot(core.WorkflowActive), truncate(tm.Name, max(8, width-7)))
+		if i == m.teamCursor {
+			line = lipgloss.NewStyle().Bold(true).Foreground(purple).Render(line)
+		}
+		lines = append(lines, line, lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("    %d working · %d need input", working, needsInput)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) teamDetail(width int) string {
+	if len(m.teams) == 0 {
+		return title.Render("AGENT TEAM") + "\n\nWaiting for peers."
+	}
+	tm := m.teams[m.teamCursor]
+	lines := []string{title.Render("AGENT TEAM"), lipgloss.NewStyle().Bold(true).Render(truncate(tm.Name, width)), lipgloss.NewStyle().Foreground(muted).Render(tm.ID + "  •  workflow " + fallback(tm.WorkflowID, "unlinked")), "", title.Render("MEMBERS")}
+	memberIDs := make([]string, 0, len(tm.Members))
+	for id := range tm.Members {
+		memberIDs = append(memberIDs, id)
+	}
+	sort.Strings(memberIDs)
+	for _, id := range memberIDs {
+		member := tm.Members[id]
+		marker := " "
+		if id == tm.LeadID {
+			marker = "★"
+		}
+		lines = append(lines, fmt.Sprintf(" %s %-14s %-12s process=%-7s plan=%s", marker, truncate(member.Name, 14), member.State, member.Process, member.Plan))
+		if member.NeedsInputReason != "" {
+			lines = append(lines, lipgloss.NewStyle().Foreground(yellow).Render("    ↳ "+truncate(member.NeedsInputReason, width-6)))
+		}
+	}
+	lines = append(lines, "", title.Render("TASKS"))
+	for _, id := range tm.TaskOrder {
+		task := tm.Tasks[id]
+		if task == nil {
+			continue
+		}
+		claim := ""
+		if task.Claim != nil {
+			claim = fmt.Sprintf(" · %s/g%d", task.Claim.MemberID, task.Claim.Generation)
+		}
+		blocked := ""
+		if len(task.BlockedBy) > 0 {
+			blocked = " ← " + strings.Join(task.BlockedBy, ",")
+		}
+		lines = append(lines, fmt.Sprintf(" %s %-18s %s%s%s", teamTaskGlyph(task.State), truncate(task.Title, 18), task.State, claim, blocked))
+	}
+	lines = append(lines, "", title.Render("MAILBOX"))
+	start := max(0, len(tm.Messages)-5)
+	for _, message := range tm.Messages[start:] {
+		target := "all"
+		if message.To != "" {
+			target = message.To
+		}
+		lines = append(lines, lipgloss.NewStyle().Foreground(muted).Render(message.CreatedAt.Local().Format("15:04:05"))+fmt.Sprintf("  %s → %s  %s", message.From, target, truncate(message.Body, max(8, width-24))))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func teamTaskGlyph(state coord.TaskState) string {
+	switch state {
+	case coord.TaskCompleted:
+		return lipgloss.NewStyle().Foreground(green).Render("✓")
+	case coord.TaskInProgress:
+		return lipgloss.NewStyle().Foreground(cyan).Render("◆")
+	case coord.TaskFailed:
+		return lipgloss.NewStyle().Foreground(red).Render("×")
+	default:
+		return lipgloss.NewStyle().Foreground(muted).Render("○")
+	}
 }
 
 func (m Model) runSelected() tea.Cmd {

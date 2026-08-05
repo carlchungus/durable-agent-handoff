@@ -46,7 +46,7 @@ The event ledger, policy kernel, runtime adapters, logs, leases, and model route
 
 The team ledger is implemented independently of the workflow graph. A member's logical state (`working`, `idle`, `needs_input`, `stopped`) is separate from whether its current OS process is live. Tasks have dependencies and expiring, generation-fenced claims so an old worker cannot complete work after another member reclaims it. Direct and broadcast messages, idle notifications, submitted/reviewed plans, and cooperative shutdown requests are durable mailbox entries.
 
-The machine interface is `handoff team create|status|apply|inbox`. Runtime spawning, automatic mailbox injection/wake-up, and the combined Agent View UI remain compatibility work; the ledger deliberately exists first so replacing a runtime session cannot destroy the logical member, task, or message.
+The machine interface is `handoff team create|status|apply|inbox`; the animated TUI has a team view for member, task, claim, plan, and mailbox state. Runtime spawning, automatic mailbox injection/wake-up, and full Agent View controls remain compatibility work; the ledger deliberately exists first so replacing a runtime session cannot destroy the logical member, task, or message.
 
 ## Recovery contract
 

@@ -22,6 +22,8 @@ handoff team inbox team_123 --member reviewer --after 0
 
 Team members, logical/process state, dependency tasks, generation-fenced claims, plan approval, direct/broadcast mailboxes, idle notices, and cooperative shutdown are durable. Runtime spawning and the combined Agent View UI remain `partial` in the compatibility matrix.
 
+Press `tab` in the animated TUI to switch between workflow and team views. The team view shows peer lifecycle and process state independently, current plan status, task claims and fencing generations, dependency blockers, and recent mailbox traffic.
+
 ## Install
 
 With Go 1.25 or newer:

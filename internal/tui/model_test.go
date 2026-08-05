@@ -7,6 +7,7 @@ import (
 
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
+	coord "github.com/carlchungus/durable-agent-handoff/internal/team"
 )
 
 func TestSnapshotIsReadableAndHasNoANSI(t *testing.T) {
@@ -63,6 +64,29 @@ func TestSnapshotShowsDurableAttemptHealth(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"pid 4242", "supervisor g1", "heartbeat", "session-", "obse…", "4.0 KB"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("missing %q in\n%s", want, view)
+		}
+	}
+}
+
+func TestTeamViewShowsPeerTaskAndMailboxState(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	teamStore, _ := coord.OpenStore(state)
+	tm, err := teamStore.Create("schema-review", "wf_review", coord.Member{ID: "lead", Name: "Lead"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = teamStore.Apply(tm.ID, coord.Command{Op: "add_member", Actor: "lead", Member: &coord.Member{ID: "db-reviewer", Name: "DB Reviewer", Plan: coord.PlanApproved}})
+	_, _ = teamStore.Apply(tm.ID, coord.Command{Op: "add_task", Actor: "lead", Task: &coord.Task{ID: "inspect", Title: "Inspect schema"}})
+	_, _ = teamStore.Apply(tm.ID, coord.Command{Op: "claim_task", Actor: "db-reviewer", TaskID: "inspect"})
+	_, _ = teamStore.Apply(tm.ID, coord.Command{Op: "send_message", Actor: "db-reviewer", To: "lead", Body: "membership key needs repair"})
+	teams, _ := teamStore.List()
+	m := New(st)
+	m.mode, m.teams = "teams", teams
+	view := m.RenderPlain()
+	for _, want := range []string{"schema-review", "DB Reviewer", "Inspect schema", "db-reviewer/g1", "membership key needs repair"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("missing %q in\n%s", want, view)
 		}

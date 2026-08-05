@@ -1,0 +1,350 @@
+{
+  "$schema": "./case.schema.json",
+  "suite": "models-usage-pr-remote-storage-hosting",
+  "source_snapshot": "2026-08-05",
+  "cases": [
+    {
+      "id": "MOD-001",
+      "surface": "models-usage",
+      "title": "Model aliases, allowlists, session choice, and resume resolve deterministically",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["model-config#setting-your-model", "model-config#restrict-model-selection", "sessions#resume-a-session"],
+      "given": [{ "op": "fixture.models", "as": "models", "with": { "default": "sonnet-current", "aliases": { "opus": "opus-current" }, "allowlist": ["sonnet", "opus"] } }],
+      "when": [
+        { "op": "session.start", "as": "s", "with": { "models": "$models", "model": "opus" } },
+        { "op": "session.exit", "target": "$s" },
+        { "op": "session.resume", "as": "r", "with": { "session_id": "$s.session_id" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$s.requested_model", "expected": "opus" },
+        { "op": "assert.eq", "actual": "$s.resolved_model", "expected": "opus-current" },
+        { "op": "assert.eq", "actual": "$r.model", "expected": "opus-current" },
+        { "op": "assert.present", "actual": "$r.model_source" }
+      ]
+    },
+    {
+      "id": "MOD-002",
+      "surface": "models-usage",
+      "title": "Model and effort overrides remain scoped to their agent role",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["model-config#adjust-effort-level", "sub-agents#supported-frontmatter-fields", "workflows#what-the-saved-script-looks-like"],
+      "given": [{ "op": "session.start", "as": "s", "with": { "model": "sonnet", "effort": "medium" } }],
+      "when": [
+        { "op": "agent.spawn", "as": "child", "with": { "parent": "$s", "model": "opus", "effort": "high" } },
+        { "op": "workflow.run", "as": "wf", "with": { "session": "$s", "agent_options": { "model": "haiku", "effort": "low" } } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$s.model", "expected": "sonnet" },
+        { "op": "assert.eq", "actual": "$child.model", "expected": "opus" },
+        { "op": "assert.eq", "actual": "$child.effort", "expected": "high" },
+        { "op": "assert.eq", "actual": "$wf.agents[0].model", "expected": "haiku" },
+        { "op": "assert.eq", "actual": "$wf.agents[0].effort", "expected": "low" }
+      ]
+    },
+    {
+      "id": "MOD-003",
+      "surface": "models-usage",
+      "title": "Claude fallback chains switch only for documented server failures and only for one turn",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["model-config#fallback-model-chains"],
+      "given": [{ "op": "fixture.models", "as": "models", "with": { "primary": "opus", "fallbacks": ["sonnet", "haiku", "duplicate", "extra"] } }],
+      "when": [{ "op": "model.exercise_failures", "as": "results", "with": { "models": "$models", "failures": ["overloaded", "unavailable", "non-retryable-server", "authentication", "billing", "rate-limit", "request-size", "transport"] } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$results.overloaded.model", "expected": "sonnet" },
+        { "op": "assert.eq", "actual": "$results.unavailable.model", "expected": "sonnet" },
+        { "op": "assert.eq", "actual": "$results.non_retryable_server.model", "expected": "sonnet" },
+        { "op": "assert.eq", "actual": "$results.authentication.switched", "expected": false },
+        { "op": "assert.eq", "actual": "$results.billing.switched", "expected": false },
+        { "op": "assert.eq", "actual": "$results.rate_limit.switched", "expected": false },
+        { "op": "assert.eq", "actual": "$results.request_size.switched", "expected": false },
+        { "op": "assert.eq", "actual": "$results.transport.switched", "expected": false },
+        { "op": "assert.eq", "actual": "$results.next_turn.model", "expected": "opus" },
+        { "op": "assert.count", "actual": "$results.effective_chain", "expected": 3 }
+      ]
+    },
+    {
+      "id": "MOD-004",
+      "surface": "models-usage",
+      "title": "Portable preference ladders degrade across runtimes with visible cooldown reasons",
+      "profiles": ["durable-extension"],
+      "match_policy": "deliberate-divergence",
+      "source_refs": ["model-config#fallback-model-chains", "costs#when-a-developer-asks-about-a-limit"],
+      "given": [{ "op": "fixture.runtime_ladder", "as": "ladder", "with": { "role": "planner", "entries": ["claude:opus", "codex:gpt-5.6-sol", "pi:kimi-k3"] } }],
+      "when": [
+        { "op": "model.route", "as": "route", "with": { "ladder": "$ladder", "failures": ["claude:plan-limit", "codex:usage-limit"] } },
+        { "op": "usage.inspect", "as": "usage", "target": "$route" }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$route.selected", "expected": "pi:kimi-k3" },
+        { "op": "assert.order", "actual": "$route.attempted", "expected": ["claude:opus", "codex:gpt-5.6-sol", "pi:kimi-k3"] },
+        { "op": "assert.eq", "actual": "$usage.fallback_reasons", "expected": ["plan-limit", "usage-limit"] },
+        { "op": "assert.present", "actual": "$usage.cooldowns" }
+      ],
+      "claude_expected": [
+        { "op": "assert.refused", "actual": "$route.cross_runtime", "expected": "not-supported" },
+        { "op": "assert.eq", "actual": "$route.primary_runtime", "expected": "claude" }
+      ],
+      "notes": ["Cross-provider routing is a named extension. It does not alter the claude-current fallback trigger contract in MOD-003."]
+    },
+    {
+      "id": "USE-001",
+      "surface": "models-usage",
+      "title": "Usage observations attribute model, tokens, cost, limits, and fallback",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["costs#track-your-costs", "costs#using-the-usage-command", "statusline#available-data"],
+      "given": [{ "op": "session.start", "as": "s", "with": { "model": "opus" } }],
+      "when": [
+        { "op": "session.prompt", "as": "turn", "with": { "session": "$s", "text": "inspect repo" } },
+        { "op": "usage.inspect", "as": "usage", "with": { "session": "$s" } }
+      ],
+      "then": [
+        { "op": "assert.present", "actual": "$usage.model" },
+        { "op": "assert.present", "actual": "$usage.input_tokens" },
+        { "op": "assert.present", "actual": "$usage.output_tokens" },
+        { "op": "assert.present", "actual": "$usage.cost_or_plan_window" },
+        { "op": "assert.eq", "actual": "$usage.turn_id", "expected": "$turn.id" },
+        { "op": "assert.present", "actual": "$usage.source" }
+      ]
+    },
+    {
+      "id": "PR-001",
+      "surface": "pr-workflows",
+      "title": "Background sessions discover linked pull requests and expose live status",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["agent-view#pull-request-status", "agent-view#read-session-state"],
+      "given": [{ "op": "fixture.pull_request", "as": "pr", "with": { "branch": "agent/fix", "checks": ["pending"], "review": "none" } }],
+      "when": [
+        { "op": "session.background", "as": "s", "with": { "branch": "agent/fix" } },
+        { "op": "pr.discover", "as": "linked", "with": { "session": "$s" } },
+        { "op": "pr.status", "as": "status", "target": "$linked" }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$linked.number", "expected": "$pr.number" },
+        { "op": "assert.eq", "actual": "$status.checks", "expected": "pending" },
+        { "op": "assert.present", "actual": "$status.url" },
+        { "op": "assert.eq", "actual": "$s.pr_number", "expected": "$pr.number" }
+      ]
+    },
+    {
+      "id": "PR-002",
+      "surface": "pr-workflows",
+      "title": "Batch work fans out to five through thirty isolated pull requests",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["agents#choose-an-approach", "commands#all-commands"],
+      "given": [{ "op": "fixture.repo", "as": "repo", "with": { "items": 8 } }],
+      "when": [
+        { "op": "pr.batch_plan", "as": "plan", "with": { "repo": "$repo", "prompt": "migrate eight independent modules" } },
+        { "op": "pr.batch_approve", "target": "$plan" },
+        { "op": "pr.batch_run", "as": "run", "target": "$plan" }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$run.worker_count", "expected": { "minimum": 5, "maximum": 30 } },
+        { "op": "assert.eq", "actual": "$run.worktree_count", "expected": "$run.worker_count" },
+        { "op": "assert.eq", "actual": "$run.pull_request_count", "expected": "$run.worker_count" },
+        { "op": "assert.eq", "actual": "$run.default_branch_mutated", "expected": false }
+      ]
+    },
+    {
+      "id": "PR-003",
+      "surface": "pr-workflows",
+      "title": "Claude Code Review verifies, deduplicates, and reports findings without blocking merge",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["code-review#how-reviews-work", "code-review#check-run-output"],
+      "given": [{ "op": "fixture.pull_request", "as": "pr", "with": { "bugs": ["important", "nit", "duplicate"] } }],
+      "when": [{ "op": "pr.review", "as": "review", "with": { "pr": "$pr", "agents": "multiple", "verify": true } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$review.duplicates", "expected": 0 },
+        { "op": "assert.present", "actual": "$review.inline_findings" },
+        { "op": "assert.present", "actual": "$review.machine_readable_counts" },
+        { "op": "assert.eq", "actual": "$review.check_conclusion", "expected": "neutral" },
+        { "op": "assert.eq", "actual": "$review.blocks_merge", "expected": false }
+      ]
+    },
+    {
+      "id": "PR-004",
+      "surface": "pr-workflows",
+      "title": "Safe autonomous merge requires unchanged head and named gates",
+      "profiles": ["durable-extension"],
+      "match_policy": "deliberate-divergence",
+      "source_refs": ["agent-view#pull-request-status", "code-review#check-run-output"],
+      "given": [{ "op": "fixture.pull_request", "as": "pr", "with": { "head": "sha-1", "required_checks": ["test"], "review_gate": "approved", "merge_policy": "authorized" } }],
+      "when": [
+        { "op": "pr.observe_head", "as": "observed", "target": "$pr" },
+        { "op": "pr.wait_gates", "as": "gates", "with": { "pr": "$pr", "head": "$observed.sha", "checks": ["test"], "review": "approved" } },
+        { "op": "pr.merge", "as": "merge", "with": { "pr": "$pr", "expected_head": "$observed.sha", "authorization": "$pr.merge_policy" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$gates.head", "expected": "sha-1" },
+        { "op": "assert.eq", "actual": "$gates.test", "expected": "passed" },
+        { "op": "assert.state", "actual": "$merge", "expected": "merged" },
+        { "op": "assert.eq", "actual": "$merge.head", "expected": "sha-1" }
+      ],
+      "claude_expected": [
+        { "op": "assert.present", "actual": "$pr.status" },
+        { "op": "assert.eq", "actual": "$pr.autonomous_merge_control", "expected": false }
+      ],
+      "faults": [
+        {
+          "at": "after-gates-before-merge",
+          "inject": { "op": "fault.pr_head_change", "target": "$pr" },
+          "recover": [{ "op": "pr.merge", "as": "stale_merge", "with": { "pr": "$pr", "expected_head": "sha-1" } }],
+          "then": [{ "op": "assert.refused", "actual": "$stale_merge", "expected": "head-changed" }]
+        }
+      ]
+    },
+    {
+      "id": "REM-001",
+      "surface": "remote-control",
+      "title": "Remote clients steer a locally authoritative process over outbound TLS",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["remote-control#connection-and-security", "remote-control#remote-control-vs-claude-code-on-the-web"],
+      "given": [{ "op": "session.start", "as": "local", "with": { "cwd": "$tmp/repo", "permission_mode": "default" } }],
+      "when": [
+        { "op": "remote.enable", "as": "remote", "with": { "session": "$local" } },
+        { "op": "remote.connect", "as": "client", "with": { "remote": "$remote", "device": "phone" } },
+        { "op": "remote.prompt", "as": "turn", "with": { "client": "$client", "text": "read local file" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$turn.executor", "expected": "$local.process" },
+        { "op": "assert.eq", "actual": "$turn.cwd", "expected": "$local.cwd" },
+        { "op": "assert.eq", "actual": "$turn.permission_mode", "expected": "$local.permission_mode" },
+        { "op": "assert.eq", "actual": "$remote.transport", "expected": "outbound-tls" },
+        { "op": "assert.eq", "actual": "$client.filesystem_mounted", "expected": false }
+      ]
+    },
+    {
+      "id": "REM-002",
+      "surface": "remote-control",
+      "title": "Remote Control reconnects after sleep and short network loss with queued updates",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["remote-control#connection-and-security", "remote-control#limitations"],
+      "given": [{ "op": "remote.enable", "as": "remote", "with": { "session": "running" } }],
+      "when": [
+        { "op": "remote.connect", "as": "client", "with": { "remote": "$remote" } },
+        { "op": "fault.network_drop", "target": "$remote", "with": { "minutes": 2 } },
+        { "op": "agent.complete", "target": "$remote.session.agent" },
+        { "op": "remote.reconnect", "as": "reconnected", "with": { "client": "$client" } }
+      ],
+      "then": [
+        { "op": "assert.state", "actual": "$reconnected", "expected": "connected" },
+        { "op": "assert.contains", "actual": "$reconnected.delivered_updates", "expected": "agent-completed" },
+        { "op": "assert.eq", "actual": "$reconnected.duplicate_updates", "expected": 0 }
+      ],
+      "faults": [
+        {
+          "at": "connected",
+          "inject": { "op": "fault.network_drop", "target": "$remote", "with": { "minutes": 11 } },
+          "recover": [{ "op": "remote.inspect", "as": "timed_out", "target": "$remote" }],
+          "then": [{ "op": "assert.state", "actual": "$timed_out.local_process", "expected": "exited" }]
+        }
+      ]
+    },
+    {
+      "id": "STORE-001",
+      "surface": "storage-hosting",
+      "title": "Session stores preserve opaque entries in append order",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["sdk-session-storage#write-your-own-adapter", "sdk-session-storage#validate-your-adapter"],
+      "given": [{ "op": "fixture.session_store", "as": "store" }],
+      "when": [
+        { "op": "store.append", "with": { "store": "$store", "session_id": "s1", "entries": [{ "type": "a", "x": 1 }] } },
+        { "op": "store.append", "with": { "store": "$store", "session_id": "s1", "entries": [{ "type": "b", "x": 2 }] } },
+        { "op": "store.load", "as": "loaded", "with": { "store": "$store", "session_id": "s1" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$loaded", "expected": [{ "type": "a", "x": 1 }, { "type": "b", "x": 2 }] },
+        { "op": "assert.eq", "actual": "$store.transformed_entries", "expected": 0 }
+      ]
+    },
+    {
+      "id": "STORE-002",
+      "surface": "storage-hosting",
+      "title": "Transcript mirroring retries rejection but not timeout and never aborts the query",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["sdk-hosting#session-and-state-persistence"],
+      "given": [{ "op": "fixture.session_store", "as": "store", "with": { "outcomes": ["reject", "reject", "reject", "timeout"] } }],
+      "when": [
+        { "op": "store.mirror", "as": "rejected", "with": { "store": "$store", "batch": "A" } },
+        { "op": "store.mirror", "as": "timed", "with": { "store": "$store", "batch": "B" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$rejected.attempts", "expected": 3 },
+        { "op": "assert.eq", "actual": "$timed.attempts", "expected": 1 },
+        { "op": "assert.eq", "actual": "$rejected.system_message.subtype", "expected": "mirror_error" },
+        { "op": "assert.eq", "actual": "$timed.system_message.subtype", "expected": "mirror_error" },
+        { "op": "assert.state", "actual": "$rejected.query", "expected": "continued" }
+      ]
+    },
+    {
+      "id": "STORE-003",
+      "surface": "storage-hosting",
+      "title": "Forking rewrites identity while subkeys retain independently resumable agents",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["sdk-sessions#fork-to-explore-alternatives", "sdk-session-storage#write-your-own-adapter"],
+      "given": [{ "op": "fixture.session_store", "as": "store", "with": { "session": "parent", "subkeys": ["agent-a"] } }],
+      "when": [
+        { "op": "session.fork", "as": "fork", "with": { "session_id": "parent", "store": "$store" } },
+        { "op": "store.list_subkeys", "as": "subkeys", "with": { "store": "$store", "session_id": "parent" } },
+        { "op": "agent.resume", "as": "agent", "with": { "store": "$store", "session_id": "parent", "subkey": "agent-a" } }
+      ],
+      "then": [
+        { "op": "assert.ne", "actual": "$fork.session_id", "expected": "parent" },
+        { "op": "assert.eq", "actual": "$fork.parent_session_id", "expected": "parent" },
+        { "op": "assert.eq", "actual": "$subkeys", "expected": ["agent-a"] },
+        { "op": "assert.state", "actual": "$agent", "expected": "resumed" }
+      ],
+      "normalize": ["session_id", "uuid"]
+    },
+    {
+      "id": "HOST-001",
+      "surface": "storage-hosting",
+      "title": "Hosting patterns expose where process, transcript, memory, and work files live",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["sdk-hosting#the-subprocess-model", "sdk-hosting#choose-a-session-pattern", "sdk-hosting#state-that-lives-on-local-disk"],
+      "given": [{ "op": "fixture.hosting", "as": "hosting", "with": { "patterns": ["ephemeral", "long-running", "hybrid", "multi-agent"] } }],
+      "when": [{ "op": "host.inspect_patterns", "as": "patterns", "with": { "hosting": "$hosting" } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$patterns.process_per_active_session", "expected": 1 },
+        { "op": "assert.eq", "actual": "$patterns.ephemeral.local_state_survives_destroy", "expected": false },
+        { "op": "assert.eq", "actual": "$patterns.hybrid.requires_session_store", "expected": true },
+        { "op": "assert.eq", "actual": "$patterns.multi_agent.unique_cwd_required", "expected": true },
+        { "op": "assert.present", "actual": "$patterns.transcript_store" },
+        { "op": "assert.present", "actual": "$patterns.artifact_store" }
+      ]
+    },
+    {
+      "id": "HOST-002",
+      "surface": "storage-hosting",
+      "title": "Multi-tenant hosting isolates credentials, config, files, processes, and telemetry",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["sdk-hosting#multi-tenant-isolation", "sdk-hosting#observability", "sdk-hosting#resources"],
+      "given": [{ "op": "fixture.host", "as": "host", "with": { "tenants": ["a", "b"], "memory_mb_per_agent": 1024, "disk_mb_per_agent": 5120, "cpu_per_agent": 1 } }],
+      "when": [
+        { "op": "host.start", "as": "agents", "with": { "host": "$host", "count_per_tenant": 1 } },
+        { "op": "host.inspect_isolation", "as": "isolation", "with": { "agents": "$agents" } }
+      ],
+      "then": [
+        { "op": "assert.ne", "actual": "$agents.a.cwd", "expected": "$agents.b.cwd" },
+        { "op": "assert.ne", "actual": "$agents.a.config_dir", "expected": "$agents.b.config_dir" },
+        { "op": "assert.ne", "actual": "$agents.a.credentials", "expected": "$agents.b.credentials" },
+        { "op": "assert.eq", "actual": "$isolation.cross_tenant_reads", "expected": 0 },
+        { "op": "assert.present", "actual": "$agents.a.telemetry.session_id" },
+        { "op": "assert.present", "actual": "$agents.a.resource_limits" }
+      ]
+    }
+  ]
+}

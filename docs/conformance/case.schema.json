@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/carlchungus/durable-agent-handoff/docs/conformance/case.schema.json",
+  "title": "Claude observable conformance suite",
+  "type": "object",
+  "required": ["suite", "source_snapshot", "cases"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "suite": { "type": "string", "minLength": 1 },
+    "source_snapshot": { "type": "string", "format": "date" },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/case" }
+    }
+  },
+  "$defs": {
+    "operation": {
+      "type": "object",
+      "required": ["op"],
+      "additionalProperties": false,
+      "properties": {
+        "op": { "type": "string", "pattern": "^[a-z]+\\.[a-z0-9_.-]+$" },
+        "as": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "with": { "type": "object" },
+        "target": { "type": ["string", "number", "boolean", "null"] },
+        "actual": { "type": ["string", "number", "boolean", "null"] },
+        "expected": {},
+        "within_ms": { "type": "integer", "minimum": 0 },
+        "note": { "type": "string" }
+      }
+    },
+    "fault": {
+      "type": "object",
+      "required": ["at", "inject", "recover", "then"],
+      "additionalProperties": false,
+      "properties": {
+        "at": { "type": "string", "minLength": 1 },
+        "inject": { "$ref": "#/$defs/operation" },
+        "recover": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/operation" }
+        },
+        "then": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/operation" }
+        }
+      }
+    },
+    "case": {
+      "type": "object",
+      "required": [
+        "id",
+        "surface",
+        "title",
+        "profiles",
+        "match_policy",
+        "source_refs",
+        "given",
+        "when",
+        "then"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Z]{2,5}-[0-9]{3}$" },
+        "surface": {
+          "enum": [
+            "sessions",
+            "agent-view",
+            "supervisor",
+            "subagents",
+            "teams",
+            "dynamic-workflows",
+            "workflow-planning",
+            "goals",
+            "hooks",
+            "tasks",
+            "worktrees",
+            "checkpoints",
+            "compaction-memory",
+            "schedules-routines",
+            "channels",
+            "permissions",
+            "models-usage",
+            "pr-workflows",
+            "remote-control",
+            "storage-hosting",
+            "tui-machine-ux",
+            "config-packaging"
+          ]
+        },
+        "title": { "type": "string", "minLength": 1 },
+        "profiles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["claude-current", "durable-extension"] }
+        },
+        "match_policy": {
+          "enum": ["exact", "normalized", "extension", "deliberate-divergence"]
+        },
+        "source_refs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z0-9-]+#[a-z0-9-]+$" }
+        },
+        "given": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/operation" }
+        },
+        "when": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/operation" }
+        },
+        "then": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/operation" }
+        },
+        "claude_expected": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/operation" }
+        },
+        "faults": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fault" }
+        },
+        "normalize": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "match_policy": { "const": "deliberate-divergence" } },
+            "required": ["match_policy"]
+          },
+          "then": {
+            "required": ["claude_expected"],
+            "properties": {
+              "profiles": { "contains": { "const": "durable-extension" } }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

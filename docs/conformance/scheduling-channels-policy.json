@@ -1,0 +1,307 @@
+{
+  "$schema": "./case.schema.json",
+  "suite": "schedules-routines-channels-permissions",
+  "source_snapshot": "2026-08-05",
+  "cases": [
+    {
+      "id": "SCH-001",
+      "surface": "schedules-routines",
+      "title": "Session loops preserve fixed and self-paced scheduling semantics",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["scheduled-tasks#run-a-prompt-repeatedly-with-loop", "scheduled-tasks#let-claude-choose-the-interval"],
+      "given": [{ "op": "session.start", "as": "s" }],
+      "when": [
+        { "op": "schedule.create", "as": "fixed", "with": { "session": "$s", "interval": "7m", "prompt": "check CI" } },
+        { "op": "schedule.create", "as": "dynamic", "with": { "session": "$s", "prompt": "check CI" } },
+        { "op": "schedule.fire", "as": "iteration", "target": "$dynamic" }
+      ],
+      "then": [
+        { "op": "assert.present", "actual": "$fixed.rounded_cron" },
+        { "op": "assert.contains", "actual": "$fixed.notice", "expected": "rounded" },
+        { "op": "assert.eq", "actual": "$iteration.next_delay_minutes", "expected": { "minimum": 1, "maximum": 60 } },
+        { "op": "assert.present", "actual": "$iteration.next_delay_reason" },
+        { "op": "assert.eq", "actual": "$dynamic.jitter_applied", "expected": false }
+      ]
+    },
+    {
+      "id": "SCH-002",
+      "surface": "schedules-routines",
+      "title": "Session schedules queue between turns, avoid catch-up bursts, and expire",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["scheduled-tasks#how-scheduled-tasks-run", "scheduled-tasks#seven-day-expiry", "scheduled-tasks#limitations"],
+      "given": [{ "op": "fixture.clock", "as": "clock", "with": { "timezone": "local" } }],
+      "when": [
+        { "op": "session.start", "as": "s", "with": { "clock": "$clock" } },
+        { "op": "schedule.create", "as": "job", "with": { "session": "$s", "cron": "*/5 * * * *", "recurring": true } },
+        { "op": "session.busy", "target": "$s" },
+        { "op": "fixture.clock_advance", "target": "$clock", "with": { "minutes": 16 } },
+        { "op": "session.idle", "target": "$s" },
+        { "op": "fixture.clock_advance", "target": "$clock", "with": { "days": 7 } }
+      ],
+      "then": [
+        { "op": "assert.count", "actual": "$job.fires_after_busy", "expected": 1 },
+        { "op": "assert.order", "actual": "$s.events", "expected": ["turn-ended", "scheduled-prompt-enqueued", "scheduled-turn-started"] },
+        { "op": "assert.state", "actual": "$job", "expected": "expired" },
+        { "op": "assert.count", "actual": "$s.scheduled_tasks", "expected": 0 }
+      ]
+    },
+    {
+      "id": "SCH-003",
+      "surface": "schedules-routines",
+      "title": "Unexpired schedules resume with a session while monitors do not",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["scheduled-tasks#limitations"],
+      "given": [{ "op": "session.start", "as": "s" }],
+      "when": [
+        { "op": "schedule.create", "as": "recurring", "with": { "session": "$s", "recurring": true } },
+        { "op": "schedule.create", "as": "future", "with": { "session": "$s", "recurring": false, "future": true } },
+        { "op": "task.background", "as": "monitor", "with": { "session": "$s", "kind": "monitor" } },
+        { "op": "session.exit", "target": "$s" },
+        { "op": "session.resume", "as": "r", "with": { "session_id": "$s.session_id" } }
+      ],
+      "then": [
+        { "op": "assert.contains", "actual": "$r.scheduled_tasks", "expected": "$recurring.id" },
+        { "op": "assert.contains", "actual": "$r.scheduled_tasks", "expected": "$future.id" },
+        { "op": "assert.absent", "actual": "$r.background_tasks", "expected": "$monitor.id" }
+      ]
+    },
+    {
+      "id": "SCH-004",
+      "surface": "schedules-routines",
+      "title": "Desktop tasks create isolated runs and record every skip reason",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["desktop-scheduled-tasks#how-scheduled-tasks-run", "desktop-scheduled-tasks#missed-runs", "desktop-scheduled-tasks#manage-scheduled-tasks"],
+      "given": [{ "op": "fixture.desktop_scheduler", "as": "desktop", "with": { "max_concurrent": 1 } }],
+      "when": [
+        { "op": "schedule.create", "as": "task", "with": { "scheduler": "$desktop", "folder": "$tmp/repo", "interval": "1m" } },
+        { "op": "schedule.fire", "as": "first", "target": "$task" },
+        { "op": "schedule.fire", "as": "overlap", "target": "$task", "with": { "while": "$first.running" } },
+        { "op": "fixture.machine_sleep", "target": "$desktop.machine" },
+        { "op": "schedule.fire", "as": "asleep", "target": "$task" }
+      ],
+      "then": [
+        { "op": "assert.ne", "actual": "$first.session_id", "expected": "$task.previous_session_id" },
+        { "op": "assert.state", "actual": "$overlap", "expected": "skipped" },
+        { "op": "assert.eq", "actual": "$overlap.reason", "expected": "previous-run-in-progress" },
+        { "op": "assert.eq", "actual": "$asleep.reason", "expected": "computer-asleep" },
+        { "op": "assert.count", "actual": "$task.history", "expected": 3 }
+      ]
+    },
+    {
+      "id": "SCH-005",
+      "surface": "schedules-routines",
+      "title": "Desktop task permissions are saved per task and interactive tools still stall",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["desktop-scheduled-tasks#permissions-for-scheduled-tasks", "desktop-scheduled-tasks#manage-scheduled-tasks"],
+      "given": [{ "op": "fixture.desktop_scheduler", "as": "desktop" }],
+      "when": [
+        { "op": "schedule.create", "as": "task", "with": { "scheduler": "$desktop", "always_allow": ["Bash(go test *)"], "ask_tools": ["mcp__calendar"], "interactive_tools": ["mcp__login"] } },
+        { "op": "schedule.fire", "as": "run", "target": "$task" }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$run.permissions.saved_scope", "expected": "$task.id" },
+        { "op": "assert.state", "actual": "$run.ask_tools", "expected": "waiting-for-input" },
+        { "op": "assert.state", "actual": "$run.interactive_tools", "expected": "waiting-for-input" },
+        { "op": "assert.present", "actual": "$task.revoke_controls" }
+      ]
+    },
+    {
+      "id": "ROU-001",
+      "surface": "schedules-routines",
+      "title": "Each routine trigger starts an autonomous fresh cloud session",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["routines#create-a-routine", "routines#configure-triggers", "routines#how-sessions-map-to-events"],
+      "given": [{ "op": "fixture.cloud_repo", "as": "repo", "with": { "default_branch": "main" } }],
+      "when": [
+        { "op": "schedule.create_routine", "as": "routine", "with": { "repo": "$repo", "triggers": ["schedule", "api", "github"] } },
+        { "op": "schedule.fire", "as": "a", "target": "$routine", "with": { "trigger": "github", "event": "pr-update-1" } },
+        { "op": "schedule.fire", "as": "b", "target": "$routine", "with": { "trigger": "github", "event": "pr-update-2" } }
+      ],
+      "then": [
+        { "op": "assert.ne", "actual": "$a.session_id", "expected": "$b.session_id" },
+        { "op": "assert.eq", "actual": "$a.clone.base_branch", "expected": "main" },
+        { "op": "assert.eq", "actual": "$a.permission_prompts", "expected": 0 },
+        { "op": "assert.eq", "actual": "$a.local_files_visible", "expected": false },
+        { "op": "assert.present", "actual": "$a.session_url" }
+      ]
+    },
+    {
+      "id": "CHAN-001",
+      "surface": "channels",
+      "title": "Channel notifications preserve order, group while busy, and have no delivery acknowledgement",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["channels-reference#notification-format"],
+      "given": [{ "op": "session.start", "as": "s", "with": { "busy": true } }],
+      "when": [
+        { "op": "channel.connect", "as": "channel", "with": { "session": "$s", "name": "alerts" } },
+        { "op": "channel.send", "as": "one", "with": { "channel": "$channel", "content": "one" } },
+        { "op": "channel.send", "as": "two", "with": { "channel": "$channel", "content": "two" } },
+        { "op": "session.idle", "target": "$s" }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$one.acknowledged", "expected": false },
+        { "op": "assert.order", "actual": "$s.next_turn.channel_events", "expected": ["one", "two"] },
+        { "op": "assert.eq", "actual": "$s.next_turn.channel_event_groups", "expected": 1 }
+      ]
+    },
+    {
+      "id": "CHAN-002",
+      "surface": "channels",
+      "title": "Channel source is authoritative and invalid metadata keys are dropped",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["channels-reference#notification-format"],
+      "given": [{ "op": "channel.connect", "as": "channel", "with": { "name": "webhook" } }],
+      "when": [{ "op": "channel.send", "as": "event", "with": { "channel": "$channel", "content": "failed", "meta": { "source": "forged", "run_id": "123", "bad-key": "drop" } } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$event.tag.source", "expected": "webhook" },
+        { "op": "assert.eq", "actual": "$event.tag.run_id", "expected": "123" },
+        { "op": "assert.absent", "actual": "$event.tag", "expected": "bad-key" }
+      ]
+    },
+    {
+      "id": "CHAN-003",
+      "surface": "channels",
+      "title": "Channel policy gates plugin, organization, session, and sender identity",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["channels#enterprise-controls", "channels-reference#test-during-the-research-preview", "channels-reference#gate-inbound-messages"],
+      "given": [{ "op": "fixture.channel_policy", "as": "policy", "with": { "org_enabled": true, "allowed_plugins": ["trusted"], "allowed_senders": ["user-1"], "allowed_rooms": ["room-1"] } }],
+      "when": [
+        { "op": "channel.connect", "as": "trusted", "with": { "plugin": "trusted", "policy": "$policy", "enabled_for_session": true } },
+        { "op": "channel.connect", "as": "blocked", "with": { "plugin": "other", "policy": "$policy", "enabled_for_session": true } },
+        { "op": "channel.send", "as": "sender_ok", "with": { "channel": "$trusted", "sender": "user-1", "room": "room-2" } },
+        { "op": "channel.send", "as": "room_only", "with": { "channel": "$trusted", "sender": "user-2", "room": "room-1" } }
+      ],
+      "then": [
+        { "op": "assert.state", "actual": "$trusted", "expected": "connected" },
+        { "op": "assert.refused", "actual": "$blocked", "expected": "plugin-not-allowed" },
+        { "op": "assert.state", "actual": "$sender_ok", "expected": "delivered" },
+        { "op": "assert.state", "actual": "$room_only", "expected": "dropped" }
+      ]
+    },
+    {
+      "id": "CHAN-004",
+      "surface": "channels",
+      "title": "Permission relay applies only the first verdict for the matching open request",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["channels-reference#relay-permission-prompts", "channels-reference#permission-request-fields"],
+      "given": [{ "op": "channel.connect", "as": "channel", "with": { "permission_capability": true, "trusted_sender": "owner" } }],
+      "when": [
+        { "op": "permission.request", "as": "request", "with": { "tool": "Bash", "input": "git push" } },
+        { "op": "channel.permission_reply", "as": "wrong", "with": { "channel": "$channel", "request_id": "wrong", "verdict": "allow" } },
+        { "op": "channel.permission_reply", "as": "first", "with": { "channel": "$channel", "request_id": "$request.id", "verdict": "deny" } },
+        { "op": "channel.permission_reply", "as": "second", "with": { "channel": "$channel", "request_id": "$request.id", "verdict": "allow" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$wrong.applied", "expected": false },
+        { "op": "assert.eq", "actual": "$first.applied", "expected": true },
+        { "op": "assert.state", "actual": "$request", "expected": "denied" },
+        { "op": "assert.eq", "actual": "$second.applied", "expected": false }
+      ]
+    },
+    {
+      "id": "PERM-001",
+      "surface": "permissions",
+      "title": "Deny, ask, and allow precedence is independent of settings scope",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["permissions#permission-system", "permissions#settings-precedence"],
+      "given": [{ "op": "fixture.permissions", "as": "rules", "with": { "managed_allow": ["Bash(*)"], "user_deny": ["Bash(rm *)"], "project_ask": ["Bash(git push *)"], "cli_allow": ["Bash(git push *)"] } }],
+      "when": [
+        { "op": "permission.evaluate", "as": "remove", "with": { "rules": "$rules", "tool": "Bash", "input": "rm file" } },
+        { "op": "permission.evaluate", "as": "push", "with": { "rules": "$rules", "tool": "Bash", "input": "git push origin feature" } },
+        { "op": "permission.evaluate", "as": "test", "with": { "rules": "$rules", "tool": "Bash", "input": "go test ./..." } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$remove.decision", "expected": "deny" },
+        { "op": "assert.eq", "actual": "$push.decision", "expected": "ask" },
+        { "op": "assert.eq", "actual": "$test.decision", "expected": "allow" }
+      ]
+    },
+    {
+      "id": "PERM-002",
+      "surface": "permissions",
+      "title": "Permission modes preserve their distinct baselines and protected paths",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["permission-modes#available-modes", "permission-modes#protected-paths"],
+      "given": [{ "op": "fixture.permission_modes", "as": "modes", "with": { "names": ["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"] } }],
+      "when": [{ "op": "permission.evaluate_matrix", "as": "matrix", "with": { "modes": "$modes", "actions": ["read", "edit", "unapproved-tool", "protected-write"] } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$matrix.default.edit", "expected": "ask" },
+        { "op": "assert.eq", "actual": "$matrix.acceptEdits.edit", "expected": "allow" },
+        { "op": "assert.eq", "actual": "$matrix.plan.edit", "expected": "deny-until-plan-approved" },
+        { "op": "assert.eq", "actual": "$matrix.auto.unapproved_tool", "expected": "classifier" },
+        { "op": "assert.eq", "actual": "$matrix.dontAsk.unapproved_tool", "expected": "deny" },
+        { "op": "assert.eq", "actual": "$matrix.acceptEdits.protected_write", "expected": "ask" },
+        { "op": "assert.eq", "actual": "$matrix.bypassPermissions.protected_write", "expected": "allow" }
+      ]
+    },
+    {
+      "id": "PERM-003",
+      "surface": "permissions",
+      "title": "Child agents can narrow authority and cannot approve permissions",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["permissions#agent-subagents", "sub-agents#permission-modes"],
+      "given": [{ "op": "session.start", "as": "parent", "with": { "allow": ["Read", "Bash(go test *)"], "deny": ["Bash(git push *)"] } }],
+      "when": [
+        { "op": "agent.spawn", "as": "child", "with": { "parent": "$parent", "allow": ["Read"], "requested_allow": ["Bash(git push *)"] } },
+        { "op": "permission.request", "as": "request", "with": { "agent": "$child", "tool": "Bash", "input": "git push" } },
+        { "op": "agent.message", "with": { "agent": "$child", "text": "approve request" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$child.capabilities", "expected": ["Read"] },
+        { "op": "assert.state", "actual": "$request", "expected": "waiting-for-human" },
+        { "op": "assert.eq", "actual": "$request.approved_by_agent", "expected": false }
+      ]
+    },
+    {
+      "id": "PERM-004",
+      "surface": "permissions",
+      "title": "Hooks may allow, block, ask, or classify without bypassing policy ownership",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["permissions#extend-permissions-with-hooks", "hooks#permissionrequest", "hooks#pretooluse"],
+      "given": [{ "op": "fixture.permission_hooks", "as": "hooks", "with": { "pretool": "block-danger", "permission": "allow-tests", "silent": "no-decision" } }],
+      "when": [
+        { "op": "permission.request", "as": "danger", "with": { "hooks": "$hooks", "tool": "Bash", "input": "danger" } },
+        { "op": "permission.request", "as": "tests", "with": { "hooks": "$hooks", "tool": "Bash", "input": "go test ./..." } },
+        { "op": "permission.request", "as": "silent", "with": { "hooks": "$hooks", "tool": "Bash", "input": "other" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$danger.decision", "expected": "deny" },
+        { "op": "assert.eq", "actual": "$tests.decision", "expected": "allow" },
+        { "op": "assert.eq", "actual": "$silent.decision", "expected": "ask" },
+        { "op": "assert.eq", "actual": "$silent.hook_silence_is_approval", "expected": false }
+      ]
+    },
+    {
+      "id": "PERM-005",
+      "surface": "permissions",
+      "title": "Additional directories grant file access but never import configuration",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["permissions#additional-directories-grant-file-access-not-configuration"],
+      "given": [{ "op": "fixture.directory", "as": "extra", "with": { "claude_config": { "allow": ["Bash(*)"] }, "file": "visible.txt" } }],
+      "when": [
+        { "op": "session.start", "as": "s", "with": { "additional_directories": ["$extra.path"] } },
+        { "op": "permission.evaluate", "as": "bash", "with": { "session": "$s", "tool": "Bash", "input": "unsafe" } }
+      ],
+      "then": [
+        { "op": "assert.present", "actual": "$s.files", "expected": "$extra/visible.txt" },
+        { "op": "assert.eq", "actual": "$bash.decision", "expected": "ask" },
+        { "op": "assert.absent", "actual": "$s.loaded_config", "expected": "$extra/.claude" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,229 @@
+{
+  "$schema": "./case.schema.json",
+  "suite": "terminal-machine-ux-config-packaging",
+  "source_snapshot": "2026-08-05",
+  "cases": [
+    {
+      "id": "UX-001",
+      "surface": "tui-machine-ux",
+      "title": "Animated Agent View derives labels from logical state rather than process liveness",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["agent-view#read-session-state", "agent-view#monitor-sessions-with-agent-view"],
+      "given": [{ "op": "fixture.agent_states", "as": "states", "with": { "sessions": ["working", "needs-input", "completed", "exited-resumable"] } }],
+      "when": [{ "op": "ui.render_agent_view", "as": "frame", "with": { "states": "$states", "animations": true } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$frame.groups", "expected": ["needs-input", "working", "completed"] },
+        { "op": "assert.present", "actual": "$frame.working.animation" },
+        { "op": "assert.eq", "actual": "$frame.exited_resumable.logical_state", "expected": "working" },
+        { "op": "assert.eq", "actual": "$frame.exited_resumable.process_state", "expected": "exited" },
+        { "op": "assert.present", "actual": "$frame.exited_resumable.restart_action" }
+      ]
+    },
+    {
+      "id": "UX-002",
+      "surface": "tui-machine-ux",
+      "title": "Narrow terminals preserve controls and collapse secondary detail",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["agent-view#keyboard-shortcuts", "fullscreen#fullscreen-rendering"],
+      "given": [{ "op": "fixture.terminal", "as": "terminal", "with": { "widths": [120, 60, 32] } }],
+      "when": [{ "op": "ui.render_responsive", "as": "frames", "with": { "terminal": "$terminal", "view": "agents" } }],
+      "then": [
+        { "op": "assert.present", "actual": "$frames[120].session_list" },
+        { "op": "assert.present", "actual": "$frames[60].primary_controls" },
+        { "op": "assert.present", "actual": "$frames[32].primary_controls" },
+        { "op": "assert.eq", "actual": "$frames[32].horizontal_overflow", "expected": false },
+        { "op": "assert.eq", "actual": "$frames[32].secondary_detail", "expected": "collapsed" }
+      ]
+    },
+    {
+      "id": "UX-003",
+      "surface": "tui-machine-ux",
+      "title": "Screen-reader mode becomes linear labeled text with numbered prompts and alerts",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["accessibility#what-your-screen-reader-hears", "accessibility#answer-menus-and-prompts", "accessibility#hear-when-claude-code-needs-you"],
+      "given": [{ "op": "fixture.terminal", "as": "terminal", "with": { "screen_reader": true } }],
+      "when": [{ "op": "ui.render_conversation", "as": "output", "with": { "terminal": "$terminal", "turns": ["user", "assistant", "tool"], "permission_prompt": true, "needs_input": true } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$output.alternate_screen", "expected": false },
+        { "op": "assert.order", "actual": "$output.labels", "expected": ["you", "Claude", "tool", "permission"] },
+        { "op": "assert.eq", "actual": "$output.menu.kind", "expected": "numbered-list" },
+        { "op": "assert.eq", "actual": "$output.animations", "expected": false },
+        { "op": "assert.present", "actual": "$output.terminal_bell" }
+      ]
+    },
+    {
+      "id": "UX-004",
+      "surface": "tui-machine-ux",
+      "title": "Human and machine views consume one ordered state stream",
+      "profiles": ["durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["agent-view#read-session-state", "sdk-streaming#enable-streaming-output"],
+      "given": [{ "op": "fixture.activity_ledger", "as": "ledger", "with": { "events": ["started", "needs-input", "replied", "completed"] } }],
+      "when": [
+        { "op": "ui.render_agent_view", "as": "tui", "with": { "ledger": "$ledger" } },
+        { "op": "ui.render_json", "as": "json", "with": { "ledger": "$ledger" } },
+        { "op": "ui.follow_jsonl", "as": "stream", "with": { "ledger": "$ledger", "cursor": 0 } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$tui.state", "expected": "$json.state" },
+        { "op": "assert.eq", "actual": "$json.last_cursor", "expected": "$stream.last_cursor" },
+        { "op": "assert.order", "actual": "$stream.events", "expected": ["started", "needs-input", "replied", "completed"] },
+        { "op": "assert.eq", "actual": "$stream.duplicate_events", "expected": 0 }
+      ],
+      "claude_expected": [{ "op": "assert.present", "actual": "$tui.session_detail" }]
+    },
+    {
+      "id": "UX-005",
+      "surface": "tui-machine-ux",
+      "title": "Reconnect from an event cursor reproduces the same terminal state",
+      "profiles": ["durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["sdk-streaming#enable-streaming-output", "remote-control#connection-and-security"],
+      "given": [{ "op": "fixture.activity_ledger", "as": "ledger", "with": { "events": ["A", "B", "C", "D"] } }],
+      "when": [
+        { "op": "ui.follow_jsonl", "as": "first", "with": { "ledger": "$ledger", "stop_after": "B" } },
+        { "op": "fault.network_drop", "target": "$first" },
+        { "op": "ui.follow_jsonl", "as": "second", "with": { "ledger": "$ledger", "cursor": "$first.last_cursor" } },
+        { "op": "ui.render_agent_view", "as": "frame", "with": { "events": ["$first.events", "$second.events"] } }
+      ],
+      "then": [
+        { "op": "assert.order", "actual": "$second.events", "expected": ["C", "D"] },
+        { "op": "assert.eq", "actual": "$frame.state", "expected": "$ledger.final_state" },
+        { "op": "assert.eq", "actual": "$second.duplicate_events", "expected": 0 }
+      ]
+    },
+    {
+      "id": "CFG-001",
+      "surface": "config-packaging",
+      "title": "Settings precedence is managed, CLI, local, project, then user",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["settings#how-scopes-interact", "settings#settings-precedence"],
+      "given": [{ "op": "fixture.config", "as": "config", "with": { "user": { "theme": "user" }, "project": { "theme": "project" }, "local": { "theme": "local" }, "cli": { "theme": "cli" }, "managed": { "theme": "managed" } } }],
+      "when": [{ "op": "config.resolve", "as": "resolved", "with": { "config": "$config" } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$resolved.theme", "expected": "managed" },
+        { "op": "assert.eq", "actual": "$resolved.provenance.theme", "expected": "managed" },
+        { "op": "assert.eq", "actual": "$resolved.precedence", "expected": ["managed", "cli", "local", "project", "user"] }
+      ]
+    },
+    {
+      "id": "CFG-002",
+      "surface": "config-packaging",
+      "title": "Managed drop-ins deep-merge objects and deduplicate concatenated arrays",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["settings#settings-files"],
+      "given": [{ "op": "fixture.managed_dropins", "as": "dropins", "with": { "base": { "scalar": 1, "array": ["a"], "object": { "a": 1 } }, "10-first.json": { "scalar": 2, "array": ["a", "b"], "object": { "b": 2 } }, "20-last.json": { "scalar": 3, "array": ["c"], "object": { "c": 3 } }, ".hidden.json": { "scalar": 99 } } }],
+      "when": [{ "op": "config.resolve", "as": "resolved", "with": { "managed_dropins": "$dropins" } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$resolved.scalar", "expected": 3 },
+        { "op": "assert.eq", "actual": "$resolved.array", "expected": ["a", "b", "c"] },
+        { "op": "assert.eq", "actual": "$resolved.object", "expected": { "a": 1, "b": 2, "c": 3 } },
+        { "op": "assert.absent", "actual": "$resolved.sources", "expected": ".hidden.json" }
+      ]
+    },
+    {
+      "id": "CFG-003",
+      "surface": "config-packaging",
+      "title": "Live settings changes reload where supported and report restart-only fields",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["settings#when-edits-take-effect", "settings#verify-active-settings", "hooks#configchange"],
+      "given": [{ "op": "session.start", "as": "s", "with": { "config": { "spinnerTipsEnabled": true, "model": "sonnet" } } }],
+      "when": [
+        { "op": "config.edit", "as": "edit", "with": { "session": "$s", "changes": { "spinnerTipsEnabled": false, "model": "opus" } } },
+        { "op": "config.inspect", "as": "active", "with": { "session": "$s" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$active.spinnerTipsEnabled", "expected": false },
+        { "op": "assert.eq", "actual": "$active.model", "expected": "sonnet" },
+        { "op": "assert.contains", "actual": "$edit.restart_required", "expected": "model" },
+        { "op": "assert.event", "actual": "$s.events", "expected": "ConfigChange" }
+      ]
+    },
+    {
+      "id": "CFG-004",
+      "surface": "config-packaging",
+      "title": "Alternate config directories isolate application data and discovery roots",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["claude-directory#application-data", "settings#settings-files"],
+      "given": [{ "op": "fixture.config_dirs", "as": "dirs", "with": { "default": "$tmp/default", "alternate": "$tmp/alternate" } }],
+      "when": [
+        { "op": "session.start", "as": "a", "with": { "config_dir": "$dirs.default" } },
+        { "op": "session.start", "as": "b", "with": { "config_dir": "$dirs.alternate" } }
+      ],
+      "then": [
+        { "op": "assert.ne", "actual": "$a.session_store", "expected": "$b.session_store" },
+        { "op": "assert.ne", "actual": "$a.user_skills_dir", "expected": "$b.user_skills_dir" },
+        { "op": "assert.ne", "actual": "$a.debug_dir", "expected": "$b.debug_dir" },
+        { "op": "assert.eq", "actual": "$b.config_dir", "expected": "$dirs.alternate" }
+      ]
+    },
+    {
+      "id": "PKG-001",
+      "surface": "config-packaging",
+      "title": "Nearest project definitions override broader project and user definitions",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["skills#where-skills-live", "sub-agents#choose-the-subagent-scope", "workflows#save-the-workflow-for-reuse"],
+      "given": [{ "op": "fixture.package_scopes", "as": "scopes", "with": { "name": "audit", "definitions": ["user", "project-root", "project-nested"] } }],
+      "when": [
+        { "op": "package.resolve", "as": "skill", "with": { "kind": "skill", "name": "audit", "cwd": "$scopes.nested" } },
+        { "op": "package.resolve", "as": "agent", "with": { "kind": "agent", "name": "audit", "cwd": "$scopes.nested" } },
+        { "op": "package.resolve", "as": "workflow", "with": { "kind": "workflow", "name": "audit", "cwd": "$scopes.nested" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$skill.source", "expected": "project-nested" },
+        { "op": "assert.eq", "actual": "$agent.source", "expected": "project-nested" },
+        { "op": "assert.eq", "actual": "$workflow.source", "expected": "project-nested" },
+        { "op": "assert.present", "actual": "$skill.provenance" }
+      ]
+    },
+    {
+      "id": "PKG-002",
+      "surface": "config-packaging",
+      "title": "Plugins package namespaced components without rewriting user configuration",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["plugins#plugin-structure-overview", "plugins#what-changes-when-migrating", "plugins-reference#plugin-components-reference"],
+      "given": [{ "op": "fixture.plugin", "as": "plugin", "with": { "name": "acme", "components": ["skills", "agents", "hooks", "mcp", "workflows"], "user_skill_same_name": true } }],
+      "when": [
+        { "op": "package.install", "as": "installed", "with": { "plugin": "$plugin" } },
+        { "op": "package.resolve", "as": "component", "with": { "kind": "skill", "name": "acme:audit" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$component.namespace", "expected": "acme" },
+        { "op": "assert.eq", "actual": "$component.source", "expected": "plugin" },
+        { "op": "assert.eq", "actual": "$installed.user_config_rewritten", "expected": false },
+        { "op": "assert.present", "actual": "$installed.cache_path" },
+        { "op": "assert.present", "actual": "$installed.component_provenance" }
+      ]
+    },
+    {
+      "id": "PKG-003",
+      "surface": "config-packaging",
+      "title": "Skill edits are live and forked context runs in an isolated subagent",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["skills#live-change-detection", "skills#run-skills-in-a-subagent", "skills#frontmatter-reference"],
+      "given": [{ "op": "fixture.skill", "as": "skill", "with": { "name": "research", "body": "version-one", "context": "fork", "agent": "Explore", "allowed_tools": ["Read", "Grep"] } }],
+      "when": [
+        { "op": "package.invoke_skill", "as": "first", "with": { "skill": "$skill" } },
+        { "op": "package.edit_skill", "with": { "skill": "$skill", "body": "version-two" } },
+        { "op": "package.invoke_skill", "as": "second", "with": { "skill": "$skill" } }
+      ],
+      "then": [
+        { "op": "assert.contains", "actual": "$first.context", "expected": "version-one" },
+        { "op": "assert.contains", "actual": "$second.context", "expected": "version-two" },
+        { "op": "assert.eq", "actual": "$second.execution_kind", "expected": "subagent" },
+        { "op": "assert.eq", "actual": "$second.agent_type", "expected": "Explore" },
+        { "op": "assert.eq", "actual": "$second.capabilities", "expected": ["Read", "Grep"] }
+      ]
+    }
+  ]
+}

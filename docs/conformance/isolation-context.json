@@ -1,0 +1,271 @@
+{
+  "$schema": "./case.schema.json",
+  "suite": "worktrees-checkpoints-compaction-memory",
+  "source_snapshot": "2026-08-05",
+  "cases": [
+    {
+      "id": "WT-001",
+      "surface": "worktrees",
+      "title": "Worktree identity, default path, branch, and base selection are explicit",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["worktrees#start-claude-in-a-worktree", "worktrees#choose-the-base-branch"],
+      "given": [{ "op": "fixture.repo", "as": "repo", "with": { "origin_head": "main-sha", "local_head": "feature-sha" } }],
+      "when": [
+        { "op": "worktree.create", "as": "fresh", "with": { "repo": "$repo", "name": "audit", "base_ref": "fresh" } },
+        { "op": "worktree.create", "as": "head", "with": { "repo": "$repo", "name": "audit-head", "base_ref": "head" } }
+      ],
+      "then": [
+        { "op": "assert.contains", "actual": "$fresh.path", "expected": ".claude/worktrees/audit" },
+        { "op": "assert.eq", "actual": "$fresh.branch", "expected": "worktree-audit" },
+        { "op": "assert.eq", "actual": "$fresh.base_sha", "expected": "main-sha" },
+        { "op": "assert.eq", "actual": "$head.base_sha", "expected": "feature-sha" },
+        { "op": "assert.present", "actual": "$fresh.owner_session_id" }
+      ],
+      "normalize": ["absolute_paths"]
+    },
+    {
+      "id": "WT-002",
+      "surface": "worktrees",
+      "title": "Resume returns to the worktree while fork leaves the original untouched",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["worktrees#resume-a-worktree-session", "sessions#branch-a-session"],
+      "given": [{ "op": "worktree.create", "as": "wt", "with": { "name": "resume" } }],
+      "when": [
+        { "op": "session.start", "as": "s", "with": { "cwd": "$wt.path" } },
+        { "op": "session.exit", "target": "$s" },
+        { "op": "session.resume", "as": "r", "with": { "session_id": "$s.session_id", "cwd": "$wt.repo_root" } },
+        { "op": "session.fork", "as": "fork", "with": { "session_id": "$s.session_id", "cwd": "$wt.repo_root" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$r.cwd", "expected": "$wt.path" },
+        { "op": "assert.eq", "actual": "$fork.cwd", "expected": "$wt.repo_root" },
+        { "op": "assert.eq", "actual": "$wt.owner_session_id", "expected": "$s.session_id" }
+      ]
+    },
+    {
+      "id": "WT-003",
+      "surface": "worktrees",
+      "title": "Only ignored allowlisted files are copied into a new worktree",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["worktrees#copy-gitignored-files-into-worktrees"],
+      "given": [{ "op": "fixture.repo", "as": "repo", "with": { "tracked": ["tracked.env"], "ignored": [".env", "secret.txt"], "worktreeinclude": [".env", "tracked.env"] } }],
+      "when": [{ "op": "worktree.create", "as": "wt", "with": { "repo": "$repo", "name": "copy" } }],
+      "then": [
+        { "op": "assert.file", "actual": "$wt/.env", "expected": "$repo/.env" },
+        { "op": "assert.file", "actual": "$wt/tracked.env", "expected": "checked-out-tracked-version" },
+        { "op": "assert.absent", "actual": "$wt.files", "expected": "secret.txt" }
+      ]
+    },
+    {
+      "id": "WT-004",
+      "surface": "worktrees",
+      "title": "Cleanup deletes only clean owned worktrees and locks running ones",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["worktrees#clean-up-worktrees", "worktrees#clean-up-subagent-and-background-session-worktrees"],
+      "given": [{ "op": "fixture.worktrees", "as": "trees", "with": { "clean_owned": 1, "dirty_owned": 1, "unpushed_owned": 1, "manual": 1, "running_locked": 1 } }],
+      "when": [{ "op": "worktree.cleanup", "as": "cleanup", "with": { "age_days": 31 } }],
+      "then": [
+        { "op": "assert.absent", "actual": "$trees.clean_owned.path" },
+        { "op": "assert.present", "actual": "$trees.dirty_owned.path" },
+        { "op": "assert.present", "actual": "$trees.unpushed_owned.path" },
+        { "op": "assert.present", "actual": "$trees.manual.path" },
+        { "op": "assert.present", "actual": "$trees.running_locked.path" },
+        { "op": "assert.contains", "actual": "$cleanup.skips", "expected": "preserve-work" }
+      ]
+    },
+    {
+      "id": "WT-005",
+      "surface": "worktrees",
+      "title": "Custom WorktreeCreate and WorktreeRemove hooks replace git behavior",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["worktrees#replace-worktree-creation-with-a-hook", "hooks#worktreecreate", "hooks#worktreeremove"],
+      "given": [{ "op": "fixture.worktree_hooks", "as": "hooks", "with": { "create_path": "$tmp/custom", "remove_marker": true } }],
+      "when": [
+        { "op": "worktree.create", "as": "wt", "with": { "hooks": "$hooks", "name": "custom" } },
+        { "op": "worktree.remove", "target": "$wt" }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$wt.path", "expected": "$tmp/custom" },
+        { "op": "assert.absent", "actual": "$wt.git_branch" },
+        { "op": "assert.event", "actual": "$hooks.events", "expected": "WorktreeRemove" },
+        { "op": "assert.file", "actual": "$hooks.remove_marker", "expected": true }
+      ]
+    },
+    {
+      "id": "WT-006",
+      "surface": "worktrees",
+      "title": "Background write isolation precedes edits and preserves safe Git boundaries",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["agent-view#how-file-edits-are-isolated", "worktrees#isolate-subagents-with-worktrees"],
+      "given": [{ "op": "fixture.repo", "as": "repo", "with": { "branch": "main", "remote": true } }],
+      "when": [{ "op": "session.background", "as": "s", "with": { "cwd": "$repo.path", "prompt": "edit file and preserve work" } }],
+      "then": [
+        { "op": "assert.order", "actual": "$s.events", "expected": ["write-requested", "worktree-created", "cwd-changed", "write-applied", "commit-created", "branch-pushed"] },
+        { "op": "assert.ne", "actual": "$s.branch", "expected": "main" },
+        { "op": "assert.absent", "actual": "$s.git_operations", "expected": "force-push" },
+        { "op": "assert.absent", "actual": "$s.git_operations", "expected": "merge" }
+      ]
+    },
+    {
+      "id": "CP-001",
+      "surface": "checkpoints",
+      "title": "Every user prompt captures a checkpoint and the newest 100 remain",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["checkpointing#automatic-tracking"],
+      "given": [{ "op": "session.start", "as": "s" }],
+      "when": [{ "op": "checkpoint.generate_prompts", "as": "generated", "with": { "session": "$s", "count": 101, "edit_each": true } }],
+      "then": [
+        { "op": "assert.count", "actual": "$s.checkpoints", "expected": 100 },
+        { "op": "assert.absent", "actual": "$s.checkpoints", "expected": "$generated.first_checkpoint" },
+        { "op": "assert.present", "actual": "$s.first_file_baseline" }
+      ]
+    },
+    {
+      "id": "CP-002",
+      "surface": "checkpoints",
+      "title": "Code rewind and conversation rewind can be selected independently",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["checkpointing#rewind-and-summarize"],
+      "given": [{ "op": "session.start", "as": "s", "with": { "turns": [{ "prompt": "one", "file": "v1" }, { "prompt": "two", "file": "v2" }] } }],
+      "when": [
+        { "op": "checkpoint.restore", "as": "conversation_only", "with": { "session": "$s", "checkpoint": 1, "conversation": true, "code": false } },
+        { "op": "checkpoint.restore", "as": "code_only", "with": { "session": "$s", "checkpoint": 1, "conversation": false, "code": true } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$conversation_only.file", "expected": "v2" },
+        { "op": "assert.absent", "actual": "$conversation_only.context", "expected": "two" },
+        { "op": "assert.eq", "actual": "$code_only.file", "expected": "v1" },
+        { "op": "assert.contains", "actual": "$code_only.context", "expected": "two" }
+      ]
+    },
+    {
+      "id": "CP-003",
+      "surface": "checkpoints",
+      "title": "Rewind never claims Bash, external, subagent, symlink, or hardlink changes",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["checkpointing#limitations"],
+      "given": [{ "op": "fixture.checkpoint_changes", "as": "changes", "with": { "edit_tool": "tracked.txt", "bash": "bash.txt", "external": "external.txt", "subagent": "subagent.txt", "symlink": "link.txt", "hardlink": "hard.txt" } }],
+      "when": [{ "op": "checkpoint.restore", "as": "restore", "with": { "changes": "$changes", "code": true } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$restore.files[tracked.txt]", "expected": "before" },
+        { "op": "assert.eq", "actual": "$restore.files[bash.txt]", "expected": "after" },
+        { "op": "assert.eq", "actual": "$restore.files[external.txt]", "expected": "after" },
+        { "op": "assert.eq", "actual": "$restore.files[subagent.txt]", "expected": "after" },
+        { "op": "assert.eq", "actual": "$restore.files[link.txt]", "expected": "after" },
+        { "op": "assert.eq", "actual": "$restore.files[hard.txt]", "expected": "after" },
+        { "op": "assert.contains", "actual": "$restore.warning", "expected": "skipped" }
+      ]
+    },
+    {
+      "id": "CP-004",
+      "surface": "checkpoints",
+      "title": "Targeted summary retains original transcript while changing active context",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["checkpointing#rewind-and-summarize", "checkpointing#guide-a-summary"],
+      "given": [{ "op": "session.start", "as": "s", "with": { "turns": ["A", "B", "C", "D"] } }],
+      "when": [{ "op": "checkpoint.summarize", "as": "summary", "with": { "session": "$s", "from": "B", "direction": "from-here", "focus": "decisions" } }],
+      "then": [
+        { "op": "assert.contains", "actual": "$summary.active_context", "expected": "Summarized conversation" },
+        { "op": "assert.contains", "actual": "$summary.active_context", "expected": "decisions" },
+        { "op": "assert.eq", "actual": "$s.raw_transcript.turns", "expected": ["A", "B", "C", "D"] },
+        { "op": "assert.eq", "actual": "$summary.files_changed", "expected": false }
+      ]
+    },
+    {
+      "id": "CTX-001",
+      "surface": "compaction-memory",
+      "title": "Compaction reload matrix preserves and lazily reloads the right instruction sources",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["context-window#what-survives-compaction"],
+      "given": [{ "op": "fixture.context", "as": "context", "with": { "system": "SYS", "root_claude": "ROOT", "auto_memory": "MEM", "path_rule": "PATH", "nested_claude": "NESTED", "skills": 7 } }],
+      "when": [
+        { "op": "context.compact", "as": "compacted", "with": { "context": "$context" } },
+        { "op": "context.read_matching_file", "as": "reloaded", "with": { "context": "$compacted", "path": "nested/file.ts" } }
+      ],
+      "then": [
+        { "op": "assert.contains", "actual": "$compacted", "expected": "SYS" },
+        { "op": "assert.contains", "actual": "$compacted", "expected": "ROOT" },
+        { "op": "assert.contains", "actual": "$compacted", "expected": "MEM" },
+        { "op": "assert.absent", "actual": "$compacted", "expected": "PATH" },
+        { "op": "assert.absent", "actual": "$compacted", "expected": "NESTED" },
+        { "op": "assert.contains", "actual": "$reloaded", "expected": "PATH" },
+        { "op": "assert.contains", "actual": "$reloaded", "expected": "NESTED" },
+        { "op": "assert.eq", "actual": "$compacted.skills_reinjected.max_total_tokens", "expected": 25000 }
+      ]
+    },
+    {
+      "id": "CTX-002",
+      "surface": "compaction-memory",
+      "title": "Automatic and explicit compaction expose provenance and reset live usage fields",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["context-window#when-your-context-fills-up", "statusline#context-window-fields", "hooks#precompact"],
+      "given": [{ "op": "session.start", "as": "s", "with": { "auto_compact_window": 100000 } }],
+      "when": [
+        { "op": "context.fill", "target": "$s", "with": { "tokens": 100000 } },
+        { "op": "context.wait_compaction", "as": "auto", "target": "$s" },
+        { "op": "context.compact", "as": "manual", "with": { "session": "$s", "focus": "tests" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$auto.trigger", "expected": "auto" },
+        { "op": "assert.present", "actual": "$auto.pre_tokens" },
+        { "op": "assert.eq", "actual": "$manual.trigger", "expected": "manual" },
+        { "op": "assert.eq", "actual": "$s.status.context_window.current_usage", "expected": null },
+        { "op": "assert.event", "actual": "$s.events", "expected": "PreCompact" },
+        { "op": "assert.event", "actual": "$s.events", "expected": "PostCompact" }
+      ]
+    },
+    {
+      "id": "MEM-001",
+      "surface": "compaction-memory",
+      "title": "Project auto memory is shared by worktrees but isolated from ordinary subagents",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["memory#storage-location", "memory#how-it-works", "sub-agents#enable-persistent-memory"],
+      "given": [{ "op": "fixture.repo", "as": "repo", "with": { "worktrees": ["a", "b"] } }],
+      "when": [
+        { "op": "memory.write", "with": { "cwd": "$repo.worktrees[0]", "entry": "shared fact" } },
+        { "op": "session.start", "as": "other", "with": { "cwd": "$repo.worktrees[1]" } },
+        { "op": "agent.spawn", "as": "plain", "with": { "parent": "$other", "memory": null } },
+        { "op": "agent.spawn", "as": "scoped", "with": { "parent": "$other", "memory": "project" } }
+      ],
+      "then": [
+        { "op": "assert.contains", "actual": "$other.initial_context", "expected": "shared fact" },
+        { "op": "assert.absent", "actual": "$plain.initial_context", "expected": "shared fact" },
+        { "op": "assert.ne", "actual": "$scoped.memory_path", "expected": "$other.memory_path" },
+        { "op": "assert.present", "actual": "$scoped.memory_path" }
+      ]
+    },
+    {
+      "id": "MEM-002",
+      "surface": "compaction-memory",
+      "title": "Memory index startup limits and on-demand topic files are observable",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["memory#how-it-works", "memory#audit-and-edit-your-memory"],
+      "given": [{ "op": "fixture.memory", "as": "memory", "with": { "index_lines": 220, "index_bytes": 30000, "topic": "details.md", "frontmatter_comments": true } }],
+      "when": [
+        { "op": "session.start", "as": "s", "with": { "memory": "$memory" } },
+        { "op": "memory.read_topic", "as": "topic", "with": { "session": "$s", "name": "details.md" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$s.memory.loaded.max_lines", "expected": 200 },
+        { "op": "assert.eq", "actual": "$s.memory.loaded.max_bytes", "expected": 25000 },
+        { "op": "assert.absent", "actual": "$s.initial_context", "expected": "$memory.topic_content" },
+        { "op": "assert.contains", "actual": "$topic.content", "expected": "$memory.topic_content" },
+        { "op": "assert.present", "actual": "$memory.over_limit_warning" }
+      ]
+    }
+  ]
+}

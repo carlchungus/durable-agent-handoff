@@ -1,0 +1,322 @@
+{
+  "$schema": "./case.schema.json",
+  "suite": "sessions-agent-view-supervisor",
+  "source_snapshot": "2026-08-05",
+  "cases": [
+    {
+      "id": "SES-001",
+      "surface": "sessions",
+      "title": "Exact resume appends to the same session identity",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["sessions#resume-a-session", "sdk-sessions#continue-resume-and-fork"],
+      "given": [{ "op": "fixture.repo", "as": "repo", "with": { "files": { "a.txt": "one" } } }],
+      "when": [
+        { "op": "session.start", "as": "original", "with": { "cwd": "$repo.path", "prompt": "remember alpha" } },
+        { "op": "session.exit", "target": "$original" },
+        { "op": "session.resume", "as": "resumed", "with": { "cwd": "$repo.path", "session_id": "$original.session_id", "prompt": "what word?" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$resumed.session_id", "expected": "$original.session_id" },
+        { "op": "assert.contains", "actual": "$resumed.answer", "expected": "alpha" },
+        { "op": "assert.order", "with": { "events": ["original.user", "original.result", "resumed.user", "resumed.result"] } }
+      ],
+      "faults": [
+        {
+          "at": "after:session.start",
+          "inject": { "op": "fault.kill", "target": "$original.process" },
+          "recover": [{ "op": "session.resume", "as": "recovered", "with": { "session_id": "$original.session_id", "cwd": "$repo.path", "prompt": "continue" } }],
+          "then": [{ "op": "assert.eq", "actual": "$recovered.session_id", "expected": "$original.session_id" }]
+        }
+      ],
+      "normalize": ["pid", "timestamps", "absolute_paths"]
+    },
+    {
+      "id": "SES-002",
+      "surface": "sessions",
+      "title": "Fork copies history and writes under a new identity",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["sessions#branch-a-session", "sdk-sessions#fork-to-explore-alternatives"],
+      "given": [{ "op": "fixture.repo", "as": "repo" }],
+      "when": [
+        { "op": "session.start", "as": "original", "with": { "cwd": "$repo.path", "prompt": "choose red" } },
+        { "op": "session.fork", "as": "fork", "with": { "session_id": "$original.session_id", "prompt": "choose blue instead" } }
+      ],
+      "then": [
+        { "op": "assert.ne", "actual": "$fork.session_id", "expected": "$original.session_id" },
+        { "op": "assert.contains", "actual": "$fork.transcript", "expected": "choose red" },
+        { "op": "assert.absent", "actual": "$original.transcript", "expected": "choose blue instead" },
+        { "op": "assert.eq", "actual": "$fork.parent_session_id", "expected": "$original.session_id" }
+      ],
+      "normalize": ["session_id", "timestamps"]
+    },
+    {
+      "id": "SES-003",
+      "surface": "sessions",
+      "title": "Resume restores only documented session state",
+      "profiles": ["claude-current"],
+      "match_policy": "normalized",
+      "source_refs": ["sessions#what-a-resumed-session-restores"],
+      "given": [{ "op": "fixture.config", "as": "cfg", "with": { "model": "model-a", "permission_mode": "acceptEdits", "launch_only": ["mcp-config", "add-dir"] } }],
+      "when": [
+        { "op": "session.start", "as": "s", "with": { "config": "$cfg", "active_goal": "condition", "scheduled_task": "unexpired" } },
+        { "op": "session.exit", "target": "$s" },
+        { "op": "session.resume", "as": "r", "with": { "session_id": "$s.session_id" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$r.model", "expected": "model-a" },
+        { "op": "assert.eq", "actual": "$r.permission_mode", "expected": "acceptEdits" },
+        { "op": "assert.present", "actual": "$r.goal" },
+        { "op": "assert.present", "actual": "$r.scheduled_task" },
+        { "op": "assert.absent", "actual": "$r.launch_only.mcp-config" },
+        { "op": "assert.absent", "actual": "$r.background_shell" }
+      ],
+      "notes": ["Plan and bypassPermissions are explicit negative variants and must not be restored implicitly."]
+    },
+    {
+      "id": "SES-004",
+      "surface": "sessions",
+      "title": "Picker scope, name ambiguity, and machine-wide widening are distinct",
+      "profiles": ["claude-current"],
+      "match_policy": "normalized",
+      "source_refs": ["sessions#where-the-session-picker-looks", "sessions#use-the-session-picker"],
+      "given": [{ "op": "fixture.repo", "as": "repo", "with": { "worktrees": ["one", "two"], "other_project": true } }],
+      "when": [
+        { "op": "session.start", "as": "a", "with": { "cwd": "$repo.worktrees[0]", "name": "same" } },
+        { "op": "session.start", "as": "b", "with": { "cwd": "$repo.worktrees[1]", "name": "same" } },
+        { "op": "session.list", "as": "local", "with": { "cwd": "$repo.worktrees[0]", "scope": "worktree" } },
+        { "op": "session.list", "as": "wide", "with": { "cwd": "$repo.worktrees[0]", "scope": "repository" } },
+        { "op": "session.resume_by_name", "as": "ambiguous", "with": { "cwd": "$repo.path", "name": "same" } }
+      ],
+      "then": [
+        { "op": "assert.count", "actual": "$local.matches", "expected": 1 },
+        { "op": "assert.count", "actual": "$wide.matches", "expected": 2 },
+        { "op": "assert.state", "actual": "$ambiguous", "expected": "picker-required" }
+      ]
+    },
+    {
+      "id": "SES-005",
+      "surface": "sessions",
+      "title": "Clear, compact, export, retention, and no-persistence remain separate controls",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["sessions#manage-context-within-a-session", "sessions#export-and-locate-session-data"],
+      "given": [{ "op": "fixture.clock", "as": "clock", "with": { "now": "2026-08-05T12:00:00Z" } }],
+      "when": [
+        { "op": "session.start", "as": "s", "with": { "prompt": "secret-free transcript" } },
+        { "op": "session.export", "as": "export", "with": { "session_id": "$s.session_id", "format": "human-text" } },
+        { "op": "session.compact", "as": "compact", "with": { "session_id": "$s.session_id", "focus": "decision" } },
+        { "op": "session.clear", "as": "cleared", "with": { "session_id": "$s.session_id" } },
+        { "op": "session.start", "as": "ephemeral", "with": { "persist": false, "prompt": "do not retain" } }
+      ],
+      "then": [
+        { "op": "assert.contains", "actual": "$export.text", "expected": "secret-free transcript" },
+        { "op": "assert.ne", "actual": "$cleared.session_id", "expected": "$s.session_id" },
+        { "op": "assert.contains", "actual": "$s.transcript", "expected": "secret-free transcript" },
+        { "op": "assert.absent", "actual": "$ephemeral.transcript_path" }
+      ],
+      "normalize": ["session_id", "absolute_paths", "timestamps"]
+    },
+    {
+      "id": "VIEW-001",
+      "surface": "agent-view",
+      "title": "Logical state and process liveness are independent dimensions",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["agent-view#read-session-state", "agent-view#list-sessions-as-json"],
+      "given": [{ "op": "fixture.provider", "as": "provider", "with": { "scripted_states": ["working", "needs_input", "completed"] } }],
+      "when": [
+        { "op": "session.background", "as": "s", "with": { "provider": "$provider" } },
+        { "op": "ui.agents_json", "as": "working" },
+        { "op": "fixture.provider_advance", "target": "$provider", "with": { "to": "needs_input" } },
+        { "op": "ui.agents_json", "as": "blocked" },
+        { "op": "fixture.provider_advance", "target": "$provider", "with": { "to": "completed" } },
+        { "op": "fault.kill", "target": "$s.process" },
+        { "op": "ui.agents_json", "as": "exited" }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$working.state", "expected": "working" },
+        { "op": "assert.eq", "actual": "$blocked.waitingFor", "expected": "input needed" },
+        { "op": "assert.eq", "actual": "$exited.state", "expected": "done" },
+        { "op": "assert.absent", "actual": "$exited.pid" }
+      ]
+    },
+    {
+      "id": "VIEW-002",
+      "surface": "agent-view",
+      "title": "Peek reply is durable and wakes an exited session",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["agent-view#peek-and-reply", "agent-view#the-supervisor-process"],
+      "given": [{ "op": "session.background", "as": "s", "with": { "prompt": "ask for a color" } }],
+      "when": [
+        { "op": "session.wait", "target": "$s", "with": { "state": "needs_input" } },
+        { "op": "fault.kill", "target": "$s.process" },
+        { "op": "session.reply", "as": "reply", "with": { "session": "$s", "text": "blue", "transport_available": false } },
+        { "op": "supervisor.start" }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$reply.delivery", "expected": "queued" },
+        { "op": "assert.eventually", "actual": "$s.transcript", "expected": "blue", "within_ms": 30000 },
+        { "op": "assert.eq", "actual": "$s.session_id_after_wake", "expected": "$s.session_id" }
+      ],
+      "faults": [
+        {
+          "at": "during:session.reply",
+          "inject": { "op": "fault.kill", "target": "$supervisor.process" },
+          "recover": [{ "op": "supervisor.start" }],
+          "then": [{ "op": "assert.count", "actual": "$s.transcript.messages[text=blue]", "expected": 1 }]
+        }
+      ]
+    },
+    {
+      "id": "VIEW-003",
+      "surface": "agent-view",
+      "title": "Attach, detach, and stop have non-overlapping effects",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["agent-view#attach-to-a-session"],
+      "given": [{ "op": "session.background", "as": "s", "with": { "prompt": "wait" } }],
+      "when": [
+        { "op": "session.attach", "as": "attached", "target": "$s" },
+        { "op": "session.detach", "target": "$attached" },
+        { "op": "ui.agents_json", "as": "after_detach" },
+        { "op": "session.stop", "target": "$s" },
+        { "op": "ui.agents_json", "as": "after_stop" }
+      ],
+      "then": [
+        { "op": "assert.present", "actual": "$after_detach.pid" },
+        { "op": "assert.eq", "actual": "$after_stop.state", "expected": "stopped" },
+        { "op": "assert.present", "actual": "$s.transcript" }
+      ]
+    },
+    {
+      "id": "VIEW-004",
+      "surface": "agent-view",
+      "title": "Deleting a session preserves transcript and guards unpushed work",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["agent-view#organize-the-list", "agent-view#how-file-edits-are-isolated"],
+      "given": [{ "op": "fixture.repo", "as": "repo", "with": { "remote": true } }],
+      "when": [
+        { "op": "session.background", "as": "s", "with": { "cwd": "$repo.path", "edit": true, "commit": "local-only" } },
+        { "op": "session.delete", "as": "refused", "target": "$s" },
+        { "op": "pr.push", "target": "$s.branch" },
+        { "op": "session.delete", "as": "deleted", "target": "$s" },
+        { "op": "session.resume", "as": "resumed", "with": { "session_id": "$s.session_id" } }
+      ],
+      "then": [
+        { "op": "assert.refused", "actual": "$refused", "expected": "unpushed-commits" },
+        { "op": "assert.absent", "actual": "$deleted.agent_view_row" },
+        { "op": "assert.absent", "actual": "$deleted.worktree" },
+        { "op": "assert.eq", "actual": "$resumed.session_id", "expected": "$s.session_id" }
+      ]
+    },
+    {
+      "id": "VIEW-005",
+      "surface": "agent-view",
+      "title": "Grouping, pinning, filtering, and completed folding preserve priority",
+      "profiles": ["claude-current"],
+      "match_policy": "normalized",
+      "source_refs": ["agent-view#organize-the-list", "agent-view#filter-sessions"],
+      "given": [{ "op": "fixture.sessions", "as": "sessions", "with": { "working": 2, "needs_input": 1, "failed": 1, "completed": 10, "open_pr": 1, "directories": 2 } }],
+      "when": [
+        { "op": "ui.agents_frame", "as": "state_view", "with": { "height": 16, "group": "state" } },
+        { "op": "ui.pin", "target": "$sessions.working[1]" },
+        { "op": "ui.filter", "as": "filtered", "with": { "query": "s:blocked" } },
+        { "op": "ui.agents_frame", "as": "dir_view", "with": { "height": 16, "group": "directory" } }
+      ],
+      "then": [
+        { "op": "assert.order", "actual": "$state_view.groups", "expected": ["Pinned", "Ready for review", "Needs input", "Working", "Completed"] },
+        { "op": "assert.count", "actual": "$filtered.rows", "expected": 1 },
+        { "op": "assert.present", "actual": "$state_view.failed_row" },
+        { "op": "assert.present", "actual": "$state_view.open_pr_row" },
+        { "op": "assert.eq", "actual": "$dir_view.grouping", "expected": "directory" }
+      ]
+    },
+    {
+      "id": "SUP-001",
+      "surface": "supervisor",
+      "title": "Supervisor restart adopts matching live workers without duplicate execution",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["agent-view#the-supervisor-process"],
+      "given": [{ "op": "fixture.command", "as": "counter", "with": { "side_effect": "increment-once", "duration_ms": 30000 } }],
+      "when": [
+        { "op": "session.background", "as": "s", "with": { "command": "$counter" } },
+        { "op": "fault.kill", "target": "$supervisor.process" },
+        { "op": "supervisor.start", "as": "new_supervisor" },
+        { "op": "session.wait", "target": "$s", "with": { "state": "completed" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$counter.count", "expected": 1 },
+        { "op": "assert.eq", "actual": "$s.process_identity_before.pid", "expected": "$s.process_identity_after.pid" },
+        { "op": "assert.event", "actual": "$s.events", "expected": "worker.adopted" }
+      ],
+      "normalize": ["supervisor_id", "timestamps"]
+    },
+    {
+      "id": "SUP-002",
+      "surface": "supervisor",
+      "title": "Unexpected worker exit restarts only eligible dispatched work",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["agent-view#the-supervisor-process"],
+      "given": [
+        { "op": "session.background", "as": "dispatched", "with": { "origin": "dispatch", "prompt": "finish task" } },
+        { "op": "session.background", "as": "detached", "with": { "origin": "interactive-detach" } }
+      ],
+      "when": [
+        { "op": "fault.kill", "target": "$dispatched.process" },
+        { "op": "fault.kill", "target": "$detached.process" },
+        { "op": "supervisor.reconcile" }
+      ],
+      "then": [
+        { "op": "assert.eventually", "actual": "$dispatched.process.state", "expected": "alive", "within_ms": 30000 },
+        { "op": "assert.eq", "actual": "$detached.state", "expected": "stopped" },
+        { "op": "assert.contains", "actual": "$dispatched.resume_context", "expected": "re-verify time-sensitive context" }
+      ]
+    },
+    {
+      "id": "SUP-003",
+      "surface": "supervisor",
+      "title": "Sleep is not idle and queued progress reconnects on wake",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["agent-view#read-session-state", "remote-control#connection-and-security"],
+      "given": [{ "op": "session.background", "as": "s", "with": { "prompt": "long task" } }],
+      "when": [
+        { "op": "fault.sleep", "with": { "duration_ms": 7200000 } },
+        { "op": "supervisor.reconcile" },
+        { "op": "ui.agents_json", "as": "after_wake" }
+      ],
+      "then": [
+        { "op": "assert.ne", "actual": "$after_wake.state", "expected": "stopped-for-idle" },
+        { "op": "assert.eq", "actual": "$after_wake.sessionId", "expected": "$s.session_id" },
+        { "op": "assert.order", "actual": "$s.queued_events", "expected": "$s.emitted_events" }
+      ]
+    },
+    {
+      "id": "SUP-004",
+      "surface": "supervisor",
+      "title": "Idle reaping and memory pressure preserve durable session state",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["agent-view#the-supervisor-process", "agent-view#a-session-is-slow-to-respond-after-attaching"],
+      "given": [{ "op": "fixture.sessions", "as": "sessions", "with": { "idle": 2, "pinned_idle": 1, "working": 1 } }],
+      "when": [
+        { "op": "fixture.clock_advance", "with": { "duration_ms": 3700000 } },
+        { "op": "supervisor.reap_idle" },
+        { "op": "fault.memory_pressure" },
+        { "op": "session.attach", "target": "$sessions.idle[0]" }
+      ],
+      "then": [
+        { "op": "assert.absent", "actual": "$sessions.idle[0].pid_before_attach" },
+        { "op": "assert.present", "actual": "$sessions.working.pid" },
+        { "op": "assert.eq", "actual": "$sessions.idle[0].session_id_after_attach", "expected": "$sessions.idle[0].session_id" },
+        { "op": "assert.contains", "actual": "$sessions.idle[0].transcript_after_attach", "expected": "$sessions.idle[0].last_turn" }
+      ]
+    }
+  ]
+}

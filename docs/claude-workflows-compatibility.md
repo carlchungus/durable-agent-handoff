@@ -1,92 +1,187 @@
-# Claude workflows compatibility target
+# Whole-system Claude Code workflow compatibility
 
-`handoff` is a clean-room implementation of the observable Claude Code workflow system, with runtime-neutral execution underneath. Compatibility means preserving the user-facing contracts and lifecycle semantics documented by Anthropic; it does not mean copying proprietary source code or private storage formats.
+`handoff` targets the **entire observable Claude Code workflow system**, not only process durability. The target is a clean-room behavioral clone over runtime-neutral internals: the same user-visible states, commands, identities, limits, precedence rules, failure modes, and recovery boundaries documented by Anthropic, with explicit portable extensions where Claude stops short.
 
-The current implementation is a durable kernel, not yet the complete compatibility surface. This matrix is the acceptance contract for that work. A row is not complete until it has behavior tests, restart tests where relevant, a machine-readable interface, and a human-facing view.
+The source snapshot is **2026-08-05**. Claude Code research-preview behavior is version-sensitive. Every differential capture must record the installed Claude Code version; new oracle output never replaces an expectation without a reviewed source and fixture change.
 
-Status: **done**, **partial**, **planned**.
+The current repository is a useful durable kernel, not yet a whole-system clone. Compatibility is complete only when every surface below passes its positive, denial, restart, and human/machine-view cases against a pinned Claude oracle. The 102-case contract lives in [`docs/conformance/`](conformance/README.md).
 
-| Surface | Observable Claude behavior to preserve | Portable `handoff` contract | Status |
-| --- | --- | --- | --- |
-| Sessions | continuously saved conversations; name, list, resume exact ID, continue, branch/fork, import/export, retention | durable session record, exact adapter session ID, named branch lineage, transcript locator/export, configurable retention | partial |
-| Background agent view | dispatch full sessions; group by needs-input/working/completed; animated liveness; peek, reply, attach/detach, stop, pin, filter; exited sessions restart on reply | `agents` TUI plus `agents --json`; durable inbox; attach transport; process state separate from task state | partial |
-| Supervisor | sessions survive terminal exit, supervisor restart, updates, and sleep; stopped or wedged processes can continue from saved state | service-managed run leases, heartbeats, PID/start-token validation, adoption, exact resume, atomic exit records | partial |
-| Subagents | fresh or forked context; named definitions with model, effort, tools, skills, MCP, hooks, memory, permissions, worktree, background mode; exact-ID resume; nested spawning | portable agent profiles and spawn API; parent/child lineage; isolated transcript; immutable runtime identity; capability narrowing | partial |
-| Agent teams | lead plus peer sessions; shared task list; dependencies; claiming/assignment; direct messages; idle and shutdown protocol; optional plan approval | durable team, member, task, dependency, fenced claim, mailbox, idle, shutdown, and approval records; runtime-neutral peers | partial |
-| Dynamic workflows | JavaScript with top-level await; `agent()` and `pipeline()`; phases, loops and branching in script variables; background run; 16 concurrent/1,000 total agents; pause, stop, restart, cached ordered replay; save as command; structured args | sandboxed workflow SDK with compatible primitives and caps; append-only invocation journal; deterministic replay frontier; reusable project/user workflow resolution | partial |
-| Workflow planning | natural language or keyword asks Claude to write a workflow; optional raw-script review and per-project approval; ultracode can choose multiple workflows for one request | planner emits inspectable script/IR; human/auto/bypass launch policy; role-specific planner ladder; multiple sequential runs allowed | planned |
-| Goals | one session-scoped condition; fresh small-model evaluator after every turn; reason feeds next turn; persists active condition on resume; clear/status; turn/time bounds | evaluator hook over a session loop with condition, reason, spend, turns, bounds, and independent model ladder | planned |
-| Hooks | pre/post tool, permission, subagent, task, stop/failure, teammate idle, worktree, notification, config and session lifecycle events; commands, prompts, and agent verification may allow, block, retry, or inject context | ordered typed lifecycle bus; deterministic command hooks and model/agent hooks; policy-controlled decisions; durable hook outcomes | planned |
-| Tasks and background commands | task panel lists running/completed shell jobs and agents; inspect output, attach, stop; notification on completion or input | unified activity records for agents, workflows, hooks, and commands; durable logs and control messages | partial |
-| Worktrees | isolated parallel edits; configurable setup/copy hooks; cleanup; PR association | worktree allocator with ownership, setup/remove hooks, branch/PR identity, dirty-state and cleanup policy | partial |
-| Checkpoints | checkpoint before each user prompt; restore code and/or conversation; summarize ranges; retain recent checkpoints; explicit limitations for shell, subagent, external and linked-file edits | transcript checkpoints plus Git-native file snapshots; independent code/conversation rewind; provenance and explicit untracked-change warnings | planned |
-| Compaction and memory | automatic context compaction; summaries preserve continuity; subagent transcripts survive parent compaction; scoped memories/instructions | runtime transcript pointers, generated summaries with provenance, per-agent memory scopes, stable prompt-prefix construction | planned |
-| Scheduling | session `/loop`; durable desktop tasks; cloud routines with isolated scheduled sessions and delivery | interval jobs, cron/routines, jitter, expiration, concurrency/missed-run policy, isolated session creation and result sinks | planned |
-| Channels | authenticated external events enter a running session; source metadata and permissions remain visible | typed inbound channel adapters, deduplication, audit metadata, allowlists, durable inbox and wake-up signal | planned |
-| Permissions | modes and tool allow/deny rules; launch approval distinct from subagent tool checks; child cannot expand parent authority | capability envelope inherited by default and only narrowed by workers; explicit human grants; policy kernel owns privileged actions | partial |
-| Models and usage | per-session/subagent/stage model and effort; token/cost display; plan limits; overload fallback | per-role ordered provider/model ladders, cooldown health, budget accounting, stage overrides, visible routing evidence | partial |
-| PR workflow | background session discovers linked PR and status; `/batch` fans worktree agents into PRs; checks/review gate completion | PR records linked to sessions; bounded worktree fan-out; deterministic unchanged-head and exact-check merge gate | partial |
-| Remote operation | attach from another client while execution remains local; local permissions and filesystem stay authoritative | authenticated local control socket/API with event cursor, attach/reply/approve/stop; no implicit filesystem export | planned |
-| SDK session storage/hosting | pluggable session persistence and hosted long-running agent process patterns | storage interface, local reference backend, conformance suite, lease/fencing protocol, deployable supervisor | planned |
-| Human and agent UX | animated terminal UI plus stable JSON/stream-JSON controls; reduced-motion/screen-reader modes; notifications | Bubble Tea TUI, JSON snapshots, JSONL event follow, accessible static mode, terminal/desktop notification hooks | partial |
-| Configuration and packaging | user/project/local precedence; reusable agents, skills, hooks, workflows and plugins | explicit layered config with source provenance; project/user workflow and profile directories; plugin/skill packaging | planned |
+## What “high fidelity” means
 
-## Semantic boundaries
+We reproduce observable contracts, including inconvenient limitations. We do not copy proprietary source, depend on undocumented private files, or call a stronger `handoff` behavior “Claude-compatible” when it differs.
 
-Claude exposes four different coordination models and `handoff` must not collapse them into one gated phase graph:
+Each fixture selects one of two profiles:
 
-1. **Subagent:** a delegated worker whose result returns to one parent conversation.
-2. **Background session:** an independent resumable conversation controlled by a human.
-3. **Agent team:** peer sessions coordinated dynamically by a lead through tasks and messages.
-4. **Dynamic workflow:** a script, not a lead model, owns branching, loops, fan-out, intermediate values, and replay.
+- `claude-current` reproduces the documented Claude behavior exactly or after narrowly declared normalization.
+- `durable-extension` adds a portable capability. A deliberate divergence includes both `claude_expected` and the stronger `handoff` expectation.
 
-The event ledger, policy kernel, runtime adapters, logs, leases, and model router are shared infrastructure. Their public semantics remain distinct.
+The initial named divergences are durable fenced team claims and restore (`TEAM-003`, `TEAM-007`), cross-runtime preference ladders (`MOD-004`), and unchanged-head gated autonomous merge (`PR-004`). Other extensions add observability or persistence while retaining Claude’s baseline path. An undocumented difference is a bug.
 
-## Agent-team state
+## Complete acceptance matrix
 
-The team ledger is implemented independently of the workflow graph. A member's logical state (`working`, `idle`, `needs_input`, `stopped`) is separate from whether its current OS process is live. Tasks have dependencies and expiring, generation-fenced claims so an old worker cannot complete work after another member reclaims it. Direct and broadcast messages, idle notifications, submitted/reviewed plans, and cooperative shutdown requests are durable mailbox entries.
+“Runtime status” describes the implementation today, not the completeness of the contract. `partial` means some kernel or CLI behavior exists but the differential cases do not all pass. `planned` means the contract is defined but the runtime surface is materially absent.
 
-The machine interface is `handoff team create|status|apply|inbox`; the animated TUI has a team view for member, task, claim, plan, and mailbox state. Runtime spawning, automatic mailbox injection/wake-up, and full Agent View controls remain compatibility work; the ledger deliberately exists first so replacing a runtime session cannot destroy the logical member, task, or message.
+| Surface | Claude-current acceptance boundary | Portable extension | Cases | Runtime status |
+| --- | --- | --- | ---: | --- |
+| Sessions | continuously saved transcript; exact-ID resume; continue; rename; picker scoping; fork with a new identity; clear, compact, export, and retention | explicit lineage, transcript locator, retention and normalized runtime identity | 5 | partial |
+| Agent View | dispatch independent background sessions; needs-input/working/completed grouping; pin/filter; peek/reply; attach/detach/stop/delete; restart exited work on reply | durable inbox and separate logical/process state exposed in JSON and TUI | 5 | partial |
+| Supervisor | session execution survives terminal exit, update, sleep and supported reconnect; stale processes are not shown as live | leases, heartbeat, PID start-token validation, fencing, live adoption and exact resume | 4 | partial |
+| Subagents | fresh or forked context; named definitions; model/effort/tools/skills/MCP/hooks/memory/permissions/worktree/background; exact resume; depth, count and concurrency limits | immutable runtime identity, transcript isolation and capability narrowing | 7 | partial |
+| Teams | fixed lead plus peers; shared tasks/dependencies/claims; direct and broadcast mailbox; plan approval; idle/failure/shutdown; no nesting | typed durable mailbox, generation-fenced claims, crash restore by exact identity | 8 | partial |
+| Dynamic workflows | real JavaScript with top-level `await`, `agent()` and `pipeline()`; dynamic branches/loops; 16 concurrent and 1,000 total agents; pause/stop/restart; ordered replay; saved scopes and args | sandboxed runtime adapters over one journaled invocation model | 5 | partial |
+| Workflow planning | natural-language and human-only keyword triggers; inspectable script; launch approval; project decisions; ultracode may choose several workflows | role-specific planner ladder and inspectable IR without a mandatory phase graph | 3 | planned |
+| Goals | one session-scoped condition; independent fresh evaluator after every turn; reason feeds the next turn; resume, status, clear, time/turn bounds | runtime-neutral evaluator ladder, spend and termination evidence | 2 | planned |
+| Hooks | full lifecycle event vocabulary; command, HTTP, prompt and agent handlers; matchers; allow/block/retry/context; sync/async behavior | typed durable outcomes and independently verifiable agent hooks | 4 | planned |
+| Tasks/background | `/tasks` unifies jobs and agents; live output, inspect, attach, stop and completion/input notification | durable activity identity, logs and controls across runtime restart | 2 | partial |
+| Worktrees | default path/branch/base; resume/fork cwd; ignored-file copy; cleanup guards; create/remove hooks; isolated background edits | ownership locks, provenance and safe cleanup evidence | 6 | partial |
+| Checkpoints | prompt checkpoints; newest 100; code/conversation rewind independently; targeted summary; explicit Bash/external/subagent/link limitations | Git-native snapshots with untracked-change provenance | 4 | planned |
+| Compaction/memory | auto/manual compaction; survival/reload matrix; raw transcript retention; scoped project/user/local/agent memory | summary provenance, durable pointers and stable prompt-prefix construction | 4 | planned |
+| Schedules/routines | session `/loop`, dynamic cadence, rounding/jitter/expiry/no catch-up; desktop new-session tasks and skip history; autonomous fresh-clone cloud routines | portable cron/interval/event schedules with explicit missed-run and delivery policy | 6 | planned |
+| Channels | ordered grouped inbound notifications; source/meta rules; no ack; two-way reply tools; plugin/org/session/sender gates; first-valid permission relay | authenticated adapters with durable inbox, dedupe and wake-up evidence | 4 | planned |
+| Permissions | deny-before-ask-before-allow across scopes; mode-specific baselines; protected paths; hooks; workspace trust; child narrowing; additional directories do not load config | one policy kernel owns privileged actions for every runtime | 5 | partial |
+| Models/usage | aliases, allowlists, per-role model/effort; turn-only three-entry fallback for specific server errors; visible token/cost/plan data | per-job cross-runtime ladders, cooldown health, spend and fallback evidence | 5 | partial |
+| PR workflow | linked PR status; `/batch` creates 5–30 worktree PRs; multi-agent verified/deduplicated review; neutral check result | unchanged-head and specifically named check/review/authorization merge gate | 4 | partial |
+| Remote Control | local execution/filesystem/permissions remain authoritative; outbound TLS sync; reconnect/queue after sleep or short network loss; documented timeout and command limits | authenticated local API/socket with event cursor and no implicit filesystem export | 2 | planned |
+| Storage/hosting | opaque ordered session store; optional methods/subkeys; mirror retry/error semantics; ephemeral, long-running, hybrid and multi-agent placement; tenant isolation | leases, reference backend, resource state, deployable supervisor and conformance reports | 5 | planned |
+| Human and agent UX | animated, responsive terminal view; session detail/actions; fullscreen behavior; linear screen-reader mode, numbered menus and attention alerts | same ledger powers TUI, JSON snapshot and reconnectable JSONL stream | 5 | partial |
+| Config/packaging | managed > CLI > local > project > user; managed drop-in merge rules; reload/provenance; alternate config roots; nearest definitions; live skills; plugin namespaces/cache/components | source-labelled portable profiles, workflows, skills and plugin bundles | 7 | planned |
 
-## Recovery contract
+## Semantic architecture
 
-Each attempt records, before useful work proceeds:
+The implementation shares infrastructure without flattening Claude’s different coordination models.
 
-- workflow, node, parent, team and task identity;
-- runtime, model, effort and exact runtime session ID as soon as emitted;
-- PID plus process start token, supervisor lease owner and fencing generation;
-- worktree, argv digest, capability envelope and output paths;
-- heartbeat, last durable stream offset, result and exit status.
+| Observable model | Who owns control flow | Required identity/result contract |
+| --- | --- | --- |
+| Subagent | one parent model | delegated result returns to the parent; independent transcript and exact resume identity |
+| Background session | human through Agent View | independent conversation, durable queued reply, attach/detach and logical/process state |
+| Agent team | lead and peer models | shared dynamic task/mailbox protocol; peers do not collapse into child return values |
+| Dynamic workflow | JavaScript program | script variables own loops, branches and intermediate values; `agent()` calls replay in start order |
+| Goal | evaluator-controlled session loop | one condition checked after every completed turn; evaluator reason becomes next-turn context |
+| Scheduled work | clock or external trigger | fire policy creates a turn or a fresh session according to the selected scheduling product |
+| Channel | authenticated external source | ordered event injection into a running session with visible source and permission provenance |
 
-On startup the supervisor reconciles every `running` attempt:
+Shared infrastructure is intentionally smaller than the product surface:
 
-1. Matching live process and fencing token: adopt and continue tailing.
-2. Dead process with an exact resumable session ID: start a new process that resumes only that ID.
-3. Dead process without a session ID: retry only when the node is declared restart-safe.
-4. Ambiguous identity or non-idempotent work: move to `needs_input` with the evidence required to decide.
+1. **Identity and event ledger:** sessions, attempts, processes, agents, teams, tasks, workflows, schedules, worktrees, PRs and messages have stable typed identities and ordered events.
+2. **Supervisor:** leases, heartbeats, start tokens, fencing, reconciliation, inbox wake-up and exact runtime resume.
+3. **Runtime adapters:** Claude Code, Codex, Pi/Oh My Pi and future runtimes implement spawn/resume/stream/stop/capability/model/usage contracts without leaking their command lines into workflow semantics.
+4. **Coordination engines:** subagent return, background session control, team mailbox, JS workflow replay, goals and schedules remain distinct state machines over the ledger.
+5. **Policy and routing:** permissions, launch approvals, model allowlists/ladders, provider cooldowns and budgets are evaluated before adapters act.
+6. **Isolation and delivery:** worktrees, checkpoints, memory, channel adapters, remote transport, storage mirrors and hosting leases preserve ownership and provenance.
+7. **Views:** the animated TUI, accessible static mode, JSON snapshot and cursor-based JSONL follow derive from the same reducers.
 
-Provider exhaustion is routing, not a failed task attempt. Machine sleep is not idle time. A PID alone is never proof of identity.
+## Recovery and identity contract
 
-## Dynamic workflow replay
+Before useful work starts, every attempt durably records workflow/node/parent/team/task identity, runtime/model/effort, exact runtime session ID when emitted, PID plus process start token, lease owner and generation, worktree, capability envelope, argv digest, output locations and last stream cursor.
 
-The workflow runtime journals every `agent()` invocation in script start order with an input digest and durable result. On resume, completed results are replayed only through the first unfinished invocation; that invocation and every later invocation execute again. This matches Claude's documented ordered replay frontier and prevents a script from observing a completion sequence that could not have occurred in the original run.
+At supervisor start:
 
-The orchestration script has no direct shell or filesystem access. It coordinates agents; those agents operate under capability policy. Runs support pause, resume, per-agent restart, whole-run stop, progress inspection, token accounting, and saved project/user commands.
+1. A matching live process and current fencing token is adopted; it is not spawned twice.
+2. A dead process with an exact resumable runtime session ID is replaced by a process resuming only that ID.
+3. A dead process without a resume ID is retried only when the operation is declared restart-safe.
+4. Ambiguous identity, stale fencing, dirty worktree ownership or non-idempotent work transitions to `needs_input` with evidence.
+5. Sleep advances wall time but never fabricates worker idleness or lease expiry. Remote and runtime updates are replayed from durable cursors.
 
-## Sources
+Claude-current cases retain Claude’s documented restore limitations. The durable profile strengthens recovery where it can be done without changing the baseline interaction.
 
-- [Run agents in parallel](https://code.claude.com/docs/en/agents)
-- [Agent view](https://code.claude.com/docs/en/agent-view)
-- [Agent teams](https://code.claude.com/docs/en/agent-teams)
-- [Subagents](https://code.claude.com/docs/en/sub-agents)
-- [Dynamic workflows](https://code.claude.com/docs/en/workflows)
-- [Goals](https://code.claude.com/docs/en/goal)
-- [Hooks](https://code.claude.com/docs/en/hooks)
-- [Scheduled tasks](https://code.claude.com/docs/en/scheduled-tasks)
-- [Routines](https://code.claude.com/docs/en/routines)
-- [Channels](https://code.claude.com/docs/en/channels)
-- [Sessions](https://code.claude.com/docs/en/sessions)
-- [Checkpointing](https://code.claude.com/docs/en/checkpointing)
-- [Remote Control](https://code.claude.com/docs/en/remote-control)
-- [Agent SDK session storage](https://code.claude.com/docs/en/agent-sdk/session-storage)
-- [Hosting the Agent SDK](https://code.claude.com/docs/en/agent-sdk/hosting)
+## Dynamic workflows, planning, and self-mutation
+
+This is not a checklist engine with hard-coded discovery, plan, execute and verify gates. The high-fidelity workflow surface runs sandboxed JavaScript with top-level `await`; the script may branch, loop, fan out, launch different agent roles, inspect results, revise its approach, or call several workflows sequentially. Only the orchestration API is available to the script; filesystem and shell work goes through policy-bounded agents.
+
+Planning is itself agent work. A planner can emit or revise a workflow script from current evidence. Independent verifier agents can decide semantic conditions that commands cannot establish. A workflow may self-mutate its future control flow, but it cannot rewrite completed ledger history, elevate permissions, change its oracle profile, erase costs, or weaken merge/recovery gates.
+
+On pause or crash, completed `agent()` results replay only through the ordered prefix before the first unfinished invocation. That invocation and all later invocations run again. Stopped or unrecoverable agents retain pipeline shape with a `null` result, matching the documented workflow contract.
+
+## Model ladders and graceful exhaustion
+
+Claude-current fallback stays exact: at most three de-duplicated models, allowlist-filtered, switching for overload/unavailability/other non-retryable server errors, never for authentication, billing, rate limit, request size or transport errors, and retrying the primary on the next turn.
+
+The portable router adds per-role ordered runtime/model ladders. A user may configure, for example, planner = Claude Opus → Codex GPT-5.6 Sol → Pi Kimi K3. Each route decision records attempted entry, resolved provider/model, failure class, cooldown/usage window, cost and why the next entry was eligible. Authorization, malformed requests, failing tests and tool denial are not usage exhaustion and never silently trigger a weaker model.
+
+## Pull requests and autonomous merge
+
+Creating a branch, commit, push or PR is normal agent work only when the task authorizes it. Direct default-branch mutation and force push are outside the background-worker contract. The portable merge extension additionally requires:
+
+- an explicit repository/task merge policy;
+- a recorded PR head SHA;
+- only the named required checks, with their raw conclusions;
+- the configured human or independent-agent review decision;
+- a final unchanged-head comparison immediately before merge.
+
+Any head change invalidates prior gates. Claude Code’s Code Review remains advisory/neutral in the `claude-current` profile; the stricter merge gate is not misrepresented as native Claude behavior.
+
+Runtime adapters never receive GitHub merge authority. They may propose work and report evidence; the policy-owned GitHub control plane performs the unchanged-head gate and merge with argument-vector execution.
+
+## Configuration and distribution
+
+Configuration resolution carries source provenance and preserves Claude’s scope order. Permission rules merge with deny precedence rather than scalar override. Project-provided capability grants remain subject to workspace trust. Worktrees share repository-local settings where Claude does, while alternate config directories isolate user data.
+
+Agents, workflows and skills resolve from user and nearest project scopes according to their documented rules. Plugins package namespaced skills, agents, hooks, MCP servers and workflows through a cache without rewriting standalone user configuration. Managed restrictions can prohibit sideloading or standalone customization and must fail closed where the official setting requires it.
+
+## Convergence loop
+
+Implementation proceeds as a dynamic evidence loop, not mandatory product phases:
+
+1. Select the highest-value failing capability slice and its dependency cases.
+2. Capture the pinned Claude oracle, including failures, UI frames, process tree and files allowed by the fixture.
+3. Have the implementing agent change the smallest shared primitive or surface adapter that explains the diff.
+4. Run the candidate cases plus affected restart, denial and view cases.
+5. Use deterministic assertions where semantics are mechanical and independent verifier agents where correctness is semantic.
+6. Keep, revise or replace the approach based on evidence; record any plan mutation as an event.
+7. Never relax an expectation as an implementation shortcut. Oracle changes require source review and an explicit compatibility decision.
+
+Slices can run in parallel when they do not share a mutable seam. Likely early slices are event/identity normalization, exact session resume, Agent View controls, JS workflow execution/replay, runtime ladders, and machine/human view parity, because many later surfaces depend on them. This is prioritization, not a gate that prevents a planner from adapting.
+
+## Differential suite and release gate
+
+[`docs/conformance/README.md`](conformance/README.md) defines the runner and observation bundle. [`manifest.json`](conformance/manifest.json) maps every source and required surface. The seven fixture suites define 102 cases.
+
+For a pinned Claude release, a release candidate must:
+
+- produce raw and normalized oracle/candidate bundles for every applicable `claude-current` case;
+- pass every exact/normalized comparison and every independent `then` assertion;
+- pass all fault injections without duplicate execution or stale ownership;
+- emit a reviewed report for every deliberate divergence;
+- show the same logical state in TUI, JSON and JSONL views;
+- pass race tests, static analysis, storage adapter conformance and disposable Git/PR integration tests;
+- record unsupported platform/provider features explicitly instead of silently skipping them.
+
+Syntax and catalog checks:
+
+```sh
+jq empty docs/conformance/*.json
+
+set -- \
+  docs/conformance/sessions-agent-view.json \
+  docs/conformance/coordination.json \
+  docs/conformance/workflows-automation.json \
+  docs/conformance/isolation-context.json \
+  docs/conformance/scheduling-channels-policy.json \
+  docs/conformance/models-pr-remote-hosting.json \
+  docs/conformance/ux-config-packaging.json
+
+jq -s -e '
+  .[0:-1] as $suites
+  | .[-1] as $manifest
+  | ($suites | map(.cases) | add) as $cases
+  | ($cases | length) == 102
+  and ($cases | map(.id) | length) == ($cases | map(.id) | unique | length)
+  and ($cases | map(.surface) | unique | sort) == ($manifest.required_surfaces | sort)
+  and all($cases[].source_refs[]; (split("#")[0]) as $key | $manifest.sources[$key] != null)
+' "$@" docs/conformance/manifest.json
+```
+
+The fixture schema is [`case.schema.json`](conformance/case.schema.json). A production runner must validate each suite against it, verify every `source_refs` prefix exists in the manifest, and preserve case IDs in generated test names and reports.
+
+## Official source index
+
+Anthropic’s [official documentation index](https://code.claude.com/docs/llms.txt) is the discovery root. The snapshot uses only official primary documentation:
+
+- Coordination: [agents](https://code.claude.com/docs/en/agents), [Agent View](https://code.claude.com/docs/en/agent-view), [sessions](https://code.claude.com/docs/en/sessions), [subagents](https://code.claude.com/docs/en/sub-agents), and [agent teams](https://code.claude.com/docs/en/agent-teams).
+- Orchestration: [dynamic workflows](https://code.claude.com/docs/en/workflows), [goals](https://code.claude.com/docs/en/goal), [hook reference](https://code.claude.com/docs/en/hooks), [hook guide](https://code.claude.com/docs/en/hooks-guide), and [commands/tasks](https://code.claude.com/docs/en/commands).
+- Isolation and context: [worktrees](https://code.claude.com/docs/en/worktrees), [checkpointing](https://code.claude.com/docs/en/checkpointing), [context windows](https://code.claude.com/docs/en/context-window), and [memory](https://code.claude.com/docs/en/memory).
+- Automation and ingress: [session schedules](https://code.claude.com/docs/en/scheduled-tasks), [Desktop scheduled tasks](https://code.claude.com/docs/en/desktop-scheduled-tasks), [cloud routines](https://code.claude.com/docs/en/routines), [channels](https://code.claude.com/docs/en/channels), and the [channel protocol](https://code.claude.com/docs/en/channels-reference).
+- Policy and routing: [permissions](https://code.claude.com/docs/en/permissions), [permission modes](https://code.claude.com/docs/en/permission-modes), [model configuration](https://code.claude.com/docs/en/model-config), [costs and usage](https://code.claude.com/docs/en/costs), and [status line data](https://code.claude.com/docs/en/statusline).
+- Delivery: [Code Review](https://code.claude.com/docs/en/code-review), [GitHub Actions](https://code.claude.com/docs/en/github-actions), and [Remote Control](https://code.claude.com/docs/en/remote-control).
+- SDK durability and deployment: [sessions](https://code.claude.com/docs/en/agent-sdk/sessions), [session storage](https://code.claude.com/docs/en/agent-sdk/session-storage), [hosting](https://code.claude.com/docs/en/agent-sdk/hosting), [streaming output](https://code.claude.com/docs/en/agent-sdk/streaming-output), and [user input](https://code.claude.com/docs/en/agent-sdk/user-input).
+- UX and packaging: [settings](https://code.claude.com/docs/en/settings), [`.claude` directory](https://code.claude.com/docs/en/claude-directory), [skills](https://code.claude.com/docs/en/skills), [plugins](https://code.claude.com/docs/en/plugins), [plugin reference](https://code.claude.com/docs/en/plugins-reference), [accessibility](https://code.claude.com/docs/en/accessibility), and [fullscreen rendering](https://code.claude.com/docs/en/fullscreen).

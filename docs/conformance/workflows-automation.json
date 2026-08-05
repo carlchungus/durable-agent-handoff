@@ -1,0 +1,317 @@
+{
+  "$schema": "./case.schema.json",
+  "suite": "dynamic-workflows-planning-goals-hooks-tasks",
+  "source_snapshot": "2026-08-05",
+  "cases": [
+    {
+      "id": "WF-001",
+      "surface": "dynamic-workflows",
+      "title": "JavaScript owns branches, loops, fan-out, and intermediate values",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["workflows#what-the-saved-script-looks-like", "workflows#how-a-workflow-runs"],
+      "given": [{ "op": "fixture.workflow_script", "as": "script", "with": { "javascript": "top-level-await", "calls": ["agent", "pipeline"], "branch_on_result": true, "loop_until": "stable" } }],
+      "when": [{ "op": "workflow.run", "as": "run", "with": { "script": "$script", "args": { "items": ["a", "b", "c"] } } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$run.result.branch", "expected": "$run.agent_results.decision" },
+        { "op": "assert.count", "actual": "$run.pipeline.results", "expected": 3 },
+        { "op": "assert.order", "actual": "$run.phases", "expected": ["discover", "fanout", "verify", "synthesize"] },
+        { "op": "assert.absent", "actual": "$run.parent_transcript", "expected": "$run.intermediate_results" },
+        { "op": "assert.eq", "actual": "$run.parent_final", "expected": "$run.result" }
+      ],
+      "normalize": ["run_id", "agent_id", "timestamps"]
+    },
+    {
+      "id": "WF-002",
+      "surface": "dynamic-workflows",
+      "title": "Ordered replay stops caching at the first unfinished invocation",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["workflows#resume-after-a-pause"],
+      "given": [{ "op": "fixture.workflow_script", "as": "script", "with": { "start_order": ["A", "B", "C", "D"], "completion_order": ["A", "C", "D"] } }],
+      "when": [
+        { "op": "workflow.run", "as": "run", "with": { "script": "$script" } },
+        { "op": "workflow.pause", "target": "$run", "with": { "while_running": "B" } },
+        { "op": "workflow.resume", "as": "resumed", "target": "$run" }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$resumed.invocations[A].mode", "expected": "cached" },
+        { "op": "assert.eq", "actual": "$resumed.invocations[B].mode", "expected": "live" },
+        { "op": "assert.eq", "actual": "$resumed.invocations[C].mode", "expected": "live" },
+        { "op": "assert.eq", "actual": "$resumed.invocations[D].mode", "expected": "live" }
+      ],
+      "faults": [
+        {
+          "at": "after:C-completes-before-B",
+          "inject": { "op": "fault.kill", "target": "$run.process" },
+          "recover": [{ "op": "workflow.resume", "as": "crash_resume", "target": "$run" }],
+          "then": [{ "op": "assert.eq", "actual": "$crash_resume.live_invocations", "expected": ["B", "C", "D"] }]
+        }
+      ]
+    },
+    {
+      "id": "WF-003",
+      "surface": "dynamic-workflows",
+      "title": "Workflow caps and sandbox are enforced outside the script",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["workflows#behavior-and-limits"],
+      "given": [{ "op": "fixture.workflow_script", "as": "script", "with": { "concurrent_agents": 17, "total_agents": 1001, "direct_fs_attempt": true, "direct_shell_attempt": true } }],
+      "when": [{ "op": "workflow.run", "as": "run", "with": { "script": "$script" } }],
+      "then": [
+        { "op": "assert.refused", "actual": "$run.concurrent_overflow", "expected": "max-16" },
+        { "op": "assert.refused", "actual": "$run.total_overflow", "expected": "max-1000" },
+        { "op": "assert.refused", "actual": "$run.direct_fs", "expected": "workflow-sandbox" },
+        { "op": "assert.refused", "actual": "$run.direct_shell", "expected": "workflow-sandbox" }
+      ]
+    },
+    {
+      "id": "WF-004",
+      "surface": "dynamic-workflows",
+      "title": "Stopped or unrecoverable agents resolve null without collapsing pipeline shape",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["workflows#what-the-saved-script-looks-like", "workflows#watch-the-run"],
+      "given": [{ "op": "fixture.workflow_script", "as": "script", "with": { "items": ["ok", "stop", "api-fail"] } }],
+      "when": [
+        { "op": "workflow.run", "as": "run", "with": { "script": "$script" } },
+        { "op": "workflow.agent_stop", "target": "$run.agents[stop]" },
+        { "op": "fixture.provider_fail", "target": "$run.agents[api-fail]", "with": { "kind": "unrecoverable" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$run.pipeline.results", "expected": ["ok-result", null, null] },
+        { "op": "assert.count", "actual": "$run.pipeline.results", "expected": 3 },
+        { "op": "assert.state", "actual": "$run", "expected": "completed" }
+      ]
+    },
+    {
+      "id": "WF-005",
+      "surface": "dynamic-workflows",
+      "title": "Saved workflow resolution, structured args, and plugin namespace are deterministic",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["workflows#save-the-workflow-for-reuse", "workflows#distribute-a-workflow-in-a-plugin", "workflows#pass-input-to-a-saved-workflow"],
+      "given": [{ "op": "fixture.config", "as": "scopes", "with": { "workflow_name": "audit", "definitions": ["user", "project-root", "project-nearest", "plugin:acme"] } }],
+      "when": [
+        { "op": "workflow.resolve", "as": "local", "with": { "name": "audit", "cwd": "$scopes.nested_cwd" } },
+        { "op": "workflow.invoke", "as": "invoked", "with": { "workflow": "$local", "args": { "issues": [1, 2] } } },
+        { "op": "workflow.resolve", "as": "plugin", "with": { "name": "acme:audit" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$local.source", "expected": "project-nearest" },
+        { "op": "assert.eq", "actual": "$invoked.args.issues", "expected": [1, 2] },
+        { "op": "assert.eq", "actual": "$plugin.source", "expected": "plugin:acme" },
+        { "op": "assert.refused", "actual": "$local.save_through_symlink", "expected": "symlink-target" }
+      ]
+    },
+    {
+      "id": "PLAN-001",
+      "surface": "workflow-planning",
+      "title": "Human workflow request produces inspectable script before launch",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["workflows#ask-for-a-workflow-in-your-prompt", "workflows#approve-the-plan-before-it-runs"],
+      "given": [{ "op": "session.start", "as": "s", "with": { "permission_mode": "default" } }],
+      "when": [
+        { "op": "workflow.plan", "as": "plan", "with": { "session": "$s", "origin": "human", "prompt": "use a workflow to audit routes" } },
+        { "op": "workflow.view_script", "as": "raw", "target": "$plan" },
+        { "op": "workflow.approve", "target": "$plan", "with": { "scope": "once" } }
+      ],
+      "then": [
+        { "op": "assert.present", "actual": "$plan.phases" },
+        { "op": "assert.contains", "actual": "$raw.javascript", "expected": "agent(" },
+        { "op": "assert.order", "actual": "$plan.events", "expected": ["planned", "approval_requested", "approved", "started"] }
+      ]
+    },
+    {
+      "id": "PLAN-002",
+      "surface": "workflow-planning",
+      "title": "Keyword opt-in is limited to authenticated human-origin prompts",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["workflows#where-the-keyword-works"],
+      "given": [{ "op": "fixture.prompts", "as": "prompts", "with": { "text": "ultracode audit routes", "origins": ["human", "print", "sdk-unstamped", "scheduled", "channel"] } }],
+      "when": [{ "op": "workflow.detect_trigger", "as": "detected", "with": { "prompts": "$prompts" } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$detected.human", "expected": true },
+        { "op": "assert.eq", "actual": "$detected.print", "expected": false },
+        { "op": "assert.eq", "actual": "$detected.sdk_unstamped", "expected": false },
+        { "op": "assert.eq", "actual": "$detected.scheduled", "expected": false },
+        { "op": "assert.eq", "actual": "$detected.channel", "expected": false }
+      ]
+    },
+    {
+      "id": "PLAN-003",
+      "surface": "workflow-planning",
+      "title": "Ultracode can choose several workflows dynamically for one request",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["workflows#let-claude-decide-with-ultracode", "workflows#set-a-size-guideline"],
+      "given": [{ "op": "session.start", "as": "s", "with": { "effort": "ultracode", "workflow_size_guideline": "small" } }],
+      "when": [{ "op": "session.prompt", "as": "turn", "with": { "session": "$s", "text": "understand, implement, and independently verify this migration" } }],
+      "then": [
+        { "op": "assert.count", "actual": "$turn.workflow_runs", "expected": { "minimum": 1 } },
+        { "op": "assert.order", "actual": "$turn.workflow_roles", "expected": ["understand", "implement", "verify"] },
+        { "op": "assert.eq", "actual": "$s.reported_effort", "expected": "xhigh" },
+        { "op": "assert.eq", "actual": "$turn.size_guideline.kind", "expected": "advisory" }
+      ],
+      "notes": ["The exact number of workflows is model-selected; the invariant is that the control plane permits sequential dynamic runs rather than forcing one static phase graph."]
+    },
+    {
+      "id": "GOAL-001",
+      "surface": "goals",
+      "title": "Fresh evaluator starts another turn with its reason until the condition holds",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["goal#how-evaluation-works", "goal#set-a-goal"],
+      "given": [{ "op": "fixture.provider", "as": "evaluator", "with": { "answers": [{ "met": false, "reason": "test still fails" }, { "met": true, "reason": "test passes" }], "tools": [] } }],
+      "when": [{ "op": "goal.set", "as": "goal", "with": { "condition": "test passes", "evaluator": "$evaluator" } }],
+      "then": [
+        { "op": "assert.count", "actual": "$goal.worker_turns", "expected": 2 },
+        { "op": "assert.count", "actual": "$goal.evaluator_sessions", "expected": 2 },
+        { "op": "assert.contains", "actual": "$goal.worker_turns[1].context", "expected": "test still fails" },
+        { "op": "assert.eq", "actual": "$goal.state", "expected": "achieved" },
+        { "op": "assert.absent", "actual": "$goal.evaluator.tool_calls" }
+      ]
+    },
+    {
+      "id": "GOAL-002",
+      "surface": "goals",
+      "title": "Goal status, clear, replace, and resume reset rules are observable",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["goal#check-status", "goal#clear-a-goal", "goal#resume-with-an-active-goal"],
+      "given": [{ "op": "session.start", "as": "s" }],
+      "when": [
+        { "op": "goal.set", "as": "g1", "with": { "session": "$s", "condition": "first" } },
+        { "op": "goal.set", "as": "g2", "with": { "session": "$s", "condition": "second" } },
+        { "op": "goal.status", "as": "status", "target": "$g2" },
+        { "op": "session.exit", "target": "$s" },
+        { "op": "session.resume", "as": "resumed", "with": { "session_id": "$s.session_id" } },
+        { "op": "goal.clear", "as": "cleared", "target": "$resumed.goal" }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$status.condition", "expected": "second" },
+        { "op": "assert.present", "actual": "$status.turns" },
+        { "op": "assert.present", "actual": "$status.tokens" },
+        { "op": "assert.eq", "actual": "$resumed.goal.turns", "expected": 0 },
+        { "op": "assert.eq", "actual": "$cleared.state", "expected": "cleared" }
+      ]
+    },
+    {
+      "id": "HOOK-001",
+      "surface": "hooks",
+      "title": "Lifecycle bus preserves documented event ordering",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["hooks#hook-lifecycle"],
+      "given": [{ "op": "fixture.hook_recorder", "as": "recorder", "with": { "events": "all" } }],
+      "when": [{ "op": "session.scripted_turn", "as": "turn", "with": { "hooks": "$recorder", "prompt_expansion": true, "parallel_tools": 2, "subagent": true, "task": true, "compact": true } }],
+      "then": [
+        { "op": "assert.order", "actual": "$recorder.events", "expected": ["SessionStart", "UserPromptSubmit", "UserPromptExpansion", "PreToolUse", "PostToolUse", "PostToolBatch", "SubagentStart", "SubagentStop", "TaskCreated", "TaskCompleted", "Stop", "PreCompact", "PostCompact", "SessionEnd"] },
+        { "op": "assert.eq", "actual": "$recorder.events[each].session_id", "expected": "$turn.session_id" },
+        { "op": "assert.eq", "actual": "$recorder.events[each].transcript_path", "expected": "$turn.transcript_path" }
+      ]
+    },
+    {
+      "id": "HOOK-002",
+      "surface": "hooks",
+      "title": "Blocking exit semantics are event-specific and fail closed only where documented",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["hooks#exit-code-2-behavior-per-event"],
+      "given": [{ "op": "fixture.hook", "as": "exit2", "with": { "exit_code": 2, "stderr": "blocked" } }],
+      "when": [{ "op": "hook.exercise_matrix", "as": "matrix", "with": { "handler": "$exit2", "events": ["PreToolUse", "PermissionRequest", "UserPromptSubmit", "Stop", "SubagentStop", "TaskCreated", "TaskCompleted", "TeammateIdle", "PostToolUse", "StopFailure", "SessionStart", "PreCompact", "WorktreeCreate", "WorktreeRemove"] } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$matrix.blocked", "expected": ["PreToolUse", "PermissionRequest", "UserPromptSubmit", "Stop", "SubagentStop", "TaskCreated", "TaskCompleted", "TeammateIdle", "PreCompact", "WorktreeCreate"] },
+        { "op": "assert.eq", "actual": "$matrix.non_blocking", "expected": ["PostToolUse", "SessionStart", "WorktreeRemove"] },
+        { "op": "assert.eq", "actual": "$matrix.ignored", "expected": ["StopFailure"] }
+      ]
+    },
+    {
+      "id": "HOOK-003",
+      "surface": "hooks",
+      "title": "Structured hook decisions and multiple additional-context values compose",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["hooks#json-output", "hooks#add-context-for-claude", "hooks-guide#combine-results-from-multiple-hooks"],
+      "given": [{ "op": "fixture.hooks", "as": "hooks", "with": { "outputs": [{ "permissionDecision": "deny", "reason": "protected" }, { "additionalContext": "generated file" }, { "additionalContext": "run generator" }] } }],
+      "when": [{ "op": "hook.fire", "as": "result", "with": { "event": "PreToolUse", "handlers": "$hooks", "tool": "Edit" } }],
+      "then": [
+        { "op": "assert.refused", "actual": "$result.tool_call", "expected": "protected" },
+        { "op": "assert.contains", "actual": "$result.model_context", "expected": "generated file" },
+        { "op": "assert.contains", "actual": "$result.model_context", "expected": "run generator" },
+        { "op": "assert.count", "actual": "$result.transcript.tool_calls[Edit]", "expected": 0 }
+      ]
+    },
+    {
+      "id": "HOOK-004",
+      "surface": "hooks",
+      "title": "Command, HTTP, prompt, agent, MCP, and async handlers retain distinct failure semantics",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["hooks#hook-handler-fields", "hooks#prompt-based-hooks", "hooks#agent-based-hooks", "hooks#run-hooks-in-the-background"],
+      "given": [{ "op": "fixture.hook_handlers", "as": "handlers", "with": { "types": ["command", "http", "prompt", "agent", "mcp", "async-command"] } }],
+      "when": [{ "op": "hook.exercise_handlers", "as": "results", "with": { "handlers": "$handlers", "event": "PostToolUse" } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$results.command.input_transport", "expected": "stdin-json" },
+        { "op": "assert.eq", "actual": "$results.http.input_transport", "expected": "post-json" },
+        { "op": "assert.present", "actual": "$results.prompt.model_verdict" },
+        { "op": "assert.present", "actual": "$results.agent.tool_trace" },
+        { "op": "assert.present", "actual": "$results.mcp.result" },
+        { "op": "assert.order", "actual": "$results.async_command.delivery", "expected": ["turn-completes", "result-arrives-next-turn"] }
+      ]
+    },
+    {
+      "id": "TASK-001",
+      "surface": "tasks",
+      "title": "Background command has durable ID, live output, attach, stop, and cleanup",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["interactive-mode#background-bash-commands", "agent-view#from-agent-view"],
+      "given": [{ "op": "fixture.command", "as": "command", "with": { "outputs": ["one", "two"], "waits": true } }],
+      "when": [
+        { "op": "task.background", "as": "task", "with": { "command": "$command" } },
+        { "op": "task.inspect", "as": "inspect", "target": "$task" },
+        { "op": "task.attach", "as": "attached", "target": "$task" },
+        { "op": "task.detach", "target": "$attached" },
+        { "op": "task.stop", "target": "$task" }
+      ],
+      "then": [
+        { "op": "assert.present", "actual": "$task.id" },
+        { "op": "assert.contains", "actual": "$inspect.output", "expected": "one" },
+        { "op": "assert.eq", "actual": "$task.state", "expected": "stopped" },
+        { "op": "assert.present", "actual": "$task.output_path" }
+      ],
+      "faults": [
+        {
+          "at": "after:task.background",
+          "inject": { "op": "fault.kill", "target": "$supervisor.process" },
+          "recover": [{ "op": "supervisor.start" }, { "op": "task.inspect", "as": "recovered", "target": "$task" }],
+          "then": [{ "op": "assert.contains", "actual": "$recovered.output", "expected": "one" }]
+        }
+      ]
+    },
+    {
+      "id": "TASK-002",
+      "surface": "tasks",
+      "title": "Task checklist is separate from background activity and survives compaction",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["interactive-mode#task-list", "agents#check-on-running-work"],
+      "given": [{ "op": "session.start", "as": "s" }],
+      "when": [
+        { "op": "task.checklist_create", "as": "todo", "with": { "session": "$s", "items": ["inspect", "fix"] } },
+        { "op": "task.background", "as": "shell", "with": { "session": "$s", "command": "wait" } },
+        { "op": "session.compact", "target": "$s" },
+        { "op": "ui.task_list", "as": "checklist", "target": "$s" },
+        { "op": "ui.background_tasks", "as": "activity", "target": "$s" }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$checklist.items", "expected": ["inspect", "fix"] },
+        { "op": "assert.absent", "actual": "$checklist.items", "expected": "$shell.id" },
+        { "op": "assert.contains", "actual": "$activity.items", "expected": "$shell.id" }
+      ]
+    }
+  ]
+}

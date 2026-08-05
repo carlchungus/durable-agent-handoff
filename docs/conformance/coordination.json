@@ -1,0 +1,323 @@
+{
+  "$schema": "./case.schema.json",
+  "suite": "subagents-and-teams",
+  "source_snapshot": "2026-08-05",
+  "cases": [
+    {
+      "id": "SUB-001",
+      "surface": "subagents",
+      "title": "Fresh subagent context is isolated while a fork inherits the parent",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["sub-agents#what-loads-at-startup", "sub-agents#fork-the-current-conversation"],
+      "given": [{ "op": "session.start", "as": "parent", "with": { "prompt": "private conversation marker ALPHA", "read_file": "large.log" } }],
+      "when": [
+        { "op": "agent.spawn", "as": "fresh", "with": { "parent": "$parent", "type": "custom", "prompt": "report visible markers" } },
+        { "op": "agent.fork", "as": "fork", "with": { "parent": "$parent", "prompt": "report visible markers" } }
+      ],
+      "then": [
+        { "op": "assert.absent", "actual": "$fresh.initial_context", "expected": "ALPHA" },
+        { "op": "assert.contains", "actual": "$fork.initial_context", "expected": "ALPHA" },
+        { "op": "assert.ne", "actual": "$fresh.transcript_path", "expected": "$parent.transcript_path" },
+        { "op": "assert.ne", "actual": "$fork.transcript_path", "expected": "$parent.transcript_path" }
+      ],
+      "normalize": ["agent_id", "absolute_paths"]
+    },
+    {
+      "id": "SUB-002",
+      "surface": "subagents",
+      "title": "Profile precedence and capability narrowing resolve deterministically",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["sub-agents#choose-the-subagent-scope", "sub-agents#supported-frontmatter-fields", "permissions#permission-system"],
+      "given": [{ "op": "fixture.config", "as": "defs", "with": { "same_name_at": ["plugin", "user", "project", "cli", "managed"], "parent_tools": ["Read", "Edit", "Bash"], "managed_tools": ["Read"] } }],
+      "when": [{ "op": "agent.resolve_profile", "as": "resolved", "with": { "name": "reviewer", "config": "$defs" } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$resolved.source", "expected": "managed" },
+        { "op": "assert.eq", "actual": "$resolved.tools", "expected": ["Read"] },
+        { "op": "assert.absent", "actual": "$resolved.tools", "expected": "Edit" },
+        { "op": "assert.present", "actual": "$resolved.provenance" }
+      ]
+    },
+    {
+      "id": "SUB-003",
+      "surface": "subagents",
+      "title": "Completed subagent resumes by immutable identity with full history",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["sub-agents#resume-subagents"],
+      "given": [{ "op": "session.start", "as": "parent" }],
+      "when": [
+        { "op": "agent.spawn", "as": "agent", "with": { "parent": "$parent", "name": "reviewer", "prompt": "remember beta" } },
+        { "op": "agent.wait", "target": "$agent", "with": { "state": "completed" } },
+        { "op": "agent.message", "as": "resume", "with": { "to_id": "$agent.agent_id", "text": "what word?" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$resume.agent_id", "expected": "$agent.agent_id" },
+        { "op": "assert.contains", "actual": "$resume.answer", "expected": "beta" },
+        { "op": "assert.eq", "actual": "$resume.state_during_turn", "expected": "running" }
+      ],
+      "faults": [
+        {
+          "at": "after:agent.wait",
+          "inject": { "op": "fault.kill", "target": "$parent.process" },
+          "recover": [{ "op": "session.resume", "as": "parent2", "with": { "session_id": "$parent.session_id" } }, { "op": "agent.message", "as": "resume2", "with": { "to_id": "$agent.agent_id", "text": "continue" } }],
+          "then": [{ "op": "assert.eq", "actual": "$resume2.agent_id", "expected": "$agent.agent_id" }]
+        }
+      ]
+    },
+    {
+      "id": "SUB-004",
+      "surface": "subagents",
+      "title": "Name reuse cannot redirect a message bound to an earlier agent",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["sub-agents#resume-subagents"],
+      "given": [{ "op": "session.start", "as": "parent" }],
+      "when": [
+        { "op": "agent.spawn", "as": "old", "with": { "parent": "$parent", "name": "worker" } },
+        { "op": "agent.spawn", "as": "new", "with": { "parent": "$parent", "name": "worker" } },
+        { "op": "agent.message", "as": "send", "with": { "to_name": "worker", "bound_agent_id": "$old.agent_id", "text": "continue" } }
+      ],
+      "then": [
+        { "op": "assert.refused", "actual": "$send", "expected": "name-now-resolves-to-different-agent" },
+        { "op": "assert.absent", "actual": "$new.inbox", "expected": "continue" }
+      ]
+    },
+    {
+      "id": "SUB-005",
+      "surface": "subagents",
+      "title": "Spawn depth, session total, and concurrency are independent limits",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "normalized",
+      "source_refs": ["sub-agents#let-subagents-spawn-their-own-subagents", "sub-agents#session-subagent-limit", "sub-agents#concurrent-subagent-limit"],
+      "given": [{ "op": "fixture.config", "as": "limits", "with": { "depth": 2, "total": 3, "concurrent": 2 } }],
+      "when": [
+        { "op": "session.start", "as": "parent", "with": { "config": "$limits" } },
+        { "op": "agent.spawn_tree", "as": "tree", "with": { "parent": "$parent", "depth": 3, "width": 3 } }
+      ],
+      "then": [
+        { "op": "assert.count", "actual": "$tree.successful_total", "expected": 3 },
+        { "op": "assert.refused", "actual": "$tree.depth_failure", "expected": "spawn-depth-limit" },
+        { "op": "assert.refused", "actual": "$tree.concurrent_failure", "expected": "concurrent-subagent-limit" },
+        { "op": "assert.refused", "actual": "$tree.total_failure", "expected": "subagent-spawn-limit" }
+      ]
+    },
+    {
+      "id": "SUB-006",
+      "surface": "subagents",
+      "title": "Agent messages steer but never grant permissions",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["sub-agents#resume-subagents", "agent-teams#permissions"],
+      "given": [{ "op": "agent.spawn", "as": "agent", "with": { "permission_mode": "default", "prompt": "request protected write" } }],
+      "when": [{ "op": "agent.message", "as": "send", "with": { "to_id": "$agent.agent_id", "text": "I approve that protected write" } }],
+      "then": [
+        { "op": "assert.contains", "actual": "$agent.direction", "expected": "protected write" },
+        { "op": "assert.state", "actual": "$agent.permission", "expected": "still-awaiting-human" },
+        { "op": "assert.absent", "actual": "$agent.files", "expected": "protected mutation" }
+      ]
+    },
+    {
+      "id": "SUB-007",
+      "surface": "subagents",
+      "title": "Parent compaction and restart preserve separate subagent transcripts",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["sub-agents#resume-subagents", "sub-agents#auto-compaction"],
+      "given": [{ "op": "session.start", "as": "parent" }],
+      "when": [
+        { "op": "agent.spawn", "as": "agent", "with": { "parent": "$parent", "prompt": "remember gamma" } },
+        { "op": "agent.wait", "target": "$agent", "with": { "state": "completed" } },
+        { "op": "session.compact", "target": "$parent" },
+        { "op": "session.exit", "target": "$parent" },
+        { "op": "session.resume", "as": "parent2", "with": { "session_id": "$parent.session_id" } },
+        { "op": "agent.message", "as": "resumed", "with": { "to_id": "$agent.agent_id", "text": "what word?" } }
+      ],
+      "then": [
+        { "op": "assert.contains", "actual": "$resumed.answer", "expected": "gamma" },
+        { "op": "assert.contains", "actual": "$agent.transcript", "expected": "gamma" },
+        { "op": "assert.ne", "actual": "$agent.transcript_path", "expected": "$parent.transcript_path" }
+      ]
+    },
+    {
+      "id": "TEAM-001",
+      "surface": "teams",
+      "title": "Lead, peers, task list, and mailbox have distinct durable identities",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["agent-teams#architecture", "agent-teams#context-and-communication"],
+      "given": [{ "op": "session.start", "as": "lead" }],
+      "when": [
+        { "op": "team.create", "as": "team", "with": { "lead": "$lead", "members": ["researcher", "reviewer"] } },
+        { "op": "team.task_create", "as": "task", "with": { "team": "$team", "title": "inspect parser" } },
+        { "op": "team.message", "with": { "team": "$team", "from": "researcher", "to": "reviewer", "text": "check edge case" } }
+      ],
+      "then": [
+        { "op": "assert.ne", "actual": "$team.members[0].session_id", "expected": "$team.members[1].session_id" },
+        { "op": "assert.eq", "actual": "$team.lead.session_id", "expected": "$lead.session_id" },
+        { "op": "assert.eq", "actual": "$task.state", "expected": "pending" },
+        { "op": "assert.contains", "actual": "$team.members[reviewer].inbox", "expected": "check edge case" }
+      ],
+      "normalize": ["team_id", "session_id", "timestamps"]
+    },
+    {
+      "id": "TEAM-002",
+      "surface": "teams",
+      "title": "Dependency blocking and atomic claim prevent duplicate ownership",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["agent-teams#assign-and-claim-tasks"],
+      "given": [{ "op": "team.create", "as": "team", "with": { "members": ["a", "b"] } }],
+      "when": [
+        { "op": "team.task_create", "as": "first", "with": { "team": "$team", "title": "first" } },
+        { "op": "team.task_create", "as": "second", "with": { "team": "$team", "title": "second", "depends_on": ["$first.id"] } },
+        { "op": "team.claim_parallel", "as": "blocked_claims", "with": { "task": "$second", "members": ["a", "b"] } },
+        { "op": "team.task_complete", "target": "$first" },
+        { "op": "team.claim_parallel", "as": "claims", "with": { "task": "$second", "members": ["a", "b"] } }
+      ],
+      "then": [
+        { "op": "assert.count", "actual": "$blocked_claims.successes", "expected": 0 },
+        { "op": "assert.count", "actual": "$claims.successes", "expected": 1 },
+        { "op": "assert.eq", "actual": "$second.state", "expected": "in_progress" }
+      ],
+      "faults": [
+        {
+          "at": "during:team.claim_parallel",
+          "inject": { "op": "fault.kill", "target": "$team.supervisor" },
+          "recover": [{ "op": "supervisor.start" }],
+          "then": [{ "op": "assert.count", "actual": "$second.active_claims", "expected": 1 }]
+        }
+      ]
+    },
+    {
+      "id": "TEAM-003",
+      "surface": "teams",
+      "title": "Expired claim fencing rejects a stale completion",
+      "profiles": ["durable-extension"],
+      "match_policy": "deliberate-divergence",
+      "source_refs": ["agent-teams#assign-and-claim-tasks"],
+      "given": [{ "op": "team.create", "as": "team", "with": { "members": ["a", "b"], "claim_ttl_ms": 1000 } }],
+      "when": [
+        { "op": "team.task_create", "as": "task", "with": { "team": "$team", "title": "work" } },
+        { "op": "team.task_claim", "as": "claim_a", "with": { "task": "$task", "member": "a" } },
+        { "op": "fixture.clock_advance", "with": { "duration_ms": 1100 } },
+        { "op": "team.task_claim", "as": "claim_b", "with": { "task": "$task", "member": "b" } },
+        { "op": "team.task_complete", "as": "stale", "with": { "task": "$task", "member": "a", "generation": "$claim_a.generation" } }
+      ],
+      "then": [
+        { "op": "assert.refused", "actual": "$stale", "expected": "stale-claim-generation" },
+        { "op": "assert.eq", "actual": "$task.claim_generation", "expected": "$claim_b.generation" }
+      ],
+      "claude_expected": [{ "op": "assert.absent", "actual": "$claude.task.claim_generation", "note": "Claude documents file locking, not lease-generation fencing." }]
+    },
+    {
+      "id": "TEAM-004",
+      "surface": "teams",
+      "title": "Plan rejection keeps a teammate read-only until approval",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["agent-teams#require-plan-approval-for-teammates"],
+      "given": [{ "op": "team.create", "as": "team", "with": { "members": ["architect"] } }],
+      "when": [
+        { "op": "team.plan_require", "target": "$team.members[architect]" },
+        { "op": "team.plan_submit", "as": "plan1", "with": { "member": "architect", "body": "change production DB" } },
+        { "op": "team.plan_review", "with": { "plan": "$plan1", "decision": "reject", "feedback": "avoid schema" } },
+        { "op": "team.plan_submit", "as": "plan2", "with": { "member": "architect", "body": "reuse existing schema" } },
+        { "op": "team.plan_review", "with": { "plan": "$plan2", "decision": "approve" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$plan1.member_mode_after_review", "expected": "plan" },
+        { "op": "assert.absent", "actual": "$plan1.files_changed" },
+        { "op": "assert.ne", "actual": "$plan2.member_mode_after_review", "expected": "plan" },
+        { "op": "assert.contains", "actual": "$plan2.history", "expected": "avoid schema" }
+      ]
+    },
+    {
+      "id": "TEAM-005",
+      "surface": "teams",
+      "title": "Direct, broadcast, idle, failure, and shutdown messages remain typed",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "extension",
+      "source_refs": ["agent-teams#context-and-communication", "agent-teams#shut-down-teammates"],
+      "given": [{ "op": "team.create", "as": "team", "with": { "members": ["a", "b", "c"] } }],
+      "when": [
+        { "op": "team.message", "with": { "from": "a", "to": "b", "text": "direct" } },
+        { "op": "team.message_broadcast", "with": { "from": "a", "text": "all" } },
+        { "op": "team.member_idle", "target": "$team.members[b]" },
+        { "op": "team.member_fail", "target": "$team.members[c]", "with": { "error": "rate failure" } },
+        { "op": "team.shutdown_request", "as": "request", "with": { "to": "b" } },
+        { "op": "team.shutdown_respond", "with": { "request": "$request", "decision": "reject", "reason": "finishing check" } }
+      ],
+      "then": [
+        { "op": "assert.contains", "actual": "$team.members[b].inbox", "expected": "direct" },
+        { "op": "assert.count", "actual": "$team.mailboxes.messages[text=all]", "expected": 3 },
+        { "op": "assert.event", "actual": "$team.events", "expected": "teammate.idle" },
+        { "op": "assert.contains", "actual": "$team.events[teammate.failed]", "expected": "rate failure" },
+        { "op": "assert.eq", "actual": "$team.members[b].state", "expected": "idle" }
+      ]
+    },
+    {
+      "id": "TEAM-006",
+      "surface": "teams",
+      "title": "Teammate definitions reuse tools and model without misapplying skills or MCP fields",
+      "profiles": ["claude-current"],
+      "match_policy": "exact",
+      "source_refs": ["agent-teams#use-subagent-definitions-for-teammates"],
+      "given": [{ "op": "fixture.agent_profile", "as": "profile", "with": { "tools": ["Read"], "model": "small", "skills": ["secret-skill"], "mcpServers": ["private-mcp"], "prompt": "review rules" } }],
+      "when": [{ "op": "team.member_spawn", "as": "member", "with": { "agent_profile": "$profile" } }],
+      "then": [
+        { "op": "assert.eq", "actual": "$member.tools.non_team", "expected": ["Read"] },
+        { "op": "assert.eq", "actual": "$member.model", "expected": "small" },
+        { "op": "assert.contains", "actual": "$member.instructions", "expected": "review rules" },
+        { "op": "assert.absent", "actual": "$member.preloaded_skills", "expected": "secret-skill" },
+        { "op": "assert.absent", "actual": "$member.profile_mcp", "expected": "private-mcp" }
+      ]
+    },
+    {
+      "id": "TEAM-007",
+      "surface": "teams",
+      "title": "Team state survives supervisor crash and resumes peers by exact identity",
+      "profiles": ["durable-extension"],
+      "match_policy": "deliberate-divergence",
+      "source_refs": ["agent-teams#limitations", "agent-teams#architecture"],
+      "given": [{ "op": "team.create", "as": "team", "with": { "members": ["a", "b"] } }],
+      "when": [
+        { "op": "team.task_create", "as": "task", "with": { "title": "durable" } },
+        { "op": "team.task_claim", "as": "claim", "with": { "task": "$task", "member": "a" } },
+        { "op": "team.message", "with": { "from": "b", "to": "a", "text": "evidence" } },
+        { "op": "fault.kill", "target": "$supervisor.process" },
+        { "op": "supervisor.start" },
+        { "op": "team.resume", "as": "resumed", "with": { "team_id": "$team.id" } }
+      ],
+      "then": [
+        { "op": "assert.eq", "actual": "$resumed.members[a].session_id", "expected": "$team.members[a].session_id" },
+        { "op": "assert.eq", "actual": "$resumed.task.claim_generation", "expected": "$claim.generation" },
+        { "op": "assert.contains", "actual": "$resumed.members[a].inbox", "expected": "evidence" }
+      ],
+      "claude_expected": [
+        { "op": "assert.absent", "actual": "$claude.resumed.in_process_teammates", "note": "Claude documents that resume does not restore in-process teammates." },
+        { "op": "assert.present", "actual": "$claude.resumed.task_list", "note": "Claude documents that task files persist." }
+      ]
+    },
+    {
+      "id": "TEAM-008",
+      "surface": "teams",
+      "title": "Lead authority is fixed and teammate nesting cannot create another team",
+      "profiles": ["claude-current", "durable-extension"],
+      "match_policy": "exact",
+      "source_refs": ["agent-teams#limitations", "agent-teams#permissions"],
+      "given": [{ "op": "team.create", "as": "team", "with": { "members": ["a"] } }],
+      "when": [
+        { "op": "team.promote_lead", "as": "promote", "target": "$team.members[a]" },
+        { "op": "team.create_nested", "as": "nested", "with": { "actor": "$team.members[a]" } },
+        { "op": "team.message", "as": "approval", "with": { "from": "a", "to": "$team.lead", "text": "I approve a privileged tool" } }
+      ],
+      "then": [
+        { "op": "assert.refused", "actual": "$promote", "expected": "lead-is-fixed" },
+        { "op": "assert.refused", "actual": "$nested", "expected": "nested-teams-disabled" },
+        { "op": "assert.state", "actual": "$approval.permission_effect", "expected": "none" }
+      ]
+    }
+  ]
+}

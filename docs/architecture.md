@@ -67,6 +67,37 @@ $HANDOFF_HOME/sessions/AGENT_ID/
 
 This is deliberately separate from workflow nodes: a node describes graph work, while an agent session describes a durable conversation and its queued replies. Logical state and process liveness are independent. Message dispatch uses a monotonic fence independent of refundable node retry counts. Every accepted or rejected agent exit records a typed attempt outcome atomically with its workflow transition; reconciliation delivers or requeues only the inbox batch named by that outcome. Exact opaque runtime session IDs are retained across process exit and reply-triggered restart.
 
+Independently controllable work uses a separate Activity ledger:
+
+```text
+$HANDOFF_HOME/activities/ACTIVITY_ID/
+  events.jsonl
+  state.json
+  attempts/ATTEMPT_ID/
+    stdout.log
+    stderr.log
+```
+
+A Session owns conversational identity; an Activity owns work lifecycle and
+durable output; an Attempt records one immutable process execution. PID,
+command, output, and stop authority therefore never become Session fields.
+Checklist tasks remain separate again: they are planning state, not background
+processes.
+
+An attachment is an ephemeral reader over an Activity revision and byte cursor.
+Disconnecting it has no lifecycle effect. Stop, signal, adopt, and restart are
+durable control intents that include the expected Activity generation and exact
+Attempt process identity (PID plus platform start token). Stale controllers and
+PID reuse fail closed.
+
+The ledger reducer produces the sole Activity projection used by human TUI,
+JSON/JSONL, RPC, and policy. A combined snapshot-and-subscribe operation orders
+subscriber registration with the initial read so reconnect cannot lose events
+between snapshot and follow. The prior-art evidence and license boundary are in
+[`prior-art-codex-pi-omp.md`](prior-art-codex-pi-omp.md); the domain decision is
+recorded in
+[`ADR 0001`](adr/0001-separate-sessions-and-activities.md).
+
 ## Scheduling
 
 `handoff serve` scans active workflows and runs ready nodes up to a configurable cross-workflow concurrency bound. Per-workflow writes remain serialized. It can run under launchd or systemd-user and resumes from durable state after restart.

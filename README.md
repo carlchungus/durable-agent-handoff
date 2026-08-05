@@ -10,7 +10,7 @@ The workflow is not a fixed `discover -> plan -> lint -> done` pipeline. Workers
 
 Claude Code's useful orchestration ideas are dynamic: shared task state, background subagents, resumable sessions, event hooks that can send an agent back to work, and an agent-owned maintenance loop. `handoff` implements the portable contracts itself so one workflow can mix runtimes and survive the lifecycle of any one harness.
 
-The design borrows the good parts of [Claude Code hooks](https://code.claude.com/docs/en/hooks), [agent teams](https://code.claude.com/docs/en/agent-teams), [subagent isolation](https://code.claude.com/docs/en/sub-agents), and the dynamic maintenance behavior of [`/loop`](https://code.claude.com/docs/en/scheduled-tasks), while keeping durable state outside Claude. The TUI uses [Bubble Tea v2](https://github.com/charmbracelet/bubbletea).
+The design borrows the good parts of [Claude Code hooks](https://code.claude.com/docs/en/hooks), [agent teams](https://code.claude.com/docs/en/agent-teams), [subagent isolation](https://code.claude.com/docs/en/sub-agents), and the dynamic maintenance behavior of [`/loop`](https://code.claude.com/docs/en/scheduled-tasks), while keeping durable state outside Claude. It also takes narrowly scoped contracts from Codex, Pi, and Oh My Pi; the pinned source review and the ideas intentionally rejected are documented in [the prior-art study](docs/prior-art-codex-pi-omp.md). The TUI uses [Bubble Tea v2](https://github.com/charmbracelet/bubbletea).
 
 Durable team coordination is also available through a machine-first interface:
 

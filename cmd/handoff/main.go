@@ -124,6 +124,7 @@ func cmdCreate(args []string, out io.Writer, seed bool) error {
 	runtimeName := fs.String("runtime", "codex", "codex, claude, pi, ohmypi, or exec")
 	model := fs.String("model", "", "runtime model")
 	effort := fs.String("effort", "xhigh", "reasoning effort")
+	sandbox := fs.String("sandbox", "workspace-write", "read-only or workspace-write")
 	role := fs.String("role", "", "preference-ladder role, for example planner or verifier")
 	finalizeRepo := fs.String("finalize-repo", "", "authorize deterministic PR creation and merge in OWNER/REPO")
 	var mergeGates stringList
@@ -141,13 +142,13 @@ func cmdCreate(args []string, out io.Writer, seed bool) error {
 		return err
 	}
 	if seed {
-		n := &core.Node{ID: "lead", Title: "Own the goal and dynamically adapt the workflow", Kind: "agent", Role: *role, Prompt: "Discover the live state, decide the smallest safe next action, implement it, and add independent verification or follow-up nodes when evidence warrants it.", Runtime: core.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort}}
+		n := &core.Node{ID: "lead", Title: "Own the goal and dynamically adapt the workflow", Kind: "agent", Role: *role, Prompt: "Discover the live state, decide the smallest safe next action, implement it, and add independent verification or follow-up nodes when evidence warrants it.", Runtime: core.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort, Sandbox: *sandbox}}
 		mutations := []core.Mutation{{Op: "add_node", Node: n}}
 		if *finalizeRepo != "" {
 			if len(mergeGates) == 0 {
 				return errors.New("--finalize-repo requires at least one --merge-gate")
 			}
-			verify := &core.Node{ID: "verify", Title: "Independently evaluate the implementation", Kind: "agent", DependsOn: []string{"lead"}, Prompt: "Review the live diff and goal independently. Run the verification that best tests the actual risk. If sound, emit a pass attestation with concrete evidence; otherwise propose repair work.", Runtime: core.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort}}
+			verify := &core.Node{ID: "verify", Title: "Independently evaluate the implementation", Kind: "agent", DependsOn: []string{"lead"}, Prompt: "Review the live diff and goal independently. Run the verification that best tests the actual risk. If sound, emit a pass attestation with concrete evidence; otherwise propose repair work.", Runtime: core.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort, Sandbox: "read-only"}}
 			finish := &core.Node{ID: "finalize", Title: "Create and safely merge the pull request", Kind: "finalize", DependsOn: []string{"verify"}, MaxAttempts: 100, Metadata: map[string]string{"repo": *finalizeRepo, "gates": strings.Join(mergeGates, ","), "pr_title": *goal, "commit_message": *goal}}
 			mutations = append(mutations, core.Mutation{Op: "add_node", Node: verify}, core.Mutation{Op: "add_node", Node: finish})
 		}
@@ -629,6 +630,7 @@ func cmdImport(args []string, out io.Writer) error {
 	runtimeName := fs.String("runtime", "codex", "target runtime")
 	model := fs.String("model", "", "target model")
 	effort := fs.String("effort", "xhigh", "reasoning effort")
+	sandbox := fs.String("sandbox", "workspace-write", "read-only or workspace-write")
 	allowRisk := fs.Bool("allow-risk", false, "explicitly allow medium/high risk import")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -666,7 +668,7 @@ func cmdImport(args []string, out io.Writer) error {
 		return err
 	}
 	prompt := fmt.Sprintf("Recovered from Claude Code session %s on branch %s. Revalidate every claim against the live checkout before editing. Sanitized text-only transcript context follows:\n\n%s", found.SessionID, found.Branch, found.Handoff)
-	n := &core.Node{ID: "lead", Title: "Continue the interrupted work", Kind: "agent", Prompt: prompt, Worktree: found.CWD, Runtime: core.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort}, Metadata: map[string]string{"source": "claude", "source_session_id": found.SessionID, "source_transcript": found.Transcript, "risk": found.Risk}}
+	n := &core.Node{ID: "lead", Title: "Continue the interrupted work", Kind: "agent", Prompt: prompt, Worktree: found.CWD, Runtime: core.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort, Sandbox: *sandbox}, Metadata: map[string]string{"source": "claude", "source_session_id": found.SessionID, "source_transcript": found.Transcript, "risk": found.Risk}}
 	if *runtimeName == "claude" {
 		n.SessionID = found.SessionID
 	}

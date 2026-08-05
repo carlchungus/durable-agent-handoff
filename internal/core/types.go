@@ -43,6 +43,7 @@ type RuntimeSpec struct {
 	Executable string   `json:"executable,omitempty"`
 	Model      string   `json:"model,omitempty"`
 	Effort     string   `json:"effort,omitempty"`
+	Sandbox    string   `json:"sandbox,omitempty"`
 	Args       []string `json:"args,omitempty"`
 }
 

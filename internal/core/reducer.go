@@ -77,6 +77,11 @@ func validateMutation(w *Workflow, actor string, m Mutation) error {
 		if (m.Node.Kind == "merge" || m.Node.Kind == "finalize") && actor != "human" && actor != "supervisor" {
 			return errors.New("only a human or supervisor may add a merge or finalize node")
 		}
+		if parent := w.Nodes[actor]; parent != nil && parent.Runtime.Sandbox == "read-only" {
+			if m.Node.Runtime.Name != "" && m.Node.Runtime.Sandbox != "read-only" {
+				return errors.New("a read-only worker cannot spawn a write-capable child")
+			}
+		}
 		if err := validateWorktree(w.Root, m.Node.Worktree); err != nil {
 			return err
 		}

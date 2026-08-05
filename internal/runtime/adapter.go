@@ -1,13 +1,11 @@
 package runtime
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
@@ -21,10 +19,14 @@ type Command struct {
 
 func Build(spec core.RuntimeSpec, worktree, prompt, sessionID, schemaPath, outputPath string) (Command, error) {
 	name := spec.Name
+	sandbox := fallback(spec.Sandbox, "workspace-write")
+	if sandbox != "workspace-write" && sandbox != "read-only" {
+		return Command{}, fmt.Errorf("unsupported sandbox %q; use read-only or workspace-write", sandbox)
+	}
 	switch name {
 	case "codex":
 		exe := fallback(spec.Executable, "codex")
-		args := []string{"-C", worktree, "-m", fallback(spec.Model, "gpt-5.6-luna"), "-c", fmt.Sprintf("model_reasoning_effort=%q", fallback(spec.Effort, "xhigh")), "-s", "workspace-write", "-a", "never"}
+		args := []string{"-C", worktree, "-m", fallback(spec.Model, "gpt-5.6-luna"), "-c", fmt.Sprintf("model_reasoning_effort=%q", fallback(spec.Effort, "xhigh")), "-s", sandbox, "-a", "never"}
 		args = append(args, disabledProjectMCPArgs(worktree)...)
 		args = append(args, "exec", "--ignore-user-config", "--json")
 		if schemaPath != "" {
@@ -40,12 +42,19 @@ func Build(spec core.RuntimeSpec, worktree, prompt, sessionID, schemaPath, outpu
 		return Command{Name: exe, Args: append(args, spec.Args...), PromptOnStdin: true}, nil
 	case "claude":
 		exe := fallback(spec.Executable, "claude")
-		args := []string{"-p", prompt, "--output-format", "stream-json", "--verbose", "--safe-mode", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`, "--model", fallback(spec.Model, "sonnet"), "--effort", fallback(spec.Effort, "high"), "--permission-mode", "dontAsk", "--tools", "Bash,Read,Edit,Write,Glob,Grep"}
+		tools := "Bash,Read,Edit,Write,Glob,Grep"
+		if sandbox == "read-only" {
+			tools = "Read,Glob,Grep"
+		}
+		args := []string{"-p", prompt, "--output-format", "stream-json", "--verbose", "--safe-mode", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`, "--model", fallback(spec.Model, "sonnet"), "--effort", fallback(spec.Effort, "high"), "--permission-mode", "dontAsk", "--tools", tools}
 		if sessionID != "" {
 			args = append(args, "--resume", sessionID)
 		}
 		return Command{Name: exe, Args: append(args, spec.Args...)}, nil
 	case "pi":
+		if sandbox == "read-only" {
+			return Command{}, errors.New("pi cannot enforce read-only execution; use an external OS sandbox or another runtime")
+		}
 		exe := fallback(spec.Executable, "pi")
 		args := []string{"--mode", "json", "--model", fallback(spec.Model, "openrouter/deepseek/deepseek-v4-flash"), "--thinking", fallback(spec.Effort, "xhigh")}
 		if sessionID != "" {
@@ -56,6 +65,9 @@ func Build(spec core.RuntimeSpec, worktree, prompt, sessionID, schemaPath, outpu
 		args = append(args, prompt)
 		return Command{Name: exe, Args: append(args, spec.Args...)}, nil
 	case "ohmypi", "omp":
+		if sandbox == "read-only" {
+			return Command{}, errors.New("ohmypi cannot enforce read-only execution; use an external OS sandbox or another runtime")
+		}
 		exe := fallback(spec.Executable, "omp")
 		args := []string{"--mode", "json", "--model", fallback(spec.Model, "vercel-ai-gateway/deepseek/deepseek-v4-flash"), "--thinking", fallback(spec.Effort, "xhigh"), "--no-pty", "--no-title", "--auto-approve"}
 		if sessionID != "" {
@@ -66,6 +78,9 @@ func Build(spec core.RuntimeSpec, worktree, prompt, sessionID, schemaPath, outpu
 		args = append(args, prompt)
 		return Command{Name: exe, Args: append(args, spec.Args...)}, nil
 	case "exec":
+		if sandbox == "read-only" {
+			return Command{}, errors.New("exec cannot enforce read-only execution; wrap the executable in an external OS sandbox")
+		}
 		if spec.Executable == "" {
 			return Command{}, errors.New("exec adapter requires executable")
 		}
@@ -75,26 +90,14 @@ func Build(spec core.RuntimeSpec, worktree, prompt, sessionID, schemaPath, outpu
 	}
 }
 
-var mcpSection = regexp.MustCompile(`^\[mcp_servers\.([A-Za-z0-9_-]+)\]$`)
-
 // --ignore-user-config removes ambient user MCPs, but Codex intentionally still
-// loads project config. Disable each declared project MCP explicitly so a
-// background worker cannot inherit credentials or hang on interactive auth.
+// loads project config. Replace the whole project MCP table so stale or newer
+// transport fields are not parsed before an `enabled=false` leaf can apply.
 func disabledProjectMCPArgs(worktree string) []string {
-	f, err := os.Open(filepath.Join(worktree, ".codex", "config.toml"))
-	if err != nil {
+	if _, err := os.Stat(filepath.Join(worktree, ".codex", "config.toml")); err != nil {
 		return nil
 	}
-	defer f.Close()
-	var args []string
-	scan := bufio.NewScanner(f)
-	for scan.Scan() {
-		match := mcpSection.FindStringSubmatch(strings.TrimSpace(scan.Text()))
-		if len(match) == 2 {
-			args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.enabled=false", match[1]))
-		}
-	}
-	return args
+	return []string{"-c", "mcp_servers={}"}
 }
 
 func Available(spec core.RuntimeSpec) error {

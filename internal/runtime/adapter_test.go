@@ -35,7 +35,7 @@ func TestCodexDisablesProjectMCPServers(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(c.Args, " ")
-	for _, expected := range []string{"--ignore-user-config", "mcp_servers.neon.enabled=false", "mcp_servers.repo_tools.enabled=false"} {
+	for _, expected := range []string{"--ignore-user-config", "mcp_servers={}"} {
 		if !strings.Contains(joined, expected) {
 			t.Fatalf("missing %q in %s", expected, joined)
 		}
@@ -54,6 +54,29 @@ func TestClaudeIsFailClosed(t *testing.T) {
 	for _, required := range []string{"--safe-mode", "--strict-mcp-config", "--permission-mode dontAsk", "--resume abc"} {
 		if !contains(joined, required) {
 			t.Errorf("missing %q in %s", required, joined)
+		}
+	}
+}
+
+func TestReadOnlyCapabilityIsEnforcedPerRuntime(t *testing.T) {
+	codex, err := Build(core.RuntimeSpec{Name: "codex", Sandbox: "read-only"}, "/repo", "prompt", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if joined := strings.Join(codex.Args, " "); !strings.Contains(joined, "-s read-only") {
+		t.Fatalf("codex args=%s", joined)
+	}
+	claude, err := Build(core.RuntimeSpec{Name: "claude", Sandbox: "read-only"}, "/repo", "prompt", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(claude.Args, " ")
+	if !strings.Contains(joined, "--tools Read,Glob,Grep") || strings.Contains(joined, "Edit") || strings.Contains(joined, "Write") || strings.Contains(joined, "Bash") {
+		t.Fatalf("claude args=%s", joined)
+	}
+	for _, runtimeName := range []string{"pi", "ohmypi", "exec"} {
+		if _, err = Build(core.RuntimeSpec{Name: runtimeName, Sandbox: "read-only", Executable: "tool"}, "/repo", "prompt", "", "", ""); err == nil {
+			t.Fatalf("%s accepted unenforceable read-only mode", runtimeName)
 		}
 	}
 }

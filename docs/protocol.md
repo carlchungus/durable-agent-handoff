@@ -36,6 +36,8 @@ An agent ends with one object:
 
 `agent` invokes a runtime adapter. `command` executes an argv vector without a shell. `human` is visible but not scheduled. `finalize` is a privileged deterministic Git/PR operation. Unknown kinds remain pending and observable so extensions fail closed.
 
+`runtime.sandbox` is `read-only` or `workspace-write`. A read-only node cannot propose a write-capable child. Adapters that cannot enforce read-only execution fail closed instead of silently widening authority.
+
 ## Compatibility
 
 Fields are additive during the `0.x` series. Consumers must ignore unknown JSON fields and must not infer ordering from object keys. Event sequence numbers are the ordering contract.

@@ -78,6 +78,8 @@ handoff preference list
 handoff preference health
 ```
 
+Use `--sandbox read-only` for discovery and independent verification. Codex uses its native read-only sandbox and Claude receives a narrowed read-only tool list. Pi, OhMyPi, and arbitrary executables currently reject read-only mode unless an external OS sandbox is added; they never silently widen it.
+
 When a limit is observed, `handoff` records the provider/model cooldown durably, appends routing evidence to the workflow, and selects the next healthy candidate. Usage-limit cooldowns default to one hour; transient rate limits default to five minutes. If every candidate is cooling down, the node remains ready and the scheduler waits rather than treating the work as failed. Reset observed health explicitly with `handoff preference reset [runtime/model]`.
 
 Claude's own headless `--fallback-model` can still be useful within Claude for overload, but the external ladder is what crosses harness and billing boundaries. Model names are deliberately not hardcoded; inspect the live runtime catalog (for example, `pi --list-models kimi`) before choosing aliases.

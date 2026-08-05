@@ -71,6 +71,23 @@ func TestPolicyAuthorityAndRootBoundary(t *testing.T) {
 	}
 }
 
+func TestReadOnlyWorkerCannotEscalateChildCapability(t *testing.T) {
+	w := fixtureWorkflow(t)
+	if err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []Mutation{{Op: "add_node", Node: &Node{ID: "reviewer", Title: "review", Kind: "agent", Runtime: RuntimeSpec{Name: "codex", Sandbox: "read-only"}}}}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "reviewer", Mutations: []Mutation{{Op: "add_node", Node: &Node{ID: "writer", Title: "write", Kind: "agent", Runtime: RuntimeSpec{Name: "codex", Sandbox: "workspace-write"}}}}}, time.Now().UTC())
+	if err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("unexpected escalation result: %v", err)
+	}
+	if w.Nodes["writer"] != nil {
+		t.Fatal("rejected escalation mutated workflow")
+	}
+	if err = ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "reviewer", Mutations: []Mutation{{Op: "add_node", Node: &Node{ID: "reader", Title: "read", Kind: "agent", Runtime: RuntimeSpec{Name: "codex", Sandbox: "read-only"}}}}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCompletionWaitsForAttestation(t *testing.T) {
 	w := fixtureWorkflow(t)
 	if err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []Mutation{{Op: "add_node", Node: &Node{ID: "one", Title: "one", Kind: "agent"}}}}, time.Now().UTC()); err != nil {

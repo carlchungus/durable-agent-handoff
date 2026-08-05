@@ -80,6 +80,7 @@ Cooldown state is durable across scheduler restarts. When every candidate is coo
 1. Transcript discovery is read-only and text-only. It redacts common credentials and classifies obvious high-risk work.
 2. Runtime workers can change files only within their configured worktree and can propose graph mutations.
 3. The policy kernel validates an entire proposal against a cloned graph before applying any mutation.
+   Read-only workers cannot create a write-capable child; runtime routing preserves the parent's sandbox envelope.
 4. A finalizer is privileged and must be authorized by a human/supervisor node. Agent proposals cannot create one.
 5. Finalization requires an independent passing attestation, local diff budgets, a non-protected branch, exact named CI checks, and an unchanged PR head.
 
@@ -88,6 +89,8 @@ Cooldown state is durable across scheduler restarts. When every candidate is coo
 Runtime-specific command construction lives behind one interface. Each adapter must provide noninteractive execution, an explicit working directory, a parseable event stream, a final result object, and exact-session resume when supported.
 
 Claude runs in safe mode with an empty strict MCP configuration. This intentionally does not inherit ambient plugins, hooks, or MCP servers. Pi and OhMyPi need stronger external isolation because they do not provide an OS sandbox.
+
+Codex and Claude support a portable `read-only` profile. Codex receives its native read-only sandbox; Claude receives a read-only tool allowlist with Bash/Edit/Write removed. Pi, OhMyPi, and arbitrary executables fail closed for `read-only` until wrapped by an external OS sandbox.
 
 ## Extension path
 

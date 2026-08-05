@@ -100,6 +100,9 @@ func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 		if routeErr != nil {
 			return nil, routeErr
 		}
+		if routed.Sandbox == "" {
+			routed.Sandbox = node.Runtime.Sandbox
+		}
 		if !reflect.DeepEqual(routed, node.Runtime) || index != node.CandidateIndex {
 			_, err = e.Store.Apply(core.Proposal{WorkflowID: id, Actor: "supervisor", Mutations: []core.Mutation{
 				{Op: "set_runtime", NodeID: node.ID, Runtime: &routed, CandidateIndex: index},

@@ -1,10 +1,13 @@
 package runtime
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
@@ -21,7 +24,9 @@ func Build(spec core.RuntimeSpec, worktree, prompt, sessionID, schemaPath, outpu
 	switch name {
 	case "codex":
 		exe := fallback(spec.Executable, "codex")
-		args := []string{"-C", worktree, "-m", fallback(spec.Model, "gpt-5.6-luna"), "-c", fmt.Sprintf("model_reasoning_effort=%q", fallback(spec.Effort, "xhigh")), "-s", "workspace-write", "-a", "never", "exec", "--json"}
+		args := []string{"-C", worktree, "-m", fallback(spec.Model, "gpt-5.6-luna"), "-c", fmt.Sprintf("model_reasoning_effort=%q", fallback(spec.Effort, "xhigh")), "-s", "workspace-write", "-a", "never"}
+		args = append(args, disabledProjectMCPArgs(worktree)...)
+		args = append(args, "exec", "--ignore-user-config", "--json")
 		if schemaPath != "" {
 			args = append(args, "--output-schema", schemaPath)
 		}
@@ -68,6 +73,28 @@ func Build(spec core.RuntimeSpec, worktree, prompt, sessionID, schemaPath, outpu
 	default:
 		return Command{}, fmt.Errorf("unsupported runtime %q", name)
 	}
+}
+
+var mcpSection = regexp.MustCompile(`^\[mcp_servers\.([A-Za-z0-9_-]+)\]$`)
+
+// --ignore-user-config removes ambient user MCPs, but Codex intentionally still
+// loads project config. Disable each declared project MCP explicitly so a
+// background worker cannot inherit credentials or hang on interactive auth.
+func disabledProjectMCPArgs(worktree string) []string {
+	f, err := os.Open(filepath.Join(worktree, ".codex", "config.toml"))
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var args []string
+	scan := bufio.NewScanner(f)
+	for scan.Scan() {
+		match := mcpSection.FindStringSubmatch(strings.TrimSpace(scan.Text()))
+		if len(match) == 2 {
+			args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.enabled=false", match[1]))
+		}
+	}
+	return args
 }
 
 func Available(spec core.RuntimeSpec) error {

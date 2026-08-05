@@ -61,6 +61,14 @@ $HANDOFF_HOME/workflows/WF_ID/
 
 The scheduler does not infer health from a PID. The observable contract is state plus events, evidence, attempt count, and persisted session ID.
 
+## Claude-compatible dynamic workflows
+
+Dynamic workflows are a separate coordination contract layered over the same runtime adapters; they are not translated into a static phase DAG. A sandboxed JavaScript program owns loops, branches, `parallel`, `pipeline`, phases, and intermediate values. Go owns agent execution, caps, permissions, storage, leases, and replay.
+
+The durable journal records every `agent()` start in start order, its prompt/options fingerprint, and its result. On restart the script executes again from the beginning. Cached results are returned only through the completed ordered prefix. At the first unfinished or changed call, that call and the entire suffix execute live, even when later calls completed before interruption. The JavaScript heap therefore does not need to be serialized, and replay cannot manufacture an execution order the original run never observed.
+
+The compatibility profile targets Claude's documented 16 concurrent and 1,000 total agents. Policy may choose lower caps. The workflow program itself receives no filesystem, shell, network, process, import, or package-loader capability; only the agents it launches can request tools through their inherited capability envelope.
+
 ## Routing and usage limits
 
 Role-specific preference ladders are stored outside individual workflows. Before a node starts, the supervisor selects the first candidate without an active cooldown. A recognized quota/usage-limit or rate-limit failure records provider health, returns the node to `ready`, persists the next runtime choice, and appends evidence. Ordinary runtime, auth, model-name, code, and test failures stay on the normal failure path.

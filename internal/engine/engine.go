@@ -6,15 +6,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/finalize"
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
+	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 	hruntime "github.com/carlchungus/durable-agent-handoff/internal/runtime"
 )
 
@@ -22,8 +25,25 @@ type Result struct {
 	Status       string             `json:"status"`
 	Summary      string             `json:"summary"`
 	SessionID    string             `json:"session_id,omitempty"`
-	Mutations    []core.Mutation    `json:"mutations,omitempty"`
+	Mutations    []encodedMutation  `json:"mutations,omitempty"`
 	Attestations []core.Attestation `json:"attestations,omitempty"`
+}
+
+// encodedMutation accepts ordinary mutation objects from runtimes without
+// strict structured output and JSON-encoded object strings from Codex. Codex's
+// strict response schemas cannot express the intentionally dynamic mutation
+// union without making every nested operation shape required.
+type encodedMutation struct{ core.Mutation }
+
+func (m *encodedMutation) UnmarshalJSON(data []byte) error {
+	if len(data) > 0 && data[0] == '"' {
+		var encoded string
+		if err := json.Unmarshal(data, &encoded); err != nil {
+			return err
+		}
+		data = []byte(encoded)
+	}
+	return json.Unmarshal(data, &m.Mutation)
 }
 
 type Engine struct {
@@ -76,6 +96,60 @@ func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 		return node, e.runFinalize(ctx, w, node)
 	}
 	return node, e.runAgent(ctx, w, node)
+}
+
+// Reconcile repairs nodes left in running state after a supervisor restart.
+// It never guesses from a PID alone and never reruns ambiguous side effects.
+func (e *Engine) Reconcile(_ context.Context, id string) error {
+	w, err := e.Store.Load(id)
+	if err != nil {
+		return err
+	}
+	for _, nodeID := range w.Order {
+		n := w.Nodes[nodeID]
+		if n == nil || n.State != core.NodeRunning {
+			continue
+		}
+		dir := filepath.Join(e.Store.Dir(), "workflows", w.ID, "runs", n.ID, fmt.Sprint(n.Attempt))
+		manifest, manifestErr := runstate.Load(filepath.Join(dir, "attempt.json"))
+		if manifestErr == nil && runstate.ProcessMatches(manifest) {
+			continue
+		}
+
+		outputPath := filepath.Join(dir, "last-message.json")
+		b, readErr := os.ReadFile(outputPath)
+		if readErr != nil || len(bytes.TrimSpace(b)) == 0 {
+			b, _ = os.ReadFile(filepath.Join(dir, "events.jsonl"))
+		}
+		if result, parseErr := parseResult(b); parseErr == nil {
+			sessionID := result.SessionID
+			if sessionID == "" && manifestErr == nil {
+				sessionID = manifest.SessionID
+			}
+			return e.applyAgentResult(w, n, result, sessionID, n.Attempt)
+		}
+
+		sessionID := n.SessionID
+		if sessionID == "" && manifestErr == nil {
+			sessionID = manifest.SessionID
+		}
+		state := core.NodeWaiting
+		summary := "supervisor lost the worker before a resumable session identity was persisted; human review is required before retrying"
+		if sessionID != "" {
+			state = core.NodeReady
+			summary = "worker process ended after supervisor interruption; resuming the exact persisted runtime session"
+		} else if manifestErr == nil && manifest.RestartSafe {
+			state = core.NodeReady
+			summary = "restart-safe worker ended after supervisor interruption; scheduling a fresh attempt"
+		}
+		mutations := []core.Mutation{{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("recovery-%s-%d", n.ID, n.Attempt), NodeID: n.ID, Kind: "recovery", Summary: summary}}, {Op: "set_state", NodeID: n.ID, State: state}}
+		if sessionID != "" && sessionID != n.SessionID {
+			mutations = append([]core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, mutations...)
+		}
+		_, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: mutations, Rationale: "reconcile interrupted runtime attempt"})
+		return err
+	}
+	return nil
 }
 
 func (e *Engine) runFinalize(ctx context.Context, w *core.Workflow, n *core.Node) error {
@@ -138,35 +212,128 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	if c.PromptOnStdin {
 		cmd.Stdin = strings.NewReader(prompt)
 	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err = cmd.Run()
-	_ = os.WriteFile(filepath.Join(dir, "events.jsonl"), stdout.Bytes(), 0o600)
-	_ = os.WriteFile(filepath.Join(dir, "stderr.log"), stderr.Bytes(), 0o600)
+	stdoutPath := filepath.Join(dir, "events.jsonl")
+	stderrPath := filepath.Join(dir, "stderr.log")
+	recorder, err := runstate.Create(filepath.Join(dir, "attempt.json"), runstate.Manifest{
+		ID:            fmt.Sprintf("%s/%d", n.ID, n.Attempt+1),
+		WorkflowID:    w.ID,
+		NodeID:        n.ID,
+		Attempt:       n.Attempt + 1,
+		Runtime:       n.Runtime.Name,
+		Model:         n.Runtime.Model,
+		Effort:        n.Runtime.Effort,
+		SessionID:     n.SessionID,
+		CommandDigest: runstate.CommandDigest(c.Name, c.Args),
+		Worktree:      workdir(w, n),
+		RestartSafe:   n.Metadata["restart_safe"] == "true",
+	})
 	if err != nil {
-		failure := fmt.Sprintf("runtime failed: %v: %s %s", err, truncate(stderr.String(), 1000), truncate(stdout.String(), 1000))
-		if e.routeAfterLimit(w, n, failure, stderr.String(), stdout.String()) {
+		return e.fail(w, n, err.Error())
+	}
+	stdout, err := os.OpenFile(stdoutPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return e.fail(w, n, err.Error())
+	}
+	defer stdout.Close()
+	stderr, err := os.OpenFile(stderrPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return e.fail(w, n, err.Error())
+	}
+	defer stderr.Close()
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err = cmd.Start(); err != nil {
+		_ = recorder.Update(func(m *runstate.Manifest) {
+			m.Status, m.Error, m.FinishedAt = "failed", err.Error(), time.Now().UTC()
+		})
+		return e.fail(w, n, err.Error())
+	}
+	_ = recorder.Update(func(m *runstate.Manifest) {
+		m.Status = "running"
+		m.PID = cmd.Process.Pid
+		m.ProcessStartToken = runstate.ProcessStartToken(cmd.Process.Pid)
+	})
+	heartbeatStop := make(chan struct{})
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatStop:
+				return
+			case <-ticker.C:
+				_ = recorder.Update(func(m *runstate.Manifest) {
+					if info, statErr := os.Stat(stdoutPath); statErr == nil {
+						m.EventOffset = info.Size()
+					}
+				})
+			}
+		}
+	}()
+	stopObserve := make(chan struct{})
+	observed := observeRuntimeEvents(stdoutPath, stopObserve, func(sessionID string) {
+		if sessionID == "" || sessionID == n.SessionID {
+			return
+		}
+		_ = recorder.Update(func(m *runstate.Manifest) { m.SessionID = sessionID })
+		_, _ = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, Rationale: "persist runtime session identity before the process exits"})
+	})
+	err = cmd.Wait()
+	close(heartbeatStop)
+	<-heartbeatDone
+	close(stopObserve)
+	<-observed
+	_ = stdout.Sync()
+	_ = stderr.Sync()
+	stdoutBytes, _ := os.ReadFile(stdoutPath)
+	stderrBytes, _ := os.ReadFile(stderrPath)
+	_ = recorder.Update(func(m *runstate.Manifest) {
+		m.FinishedAt = time.Now().UTC()
+		m.EventOffset = int64(len(stdoutBytes))
+		code := 0
+		if err != nil {
+			m.Status, m.Error = "failed", err.Error()
+			code = -1
+			if cmd.ProcessState != nil {
+				code = cmd.ProcessState.ExitCode()
+			}
+		} else {
+			m.Status = "completed"
+		}
+		m.ExitCode = &code
+	})
+	if err != nil {
+		failure := fmt.Sprintf("runtime failed: %v: %s %s", err, truncate(string(stderrBytes), 1000), truncate(string(stdoutBytes), 1000))
+		if e.routeAfterLimit(w, n, failure, string(stderrBytes), string(stdoutBytes)) {
 			return nil
 		}
 		return e.fail(w, n, failure)
 	}
-	b := stdout.Bytes()
+	b := stdoutBytes
 	if data, readErr := os.ReadFile(output); readErr == nil && len(bytes.TrimSpace(data)) > 0 {
 		b = data
 	}
 	result, err := parseResult(b)
 	if err != nil {
-		failure := err.Error() + ": " + truncate(stderr.String(), 1000) + " " + truncate(stdout.String(), 1000)
-		if e.routeAfterLimit(w, n, failure, stderr.String(), stdout.String()) {
+		failure := err.Error() + ": " + truncate(string(stderrBytes), 1000) + " " + truncate(string(stdoutBytes), 1000)
+		if e.routeAfterLimit(w, n, failure, string(stderrBytes), string(stdoutBytes)) {
 			return nil
 		}
 		return e.fail(w, n, failure)
 	}
-	mut := append([]core.Mutation{}, result.Mutations...)
+	return e.applyAgentResult(w, n, result, extractSessionID(stdoutBytes), n.Attempt+1)
+}
+
+func (e *Engine) applyAgentResult(w *core.Workflow, n *core.Node, result Result, streamSessionID string, attempt int) error {
+	mut := make([]core.Mutation, 0, len(result.Mutations)+4)
+	for _, proposed := range result.Mutations {
+		mut = append(mut, proposed.Mutation)
+	}
 	sessionID := result.SessionID
 	if sessionID == "" {
-		sessionID = extractSessionID(stdout.Bytes())
+		sessionID = streamSessionID
 	}
 	if sessionID != "" && sessionID != n.SessionID {
 		mut = append(mut, core.Mutation{Op: "set_session", NodeID: n.ID, Reason: sessionID})
@@ -191,12 +358,56 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	if result.Status == "blocked" {
 		state = core.NodeFailed
 	}
-	mut = append(mut, core.Mutation{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("result-%s-%d", n.ID, n.Attempt+1), NodeID: n.ID, Kind: "agent", Summary: result.Summary}}, core.Mutation{Op: "set_state", NodeID: n.ID, State: state})
-	_, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: n.ID, Mutations: mut, Rationale: result.Summary})
+	mut = append(mut, core.Mutation{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("result-%s-%d", n.ID, attempt), NodeID: n.ID, Kind: "agent", Summary: result.Summary}}, core.Mutation{Op: "set_state", NodeID: n.ID, State: state})
+	_, err := e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: n.ID, Mutations: mut, Rationale: result.Summary})
 	if err != nil {
 		return e.fail(w, n, "runtime proposed an invalid workflow mutation: "+err.Error())
 	}
 	return nil
+}
+
+// observeRuntimeEvents tails a file that the child process writes directly.
+// Direct file descriptors matter: if the supervisor crashes, the child keeps
+// its descriptor and can finish emitting output instead of losing a Go pipe.
+func observeRuntimeEvents(path string, stop <-chan struct{}, onSession func(string)) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f, err := os.Open(path)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		buf := make([]byte, 32<<10)
+		pending := make([]byte, 0, 32<<10)
+		seen := false
+		stopping := false
+		for {
+			n, readErr := f.Read(buf)
+			if n > 0 && !seen {
+				pending = append(pending, buf[:n]...)
+				if id := extractSessionID(pending); id != "" {
+					seen = true
+					onSession(id)
+				}
+			}
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				return
+			}
+			if n > 0 {
+				continue
+			}
+			if stopping {
+				return
+			}
+			select {
+			case <-stop:
+				stopping = true
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}()
+	return done
 }
 
 func (e *Engine) routeAfterLimit(w *core.Workflow, n *core.Node, failure string, rawOutput ...string) bool {
@@ -330,4 +541,4 @@ Task id: %s
 You own how to accomplish and verify this task. Inspect live state, adapt the plan when evidence changes, and propose new nodes or independent verifier work when useful. Do not push, merge, access production, or expand authority. End with one JSON result matching the supplied schema.`, w.Goal, n.Title, n.ID, n.Prompt)
 }
 
-const resultSchema = `{"type":"object","required":["status","summary"],"properties":{"status":{"enum":["completed","continue","blocked","needs_human"]},"summary":{"type":"string"},"session_id":{"type":"string"},"mutations":{"type":"array"},"attestations":{"type":"array"}},"additionalProperties":false}`
+const resultSchema = `{"type":"object","required":["status","summary","session_id","mutations","attestations"],"properties":{"status":{"enum":["completed","continue","blocked","needs_human"]},"summary":{"type":"string"},"session_id":{"type":"string"},"mutations":{"type":"array","description":"Workflow mutations. Each item is a JSON-encoded core Mutation object. Use an empty array when no graph change is needed.","items":{"type":"string"}},"attestations":{"type":"array","items":{"type":"object","required":["verifier","verdict","summary","evidence_ids"],"properties":{"verifier":{"type":"string"},"verdict":{"type":"string"},"summary":{"type":"string"},"evidence_ids":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}}},"additionalProperties":false}`

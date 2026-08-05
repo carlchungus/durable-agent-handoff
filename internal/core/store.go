@@ -13,6 +13,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 )
 
 type Store struct {
@@ -88,14 +90,19 @@ func (s *Store) acquireWorkflowLock(id string) (func(), error) {
 	for {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
-			_, _ = fmt.Fprintf(f, "%d %s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano))
+			owner := struct {
+				PID        int       `json:"pid"`
+				StartToken string    `json:"start_token,omitempty"`
+				CreatedAt  time.Time `json:"created_at"`
+			}{PID: os.Getpid(), StartToken: runstate.ProcessStartToken(os.Getpid()), CreatedAt: time.Now().UTC()}
+			_ = json.NewEncoder(f).Encode(owner)
 			_ = f.Close()
 			return func() { _ = os.Remove(path) }, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
 			return nil, err
 		}
-		if info, statErr := os.Stat(path); statErr == nil && time.Since(info.ModTime()) > time.Minute {
+		if staleWorkflowLock(path) {
 			_ = os.Remove(path)
 			continue
 		}
@@ -104,6 +111,24 @@ func (s *Store) acquireWorkflowLock(id string) (func(), error) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func staleWorkflowLock(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var owner struct {
+		PID        int    `json:"pid"`
+		StartToken string `json:"start_token"`
+	}
+	if json.Unmarshal(b, &owner) == nil && owner.PID > 0 {
+		return !runstate.ProcessMatches(runstate.Manifest{PID: owner.PID, ProcessStartToken: owner.StartToken})
+	}
+	// Backward compatibility for pre-v1 lock files: only age them out because
+	// they did not persist a start token and a recycled PID would be ambiguous.
+	info, statErr := os.Stat(path)
+	return statErr == nil && time.Since(info.ModTime()) > time.Minute
 }
 
 func (s *Store) Load(id string) (*Workflow, error) {

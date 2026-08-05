@@ -4,7 +4,7 @@
 
 The workflow is not a fixed `discover -> plan -> lint -> done` pipeline. Workers can reshape a task graph as evidence changes: add a specialist, replace an obsolete task, request a human, retry after infrastructure failure, or ask an independent agent to verify the result. A small deterministic policy kernel—not the model—retains authority over budgets, workspace boundaries, and PR merging.
 
-> Status: early but functional. The ledger, reducer, adapters, service templates, transcript sanitizer, TUI, and GitHub gates are covered by unit, integration, race, and cross-platform CI. Use disposable branches while evaluating it.
+> Status: early but functional. The ledger, reducer, adapters, service templates, transcript sanitizer, TUI, and GitHub gates are covered by unit, integration, race, and cross-platform CI. The complete high-fidelity Claude workflow compatibility surface is an explicit work in progress; see the [compatibility target](docs/claude-workflows-compatibility.md). Use disposable branches while evaluating it.
 
 ## Why this shape
 

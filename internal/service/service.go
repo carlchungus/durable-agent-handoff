@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,9 +14,10 @@ import (
 
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/engine"
+	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
 )
 
-func Serve(ctx context.Context, store *core.Store, interval time.Duration, workers int, logf func(string, ...any)) error {
+func Serve(ctx context.Context, store *core.Store, prefs *preferences.Manager, interval time.Duration, workers int, logf func(string, ...any)) error {
 	if interval < 100*time.Millisecond {
 		return fmt.Errorf("interval must be at least 100ms")
 	}
@@ -49,8 +51,9 @@ func Serve(ctx context.Context, store *core.Store, interval time.Duration, worke
 			case sem <- struct{}{}:
 				go func(id string) {
 					defer func() { <-sem; mu.Lock(); delete(active, id); mu.Unlock() }()
-					n, err := (&engine.Engine{Store: store}).RunOne(ctx, id)
-					if err != nil && !strings.Contains(err.Error(), "no runnable node") {
+					n, err := (&engine.Engine{Store: store, Preferences: prefs}).RunOne(ctx, id)
+					var cooldown *preferences.CooldownError
+					if err != nil && !strings.Contains(err.Error(), "no runnable node") && !errors.As(err, &cooldown) {
 						logf("workflow=%s error=%v", id, err)
 					} else if n != nil {
 						logf("workflow=%s node=%s runtime=%s", id, n.ID, n.Runtime.Name)

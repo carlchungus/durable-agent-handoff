@@ -1,0 +1,4 @@
+interface:
+  display_name: "Durable Agent Handoff"
+  short_description: "Resume interrupted agent work safely"
+  default_prompt: "Use $durable-agent-handoff to recover interrupted coding-agent work and run it as a bounded observable workflow."

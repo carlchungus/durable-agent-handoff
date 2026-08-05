@@ -30,6 +30,7 @@ An agent ends with one object:
 | `attest` | Record `pass`, `repair`, or `blocked` evaluation | any actor; verifier identity is recorded |
 | `pause` / `resume` | Stop or restart scheduling | human or supervisor only |
 | `set_session` | Persist an exact runtime session ID | supervisor/runtime result |
+| `set_runtime` | Persist an observable ladder selection | supervisor only |
 
 ## Node kinds
 
@@ -38,3 +39,5 @@ An agent ends with one object:
 ## Compatibility
 
 Fields are additive during the `0.x` series. Consumers must ignore unknown JSON fields and must not infer ordering from object keys. Event sequence numbers are the ordering contract.
+
+Provider health is available through `handoff preference health`. Each entry includes the runtime/model key, classified limit type, redacted reason, observation time, and cooldown deadline.

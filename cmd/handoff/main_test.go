@@ -42,3 +42,19 @@ func TestFinalizationRequiresExplicitGate(t *testing.T) {
 		t.Fatal("expected missing gate error")
 	}
 }
+
+func TestPreferenceCLIStoresOrderedLadder(t *testing.T) {
+	state := t.TempDir()
+	var out, errOut bytes.Buffer
+	err := run([]string{"preference", "set", "--state", state, "planner", "--candidate", "claude:opus:xhigh", "--candidate", "codex:gpt-5.6-sol:xhigh"}, &out, &errOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err = run([]string{"preference", "list", "--state", state}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte(`"opus"`)) || !bytes.Contains(out.Bytes(), []byte(`"gpt-5.6-sol"`)) {
+		t.Fatalf("output=%s", out.String())
+	}
+}

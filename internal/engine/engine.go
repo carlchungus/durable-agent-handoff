@@ -9,10 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/finalize"
+	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
 	hruntime "github.com/carlchungus/durable-agent-handoff/internal/runtime"
 )
 
@@ -24,7 +26,10 @@ type Result struct {
 	Attestations []core.Attestation `json:"attestations,omitempty"`
 }
 
-type Engine struct{ Store *core.Store }
+type Engine struct {
+	Store       *core.Store
+	Preferences *preferences.Manager
+}
 
 func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 	w, err := e.Store.Load(id)
@@ -44,6 +49,22 @@ func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 	}
 	if node == nil {
 		return nil, errors.New("no runnable node")
+	}
+	if e.Preferences != nil {
+		routed, index, routeErr := e.Preferences.Resolve(node.Role, node.Runtime)
+		if routeErr != nil {
+			return nil, routeErr
+		}
+		if !reflect.DeepEqual(routed, node.Runtime) || index != node.CandidateIndex {
+			_, err = e.Store.Apply(core.Proposal{WorkflowID: id, Actor: "supervisor", Mutations: []core.Mutation{
+				{Op: "set_runtime", NodeID: node.ID, Runtime: &routed, CandidateIndex: index},
+				{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("route-%s-%d", node.ID, node.Attempt+1), NodeID: node.ID, Kind: "routing", Summary: fmt.Sprintf("selected preference %d: %s", index+1, preferences.Key(routed))}},
+			}})
+			if err != nil {
+				return nil, err
+			}
+			node.Runtime, node.CandidateIndex = routed, index
+		}
 	}
 	if _, err = e.Store.Apply(core.Proposal{WorkflowID: id, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: node.ID, State: core.NodeRunning}}}); err != nil {
 		return nil, err
@@ -124,7 +145,11 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	_ = os.WriteFile(filepath.Join(dir, "events.jsonl"), stdout.Bytes(), 0o600)
 	_ = os.WriteFile(filepath.Join(dir, "stderr.log"), stderr.Bytes(), 0o600)
 	if err != nil {
-		return e.fail(w, n, fmt.Sprintf("runtime failed: %v: %s", err, truncate(stderr.String(), 500)))
+		failure := fmt.Sprintf("runtime failed: %v: %s %s", err, truncate(stderr.String(), 1000), truncate(stdout.String(), 1000))
+		if e.routeAfterLimit(w, n, failure) {
+			return nil
+		}
+		return e.fail(w, n, failure)
 	}
 	b := stdout.Bytes()
 	if data, readErr := os.ReadFile(output); readErr == nil && len(bytes.TrimSpace(data)) > 0 {
@@ -132,7 +157,11 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	}
 	result, err := parseResult(b)
 	if err != nil {
-		return e.fail(w, n, err.Error())
+		failure := err.Error() + ": " + truncate(stderr.String(), 1000) + " " + truncate(stdout.String(), 1000)
+		if e.routeAfterLimit(w, n, failure) {
+			return nil
+		}
+		return e.fail(w, n, failure)
 	}
 	mut := append([]core.Mutation{}, result.Mutations...)
 	sessionID := result.SessionID
@@ -168,6 +197,29 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		return e.fail(w, n, "runtime proposed an invalid workflow mutation: "+err.Error())
 	}
 	return nil
+}
+
+func (e *Engine) routeAfterLimit(w *core.Workflow, n *core.Node, failure string) bool {
+	if e.Preferences == nil || n.Role == "" {
+		return false
+	}
+	class := preferences.ClassifyFailure(failure)
+	if class == "runtime_error" {
+		return false
+	}
+	if e.Preferences.Record(n.Runtime, class, failure) != nil {
+		return false
+	}
+	next, index, routeErr := e.Preferences.Resolve(n.Role, n.Runtime)
+	mutations := []core.Mutation{
+		{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("limit-%s-%d", n.ID, n.Attempt+1), NodeID: n.ID, Kind: "provider_limit", Summary: fmt.Sprintf("%s hit %s; %s", preferences.Key(n.Runtime), class, truncate(failure, 500))}},
+		{Op: "set_state", NodeID: n.ID, State: core.NodeReady},
+	}
+	if routeErr == nil {
+		mutations = append([]core.Mutation{{Op: "set_runtime", NodeID: n.ID, Runtime: &next, CandidateIndex: index}}, mutations...)
+	}
+	_, err := e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: mutations, Rationale: "observable preference-ladder fallback"})
+	return err == nil
 }
 
 func (e *Engine) fail(w *core.Workflow, n *core.Node, reason string) error {

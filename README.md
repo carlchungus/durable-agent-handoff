@@ -51,6 +51,25 @@ handoff start --goal "review this narrow fix" --runtime pi \
 
 Pi and OhMyPi do not provide an OS sandbox. Use a dedicated worktree and narrowly scoped credentials.
 
+## Role-specific model ladders
+
+Define ordered candidates once, then assign a role to any node. Fallback happens only for recognized usage/quota or rate-limit failures; auth failures, test failures, invalid models, and ordinary runtime errors do not silently switch providers.
+
+```sh
+handoff preference set planner \
+  --candidate claude:opus:xhigh \
+  --candidate codex:gpt-5.6-sol:xhigh \
+  --candidate pi:openrouter/moonshotai/kimi-latest:xhigh
+
+handoff start --goal "study the design and propose a plan" --role planner
+handoff preference list
+handoff preference health
+```
+
+When a limit is observed, `handoff` records the provider/model cooldown durably, appends routing evidence to the workflow, and selects the next healthy candidate. Usage-limit cooldowns default to one hour; transient rate limits default to five minutes. If every candidate is cooling down, the node remains ready and the scheduler waits rather than treating the work as failed. Reset observed health explicitly with `handoff preference reset [runtime/model]`.
+
+Claude's own headless `--fallback-model` can still be useful within Claude for overload, but the external ladder is what crosses harness and billing boundaries. Model names are deliberately not hardcoded; inspect the live runtime catalog (for example, `pi --list-models kimi`) before choosing aliases.
+
 ## Recover stopped Claude Code work
 
 Discovery reads only recent local transcripts and emits sanitized text metadata. Tool inputs and outputs are skipped.
@@ -164,6 +183,7 @@ Adapters emit a common result object. The supervisor stores exact session IDs an
 - Cross-process writes use a per-workflow lease; rejected proposals are recorded but cannot partially mutate state.
 - A resident scheduler is not proof of health. Node state, events, evidence, attempts, session IDs, and attestations remain observable.
 - Agents may mutate workflow shape, but not budgets, roots, pause state, or merge authority.
+- Provider fallback follows user-authored role ladders and is recorded as evidence; it is never an invisible substitution.
 - Completion can require a separate attestation. Deterministic checks and GitHub state remain authoritative over model claims.
 - Transcript imports redact common credential forms and omit tool payloads. They still require live-checkout revalidation.
 

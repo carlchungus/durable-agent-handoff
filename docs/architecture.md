@@ -61,6 +61,12 @@ $HANDOFF_HOME/workflows/WF_ID/
 
 The scheduler does not infer health from a PID. The observable contract is state plus events, evidence, attempt count, and persisted session ID.
 
+## Routing and usage limits
+
+Role-specific preference ladders are stored outside individual workflows. Before a node starts, the supervisor selects the first candidate without an active cooldown. A recognized quota/usage-limit or rate-limit failure records provider health, returns the node to `ready`, persists the next runtime choice, and appends evidence. Ordinary runtime, auth, model-name, code, and test failures stay on the normal failure path.
+
+Cooldown state is durable across scheduler restarts. When every candidate is cooling down, resolution returns the earliest wake time and no worker is launched. The model never decides that its provider is exhausted and never edits provider health directly.
+
 ## Trust boundaries
 
 1. Transcript discovery is read-only and text-only. It redacts common credentials and classifies obvious high-risk work.

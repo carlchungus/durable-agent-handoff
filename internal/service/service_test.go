@@ -41,12 +41,12 @@ func TestServeStopsOnContext(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if err = Serve(ctx, st, 10*time.Millisecond, 1, func(string, ...any) {}); err == nil || !strings.Contains(err.Error(), "at least 100ms") {
+	if err = Serve(ctx, st, nil, 10*time.Millisecond, 1, func(string, ...any) {}); err == nil || !strings.Contains(err.Error(), "at least 100ms") {
 		t.Fatalf("expected interval validation, got %v", err)
 	}
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel2()
-	if err = Serve(ctx2, st, 100*time.Millisecond, 1, func(string, ...any) {}); err != nil {
+	if err = Serve(ctx2, st, nil, 100*time.Millisecond, 1, func(string, ...any) {}); err != nil {
 		t.Fatal(err)
 	}
 }

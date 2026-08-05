@@ -20,6 +20,7 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/discovery"
 	"github.com/carlchungus/durable-agent-handoff/internal/engine"
 	"github.com/carlchungus/durable-agent-handoff/internal/githubgate"
+	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
 	"github.com/carlchungus/durable-agent-handoff/internal/runtime"
 	"github.com/carlchungus/durable-agent-handoff/internal/service"
 	"github.com/carlchungus/durable-agent-handoff/internal/tui"
@@ -64,6 +65,8 @@ func run(args []string, out, errOut io.Writer) error {
 		return runTUI(args[1:], out)
 	case "doctor":
 		return cmdDoctor(args[1:], out)
+	case "preference":
+		return cmdPreference(args[1:], out)
 	case "discover":
 		return cmdDiscover(args[1:], out)
 	case "import":
@@ -116,6 +119,7 @@ func cmdCreate(args []string, out io.Writer, seed bool) error {
 	runtimeName := fs.String("runtime", "codex", "codex, claude, pi, ohmypi, or exec")
 	model := fs.String("model", "", "runtime model")
 	effort := fs.String("effort", "xhigh", "reasoning effort")
+	role := fs.String("role", "", "preference-ladder role, for example planner or verifier")
 	finalizeRepo := fs.String("finalize-repo", "", "authorize deterministic PR creation and merge in OWNER/REPO")
 	var mergeGates stringList
 	fs.Var(&mergeGates, "merge-gate", "exact required check name; repeatable")
@@ -132,7 +136,7 @@ func cmdCreate(args []string, out io.Writer, seed bool) error {
 		return err
 	}
 	if seed {
-		n := &core.Node{ID: "lead", Title: "Own the goal and dynamically adapt the workflow", Kind: "agent", Prompt: "Discover the live state, decide the smallest safe next action, implement it, and add independent verification or follow-up nodes when evidence warrants it.", Runtime: core.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort}}
+		n := &core.Node{ID: "lead", Title: "Own the goal and dynamically adapt the workflow", Kind: "agent", Role: *role, Prompt: "Discover the live state, decide the smallest safe next action, implement it, and add independent verification or follow-up nodes when evidence warrants it.", Runtime: core.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort}}
 		mutations := []core.Mutation{{Op: "add_node", Node: n}}
 		if *finalizeRepo != "" {
 			if len(mergeGates) == 0 {
@@ -267,7 +271,7 @@ func cmdRun(args []string, out io.Writer) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	eng := engine.Engine{Store: st}
+	eng := engine.Engine{Store: st, Preferences: preferences.Open(st.Dir())}
 	for {
 		n, err := eng.RunOne(ctx, fs.Arg(0))
 		if err != nil {
@@ -304,7 +308,7 @@ func cmdServe(args []string, out io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	fmt.Fprintf(out, "handoff scheduler · state=%s · workers=%d\n", st.Dir(), *workers)
-	return service.Serve(ctx, st, *interval, *workers, func(format string, v ...any) { fmt.Fprintf(out, time.Now().Format("15:04:05 ")+format+"\n", v...) })
+	return service.Serve(ctx, st, preferences.Open(st.Dir()), *interval, *workers, func(format string, v ...any) { fmt.Fprintf(out, time.Now().Format("15:04:05 ")+format+"\n", v...) })
 }
 func cmdService(args []string, out io.Writer) error {
 	if len(args) == 0 || args[0] != "install" {
@@ -382,6 +386,80 @@ func cmdDoctor(args []string, out io.Writer) error {
 	}
 	_ = runtime.Available
 	return nil
+}
+func cmdPreference(args []string, out io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: handoff preference set|list|health|reset")
+	}
+	switch args[0] {
+	case "set":
+		fs := flag.NewFlagSet("preference set", flag.ContinueOnError)
+		s := common(fs)
+		var values stringList
+		fs.Var(&values, "candidate", "runtime:model[:effort], repeat in preference order")
+		if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true, "--candidate": true})); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return errors.New("preference set requires a role")
+		}
+		candidates := make([]core.RuntimeSpec, 0, len(values))
+		for _, value := range values {
+			parts := strings.SplitN(value, ":", 3)
+			if len(parts) < 2 {
+				return fmt.Errorf("invalid candidate %q; expected runtime:model[:effort]", value)
+			}
+			effort := "xhigh"
+			if len(parts) == 3 {
+				effort = parts[2]
+			}
+			candidates = append(candidates, core.RuntimeSpec{Name: parts[0], Model: parts[1], Effort: effort})
+		}
+		mgr := preferences.Open(stateDir(*s))
+		if err := mgr.Set(fs.Arg(0), candidates); err != nil {
+			return err
+		}
+		cfg, err := mgr.Config()
+		if err != nil {
+			return err
+		}
+		return writeJSON(out, map[string]any{"role": fs.Arg(0), "candidates": cfg.Ladders[fs.Arg(0)]})
+	case "list":
+		fs := flag.NewFlagSet("preference list", flag.ContinueOnError)
+		s := common(fs)
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		cfg, err := preferences.Open(stateDir(*s)).Config()
+		if err != nil {
+			return err
+		}
+		return writeJSON(out, cfg)
+	case "health":
+		fs := flag.NewFlagSet("preference health", flag.ContinueOnError)
+		s := common(fs)
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		health, err := preferences.Open(stateDir(*s)).Health()
+		if err != nil {
+			return err
+		}
+		return writeJSON(out, health)
+	case "reset":
+		fs := flag.NewFlagSet("preference reset", flag.ContinueOnError)
+		s := common(fs)
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		key := ""
+		if fs.NArg() > 0 {
+			key = fs.Arg(0)
+		}
+		return preferences.Open(stateDir(*s)).Reset(key)
+	default:
+		return fmt.Errorf("unknown preference command %q", args[0])
+	}
 }
 func cmdDiscover(args []string, out io.Writer) error {
 	if len(args) == 0 || args[0] != "claude" {
@@ -554,6 +632,8 @@ Usage:
   handoff events WORKFLOW_ID [--follow]
   handoff tui
   handoff doctor [--json]
+  handoff preference set ROLE --candidate runtime:model[:effort] [...]
+  handoff preference list | health | reset
   handoff discover claude [--since 8h] [--json]
   handoff import claude --session ID [--runtime codex]
   handoff github merge --repo OWNER/REPO --pr N --gate EXACT_NAME

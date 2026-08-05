@@ -47,20 +47,22 @@ type RuntimeSpec struct {
 }
 
 type Node struct {
-	ID          string            `json:"id"`
-	Title       string            `json:"title"`
-	Kind        string            `json:"kind"`
-	State       NodeState         `json:"state"`
-	DependsOn   []string          `json:"depends_on,omitempty"`
-	Prompt      string            `json:"prompt,omitempty"`
-	Worktree    string            `json:"worktree,omitempty"`
-	Runtime     RuntimeSpec       `json:"runtime,omitempty"`
-	SessionID   string            `json:"session_id,omitempty"`
-	Attempt     int               `json:"attempt"`
-	MaxAttempts int               `json:"max_attempts"`
-	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
+	ID             string            `json:"id"`
+	Title          string            `json:"title"`
+	Kind           string            `json:"kind"`
+	State          NodeState         `json:"state"`
+	DependsOn      []string          `json:"depends_on,omitempty"`
+	Prompt         string            `json:"prompt,omitempty"`
+	Worktree       string            `json:"worktree,omitempty"`
+	Runtime        RuntimeSpec       `json:"runtime,omitempty"`
+	Role           string            `json:"role,omitempty"`
+	CandidateIndex int               `json:"candidate_index,omitempty"`
+	SessionID      string            `json:"session_id,omitempty"`
+	Attempt        int               `json:"attempt"`
+	MaxAttempts    int               `json:"max_attempts"`
+	CreatedAt      time.Time         `json:"created_at"`
+	UpdatedAt      time.Time         `json:"updated_at"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
 }
 
 type Evidence struct {
@@ -100,14 +102,16 @@ type Workflow struct {
 }
 
 type Mutation struct {
-	Op          string       `json:"op"`
-	Node        *Node        `json:"node,omitempty"`
-	NodeID      string       `json:"node_id,omitempty"`
-	DependsOn   []string     `json:"depends_on,omitempty"`
-	State       NodeState    `json:"state,omitempty"`
-	Reason      string       `json:"reason,omitempty"`
-	Evidence    *Evidence    `json:"evidence,omitempty"`
-	Attestation *Attestation `json:"attestation,omitempty"`
+	Op             string       `json:"op"`
+	Node           *Node        `json:"node,omitempty"`
+	NodeID         string       `json:"node_id,omitempty"`
+	DependsOn      []string     `json:"depends_on,omitempty"`
+	State          NodeState    `json:"state,omitempty"`
+	Reason         string       `json:"reason,omitempty"`
+	Evidence       *Evidence    `json:"evidence,omitempty"`
+	Attestation    *Attestation `json:"attestation,omitempty"`
+	Runtime        *RuntimeSpec `json:"runtime,omitempty"`
+	CandidateIndex int          `json:"candidate_index,omitempty"`
 }
 
 type Proposal struct {

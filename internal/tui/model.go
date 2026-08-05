@@ -11,6 +11,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/engine"
+	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
 )
 
 type tickMsg time.Time
@@ -154,7 +155,7 @@ func (m Model) render() string {
 func (m Model) runSelected() tea.Cmd {
 	id := m.workflows[m.cursor].ID
 	return func() tea.Msg {
-		_, err := (&engine.Engine{Store: m.store}).RunOne(context.Background(), id)
+		_, err := (&engine.Engine{Store: m.store, Preferences: preferences.Open(m.store.Dir())}).RunOne(context.Background(), id)
 		return runMsg{err}
 	}
 }
@@ -209,6 +210,9 @@ func (m Model) detail(width int) string {
 		runtime := ""
 		if n.Runtime.Name != "" {
 			runtime = "  " + n.Runtime.Name + "/" + fallback(n.Runtime.Model, "default")
+			if n.Role != "" {
+				runtime += fmt.Sprintf(" [%s #%d]", n.Role, n.CandidateIndex+1)
+			}
 		}
 		lines = append(lines, fmt.Sprintf(" %s %-18s %s%s", nodeGlyph(n.State), truncate(n.Title, 18), lipgloss.NewStyle().Foreground(muted).Render(string(n.State)+runtime), lipgloss.NewStyle().Foreground(muted).Render(deps)))
 	}

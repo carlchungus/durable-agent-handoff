@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -32,6 +33,26 @@ func TestResultSchemaDefinesArrayItems(t *testing.T) {
 		if property.Type != "array" || len(property.Items) == 0 {
 			t.Fatalf("%s must define array items: %s", name, resultSchema)
 		}
+	}
+}
+
+func TestResultSchemaConstrainsVerifierVerdicts(t *testing.T) {
+	var schema struct {
+		Properties map[string]struct {
+			Items struct {
+				Properties map[string]struct {
+					Enum []string `json:"enum"`
+				} `json:"properties"`
+			} `json:"items"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(resultSchema), &schema); err != nil {
+		t.Fatal(err)
+	}
+	got := schema.Properties["attestations"].Items.Properties["verdict"].Enum
+	want := []string{"pass", "repair", "blocked", "pass_with_limit", "pass_with_runtime_limit", "fail_blocking"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("verdict enum=%v, want %v", got, want)
 	}
 }
 
@@ -105,6 +126,118 @@ func TestApplyResultPrefersRuntimeSessionAndNormalizesLimitedAttestation(t *test
 	}
 	if got.Nodes["verify"].Runtime.Name != "codex" || got.Attestations[0].Verdict != "repair" {
 		t.Fatalf("verify=%+v attestations=%+v", got.Nodes["verify"], got.Attestations)
+	}
+}
+
+func runningVerifierWorkflow(t *testing.T, runtimeName string) (*core.Store, *core.Workflow) {
+	t.Helper()
+	st, err := core.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := st.Create("verify safely", t.TempDir(), core.DefaultBudget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := &core.Node{ID: "verify", Title: "verify", Kind: "agent", Runtime: core.RuntimeSpec{Name: runtimeName, Sandbox: "read-only"}, MaxAttempts: 1}
+	w, err = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "verify", State: core.NodeRunning}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st, w
+}
+
+func TestApplyResultNormalizesBlockingAttestationAndPreservesRawEvidence(t *testing.T) {
+	st, w := runningVerifierWorkflow(t, "codex")
+
+	result := Result{
+		Status:  "completed",
+		Summary: "unsafe to merge",
+		Attestations: []core.Attestation{{
+			Verifier:    "fresh-reviewer",
+			Verdict:     "fail_blocking",
+			Summary:     "tenant boundary is not enforced",
+			EvidenceIDs: []string{"test-output", "diff-review"},
+		}},
+	}
+	if err := (&Engine{Store: st}).applyAgentResult(w, w.Nodes["verify"], result, "", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := st.Load(w.ID)
+	if got.Nodes["verify"].State != core.NodeCompleted || len(got.Attestations) != 1 {
+		t.Fatalf("node=%+v attestations=%+v evidence=%+v", got.Nodes["verify"], got.Attestations, got.Evidence)
+	}
+	attestationJSON, err := json.Marshal(got.Attestations[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"verdict":"blocked"`, `"raw_verdict":"fail_blocking"`, `"summary":"tenant boundary is not enforced"`, `"evidence_ids":["test-output","diff-review"]`} {
+		if !strings.Contains(string(attestationJSON), want) {
+			t.Fatalf("attestation lost %s: %s", want, attestationJSON)
+		}
+	}
+}
+
+func TestApplyResultTreatsLimitedPassAsRepair(t *testing.T) {
+	st, w := runningVerifierWorkflow(t, "codex")
+
+	result := Result{Status: "completed", Summary: "verification was incomplete", Attestations: []core.Attestation{{
+		Verifier: "fresh-reviewer", Verdict: "pass_with_limit", Summary: "unit tests passed but the required browser check could not run", EvidenceIDs: []string{"unit-tests"},
+	}}}
+	if err := (&Engine{Store: st}).applyAgentResult(w, w.Nodes["verify"], result, "", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := st.Load(w.ID)
+	if len(got.Attestations) != 1 {
+		t.Fatalf("attestations=%+v evidence=%+v", got.Attestations, got.Evidence)
+	}
+	a := got.Attestations[0]
+	if a.Verdict != "repair" || a.RawVerdict != "pass_with_limit" || a.Summary != "unit tests passed but the required browser check could not run" || len(a.EvidenceIDs) != 1 || a.EvidenceIDs[0] != "unit-tests" {
+		t.Fatalf("attestation=%+v", a)
+	}
+	if got.Status == core.WorkflowCompleted {
+		t.Fatalf("qualified pass must not satisfy the merge attestation gate: workflow=%s", got.Status)
+	}
+}
+
+func TestApplyResultRejectsUnknownSemanticAttestation(t *testing.T) {
+	st, w := runningVerifierWorkflow(t, "exec")
+
+	result := Result{Status: "completed", Summary: "invented a favorable verdict", Attestations: []core.Attestation{{
+		Verifier: "fresh-reviewer", Verdict: "pass_probably", Summary: "not a recognized attestation",
+	}}}
+	if err := (&Engine{Store: st}).applyAgentResult(w, w.Nodes["verify"], result, "", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := st.Load(w.ID)
+	if got.Nodes["verify"].State != core.NodeFailed || len(got.Attestations) != 0 || got.Status == core.WorkflowCompleted {
+		t.Fatalf("unknown verdict escaped fail-closed handling: node=%+v workflow=%s attestations=%+v", got.Nodes["verify"], got.Status, got.Attestations)
+	}
+	if len(got.Evidence) == 0 || !strings.Contains(got.Evidence[len(got.Evidence)-1].Summary, "attestation verdict must be pass, repair, or blocked") {
+		t.Fatalf("rejection evidence=%+v", got.Evidence)
+	}
+}
+
+func TestApplyResultDoesNotTrustRuntimeAuthoredRawVerdict(t *testing.T) {
+	st, w := runningVerifierWorkflow(t, "exec")
+
+	result := Result{Status: "completed", Summary: "canonical pass", Attestations: []core.Attestation{{
+		Verifier: "fresh-reviewer", Verdict: "pass", RawVerdict: "fail_blocking", Summary: "canonical source verdict is authoritative",
+	}}}
+	if err := (&Engine{Store: st}).applyAgentResult(w, w.Nodes["verify"], result, "", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := st.Load(w.ID)
+	if len(got.Attestations) != 1 || got.Attestations[0].Verdict != "pass" || got.Attestations[0].RawVerdict != "" {
+		t.Fatalf("runtime supplied derived provenance: %+v", got.Attestations)
 	}
 }
 

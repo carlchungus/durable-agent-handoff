@@ -81,6 +81,7 @@ type Attestation struct {
 	NodeID      string    `json:"node_id"`
 	Verifier    string    `json:"verifier"`
 	Verdict     string    `json:"verdict"`
+	RawVerdict  string    `json:"raw_verdict,omitempty"`
 	Summary     string    `json:"summary"`
 	EvidenceIDs []string  `json:"evidence_ids,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`

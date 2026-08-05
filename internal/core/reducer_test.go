@@ -100,3 +100,20 @@ func TestCompletionWaitsForAttestation(t *testing.T) {
 		t.Fatalf("status=%s", w.Status)
 	}
 }
+
+func TestAttestationRejectsContradictoryRawVerdictAtomically(t *testing.T) {
+	w := fixtureWorkflow(t)
+	if err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []Mutation{{Op: "add_node", Node: &Node{ID: "verify", Title: "verify", Kind: "agent"}}}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "verify", Mutations: []Mutation{{Op: "attest", Attestation: &Attestation{
+		ID: "forged", NodeID: "verify", Verifier: "verify", Verdict: "pass", RawVerdict: "fail_blocking", Summary: "contradictory provenance",
+	}}}}, time.Now().UTC())
+	if err == nil || !strings.Contains(err.Error(), "raw attestation verdict") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(w.Attestations) != 0 {
+		t.Fatalf("rejected attestation mutated workflow: %+v", w.Attestations)
+	}
+}

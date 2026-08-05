@@ -32,6 +32,8 @@ transcript / prompt / event
 
 Workers decide how to pursue the goal. They may add nodes, dependencies, evidence, or attestations; supersede obsolete work; retry; or request human input. They cannot alter the root, budgets, pause state, or finalization authority.
 
+Verifier language is normalized only at the runtime protocol boundary. The ledger stores a three-state canonical verdict for policy and, when normalization was required, the exact source verdict for auditability. Qualified passes remain non-passing, blocking failures remain blocked, and unrecognized semantics fail closed.
+
 ## Why there are no mandatory phases
 
 Discovery, planning, implementation, and evaluation are useful roles, but they are not globally correct states. A tiny fix may inspect, edit, and verify in one agent turn. An uncertain incident may create several read-only discovery nodes before any plan exists. An evaluator may find a different root cause and supersede the current implementation.

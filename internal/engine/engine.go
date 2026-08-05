@@ -440,10 +440,7 @@ func (e *Engine) applyAgentResult(w *core.Workflow, n *core.Node, result Result,
 		mut = append(mut, core.Mutation{Op: "set_session", NodeID: n.ID, Reason: sessionID})
 	}
 	for i := range result.Attestations {
-		a := result.Attestations[i]
-		if a.Verdict == "pass_with_runtime_limit" {
-			a.Verdict = "repair"
-		}
+		a := normalizeAttestation(result.Attestations[i])
 		if a.NodeID == "" {
 			a.NodeID = n.ID
 		}
@@ -468,6 +465,20 @@ func (e *Engine) applyAgentResult(w *core.Workflow, n *core.Node, result Result,
 		return e.fail(w, n, "runtime proposed an invalid workflow mutation: "+err.Error())
 	}
 	return nil
+}
+
+func normalizeAttestation(a core.Attestation) core.Attestation {
+	sourceVerdict := a.Verdict
+	a.RawVerdict = ""
+	switch sourceVerdict {
+	case "fail_blocking":
+		a.RawVerdict = sourceVerdict
+		a.Verdict = "blocked"
+	case "pass_with_limit", "pass_with_runtime_limit":
+		a.RawVerdict = sourceVerdict
+		a.Verdict = "repair"
+	}
+	return a
 }
 
 // observeRuntimeEvents tails a file that the child process writes directly.
@@ -646,4 +657,4 @@ Task id: %s
 You own how to accomplish and verify this task. Inspect live state, adapt the plan when evidence changes, and propose new nodes or independent verifier work when useful. Do not push, merge, access production, or expand authority. End with one JSON result matching the supplied schema.`, w.Goal, n.Title, n.ID, n.Prompt)
 }
 
-const resultSchema = `{"type":"object","required":["status","summary","session_id","mutations","attestations"],"properties":{"status":{"enum":["completed","continue","blocked","needs_human"]},"summary":{"type":"string"},"session_id":{"type":"string"},"mutations":{"type":"array","description":"Workflow mutations. Each item is a JSON-encoded core Mutation object. Use an empty array when no graph change is needed.","items":{"type":"string"}},"attestations":{"type":"array","items":{"type":"object","required":["verifier","verdict","summary","evidence_ids"],"properties":{"verifier":{"type":"string"},"verdict":{"type":"string"},"summary":{"type":"string"},"evidence_ids":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}}},"additionalProperties":false}`
+const resultSchema = `{"type":"object","required":["status","summary","session_id","mutations","attestations"],"properties":{"status":{"enum":["completed","continue","blocked","needs_human"]},"summary":{"type":"string"},"session_id":{"type":"string"},"mutations":{"type":"array","description":"Workflow mutations. Each item is a JSON-encoded core Mutation object. Use an empty array when no graph change is needed.","items":{"type":"string"}},"attestations":{"type":"array","items":{"type":"object","required":["verifier","verdict","summary","evidence_ids"],"properties":{"verifier":{"type":"string"},"verdict":{"enum":["pass","repair","blocked","pass_with_limit","pass_with_runtime_limit","fail_blocking"]},"summary":{"type":"string"},"evidence_ids":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}}},"additionalProperties":false}`

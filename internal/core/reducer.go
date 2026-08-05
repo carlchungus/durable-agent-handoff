@@ -127,13 +127,34 @@ func validateMutation(w *Workflow, actor string, m Mutation) error {
 		if m.Attestation == nil || w.Nodes[m.Attestation.NodeID] == nil {
 			return errors.New("attestation requires an existing node")
 		}
-		if m.Attestation.Verdict != "pass" && m.Attestation.Verdict != "repair" && m.Attestation.Verdict != "blocked" {
-			return errors.New("attestation verdict must be pass, repair, or blocked")
+		if err := validateAttestationVerdict(m.Attestation); err != nil {
+			return err
 		}
 	default:
 		return fmt.Errorf("unknown mutation %q", m.Op)
 	}
 	return nil
+}
+
+func validateAttestationVerdict(a *Attestation) error {
+	if a.Verdict != "pass" && a.Verdict != "repair" && a.Verdict != "blocked" {
+		return errors.New("attestation verdict must be pass, repair, or blocked")
+	}
+	switch a.RawVerdict {
+	case "":
+		return nil
+	case "fail_blocking":
+		if a.Verdict == "blocked" {
+			return nil
+		}
+	case "pass_with_limit", "pass_with_runtime_limit":
+		if a.Verdict == "repair" {
+			return nil
+		}
+	default:
+		return fmt.Errorf("unknown raw attestation verdict %q", a.RawVerdict)
+	}
+	return fmt.Errorf("raw attestation verdict %q contradicts canonical verdict %q", a.RawVerdict, a.Verdict)
 }
 
 func validateWorktree(root, worktree string) error {

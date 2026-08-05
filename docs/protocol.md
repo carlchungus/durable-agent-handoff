@@ -18,6 +18,8 @@ An agent ends with one object:
 
 `status` is one of `completed`, `continue`, `blocked`, or `needs_human`. `continue` makes the same node ready and resumes the exact stored runtime session. Mutations are applied atomically after policy validation.
 
+Verifier results use an exact source-verdict allowlist. `pass`, `repair`, and `blocked` remain canonical. `fail_blocking` is stored as `blocked`; `pass_with_limit` and `pass_with_runtime_limit` are stored as `repair`, so a qualified pass cannot satisfy a merge gate. A normalized attestation retains the original source value in `raw_verdict` along with its summary and evidence IDs. Unknown verdicts and contradictory canonical/raw pairs reject the proposal atomically.
+
 ## Mutations
 
 | Operation | Purpose | Authority |

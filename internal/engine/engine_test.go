@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
+	"github.com/carlchungus/durable-agent-handoff/internal/finalize"
 	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 )
 
@@ -31,6 +32,19 @@ func TestResultSchemaDefinesArrayItems(t *testing.T) {
 		if property.Type != "array" || len(property.Items) == 0 {
 			t.Fatalf("%s must define array items: %s", name, resultSchema)
 		}
+	}
+}
+
+func TestDiffBudgetStopsFurtherAutonomy(t *testing.T) {
+	budget := core.DefaultBudget()
+	if exceedsDiffBudget(budget, finalize.DiffStats{Files: budget.MaxChangedFiles, Lines: budget.MaxDiffLines}) {
+		t.Fatal("the exact authorized budget should be allowed")
+	}
+	if !exceedsDiffBudget(budget, finalize.DiffStats{Files: budget.MaxChangedFiles + 1}) {
+		t.Fatal("changed-file overflow must stop autonomy")
+	}
+	if !exceedsDiffBudget(budget, finalize.DiffStats{Lines: budget.MaxDiffLines + 1}) {
+		t.Fatal("diff-line overflow must stop autonomy")
 	}
 }
 

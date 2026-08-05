@@ -379,7 +379,20 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		}
 		return e.fail(w, n, failure)
 	}
+	stats, inspectErr := finalize.InspectDiff(ctx, finalize.ExecRunner{Dir: workdir(w, n)}, workdir(w, n))
+	if inspectErr == nil && exceedsDiffBudget(w.Budget, stats) {
+		summary := fmt.Sprintf("worker stopped at deterministic diff budget: %d files / %d lines exceeds %d files / %d lines; result: %s", stats.Files, stats.Lines, w.Budget.MaxChangedFiles, w.Budget.MaxDiffLines, truncate(result.Summary, 1000))
+		_, applyErr := e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{
+			{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("budget-%s-%d", n.ID, n.Attempt+1), NodeID: n.ID, Kind: "budget", Summary: summary}},
+			{Op: "set_state", NodeID: n.ID, State: core.NodeWaiting},
+		}, Rationale: "deterministic changed-file and diff-line budget"})
+		return applyErr
+	}
 	return e.applyAgentResult(w, n, result, extractSessionID(stdoutBytes), n.Attempt+1)
+}
+
+func exceedsDiffBudget(budget core.Budget, stats finalize.DiffStats) bool {
+	return stats.Files > budget.MaxChangedFiles || stats.Lines > budget.MaxDiffLines
 }
 
 func (e *Engine) applyAgentResult(w *core.Workflow, n *core.Node, result Result, streamSessionID string, attempt int) error {

@@ -1,6 +1,6 @@
 //go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
 
-package session
+package secureledger
 
 import (
 	"errors"
@@ -10,9 +10,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-type unixSessionFileLock struct {
-	file *os.File
-}
+type unixFileLock struct{ file *os.File }
 
 type storageIdentity struct {
 	device uint64
@@ -29,11 +27,9 @@ func identifyStorageFile(file *os.File) (storageIdentity, error) {
 
 func sameStorageIdentity(left, right storageIdentity) bool { return left == right }
 
-func newPlatformFileLock(file *os.File) sessionFileLock {
-	return &unixSessionFileLock{file: file}
-}
+func newPlatformFileLock(file *os.File) fileLock { return &unixFileLock{file: file} }
 
-func (l *unixSessionFileLock) TryLock() (bool, error) {
+func (l *unixFileLock) TryLock() (bool, error) {
 	err := unix.Flock(int(l.file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 	if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
 		return false, nil
@@ -41,9 +37,7 @@ func (l *unixSessionFileLock) TryLock() (bool, error) {
 	return err == nil, err
 }
 
-func (l *unixSessionFileLock) Unlock() error {
-	return unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
-}
+func (l *unixFileLock) Unlock() error { return unix.Flock(int(l.file.Fd()), unix.LOCK_UN) }
 
 func validateRegularFile(file *os.File) error {
 	var info unix.Stat_t

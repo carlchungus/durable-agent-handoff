@@ -41,3 +41,9 @@ An agent ends with one object:
 Fields are additive during the `0.x` series. Consumers must ignore unknown JSON fields and must not infer ordering from object keys. Event sequence numbers are the ordering contract.
 
 Provider health is available through `handoff preference health`. Each entry includes the runtime/model key, classified limit type, redacted reason, observation time, and cooldown deadline.
+
+## Team protocol
+
+`handoff team apply TEAM_ID` accepts one JSON command on stdin. Commands are `add_member`, `set_member_state`, `set_process`, `add_task`, `claim_task`, `renew_claim`, `complete_task`, `fail_task`, `send_message`, `submit_plan`, `review_plan`, `request_shutdown`, and `respond_shutdown`.
+
+Claims are fenced. A worker must include the exact `claim_generation` returned by `claim_task` when renewing or completing work. Expired claims may be acquired by another member, which increments the generation and prevents the former process from committing a stale completion. `handoff team inbox TEAM_ID --member MEMBER --after SEQUENCE` is a cursor-based machine-readable mailbox.

@@ -94,3 +94,7 @@ Claude runs in safe mode with an empty strict MCP configuration. This intentiona
 The node `kind` field is data rather than a Go enum. A future handler registry can add issue trackers, deployment observers, browser evaluators, or remote harnesses without changing graph semantics. Unknown kinds stay visible and non-runnable instead of being guessed.
 
 Likewise, discovery is source-specific. Claude Code is the first source; Codex and Pi transcript importers can implement the same sanitized record contract.
+
+## Team coordination
+
+Teams use a separate append-only ledger rather than encoding peers as workflow nodes. Logical members outlive runtime sessions. Member and process state are orthogonal, task claims use expiring fencing generations, and plan approval and cooperative shutdown are explicit messages and state transitions. This preserves the observable peer-coordination contract while allowing a Claude member to resume as Codex or Pi after a provider limit or crash.

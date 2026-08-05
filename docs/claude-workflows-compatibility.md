@@ -10,10 +10,10 @@ Status: **done**, **partial**, **planned**.
 | --- | --- | --- | --- |
 | Sessions | continuously saved conversations; name, list, resume exact ID, continue, branch/fork, import/export, retention | durable session record, exact adapter session ID, named branch lineage, transcript locator/export, configurable retention | partial |
 | Background agent view | dispatch full sessions; group by needs-input/working/completed; animated liveness; peek, reply, attach/detach, stop, pin, filter; exited sessions restart on reply | `agents` TUI plus `agents --json`; durable inbox; attach transport; process state separate from task state | partial |
-| Supervisor | sessions survive terminal exit, supervisor restart, updates, and sleep; stopped or wedged processes can continue from saved state | service-managed run leases, heartbeats, PID/start-token validation, adoption, exact resume, atomic exit records | planned |
+| Supervisor | sessions survive terminal exit, supervisor restart, updates, and sleep; stopped or wedged processes can continue from saved state | service-managed run leases, heartbeats, PID/start-token validation, adoption, exact resume, atomic exit records | partial |
 | Subagents | fresh or forked context; named definitions with model, effort, tools, skills, MCP, hooks, memory, permissions, worktree, background mode; exact-ID resume; nested spawning | portable agent profiles and spawn API; parent/child lineage; isolated transcript; immutable runtime identity; capability narrowing | partial |
-| Agent teams | lead plus peer sessions; shared task list; dependencies; claiming/assignment; direct messages; idle and shutdown protocol; optional plan approval | durable team, member, task, dependency, claim, mailbox, idle, shutdown, and approval records; runtime-neutral peers | planned |
-| Dynamic workflows | JavaScript with top-level await; `agent()` and `pipeline()`; phases, loops and branching in script variables; background run; 16 concurrent/1,000 total agents; pause, stop, restart, cached ordered replay; save as command; structured args | sandboxed workflow SDK with compatible primitives and caps; append-only invocation journal; deterministic replay frontier; reusable project/user workflow resolution | planned |
+| Agent teams | lead plus peer sessions; shared task list; dependencies; claiming/assignment; direct messages; idle and shutdown protocol; optional plan approval | durable team, member, task, dependency, fenced claim, mailbox, idle, shutdown, and approval records; runtime-neutral peers | partial |
+| Dynamic workflows | JavaScript with top-level await; `agent()` and `pipeline()`; phases, loops and branching in script variables; background run; 16 concurrent/1,000 total agents; pause, stop, restart, cached ordered replay; save as command; structured args | sandboxed workflow SDK with compatible primitives and caps; append-only invocation journal; deterministic replay frontier; reusable project/user workflow resolution | partial |
 | Workflow planning | natural language or keyword asks Claude to write a workflow; optional raw-script review and per-project approval; ultracode can choose multiple workflows for one request | planner emits inspectable script/IR; human/auto/bypass launch policy; role-specific planner ladder; multiple sequential runs allowed | planned |
 | Goals | one session-scoped condition; fresh small-model evaluator after every turn; reason feeds next turn; persists active condition on resume; clear/status; turn/time bounds | evaluator hook over a session loop with condition, reason, spend, turns, bounds, and independent model ladder | planned |
 | Hooks | pre/post tool, permission, subagent, task, stop/failure, teammate idle, worktree, notification, config and session lifecycle events; commands, prompts, and agent verification may allow, block, retry, or inject context | ordered typed lifecycle bus; deterministic command hooks and model/agent hooks; policy-controlled decisions; durable hook outcomes | planned |
@@ -41,6 +41,12 @@ Claude exposes four different coordination models and `handoff` must not collaps
 4. **Dynamic workflow:** a script, not a lead model, owns branching, loops, fan-out, intermediate values, and replay.
 
 The event ledger, policy kernel, runtime adapters, logs, leases, and model router are shared infrastructure. Their public semantics remain distinct.
+
+## Agent-team state
+
+The team ledger is implemented independently of the workflow graph. A member's logical state (`working`, `idle`, `needs_input`, `stopped`) is separate from whether its current OS process is live. Tasks have dependencies and expiring, generation-fenced claims so an old worker cannot complete work after another member reclaims it. Direct and broadcast messages, idle notifications, submitted/reviewed plans, and cooperative shutdown requests are durable mailbox entries.
+
+The machine interface is `handoff team create|status|apply|inbox`. Runtime spawning, automatic mailbox injection/wake-up, and the combined Agent View UI remain compatibility work; the ledger deliberately exists first so replacing a runtime session cannot destroy the logical member, task, or message.
 
 ## Recovery contract
 

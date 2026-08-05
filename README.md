@@ -12,6 +12,16 @@ Claude Code's useful orchestration ideas are dynamic: shared task state, backgro
 
 The design borrows the good parts of [Claude Code hooks](https://code.claude.com/docs/en/hooks), [agent teams](https://code.claude.com/docs/en/agent-teams), [subagent isolation](https://code.claude.com/docs/en/sub-agents), and the dynamic maintenance behavior of [`/loop`](https://code.claude.com/docs/en/scheduled-tasks), while keeping durable state outside Claude. The TUI uses [Bubble Tea v2](https://github.com/charmbracelet/bubbletea).
 
+Durable team coordination is also available through a machine-first interface:
+
+```sh
+handoff team create --name review-squad --workflow wf_123 --lead lead
+handoff team apply team_123 --file command.json
+handoff team inbox team_123 --member reviewer --after 0
+```
+
+Team members, logical/process state, dependency tasks, generation-fenced claims, plan approval, direct/broadcast mailboxes, idle notices, and cooperative shutdown are durable. Runtime spawning and the combined Agent View UI remain `partial` in the compatibility matrix.
+
 ## Install
 
 With Go 1.25 or newer:

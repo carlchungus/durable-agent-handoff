@@ -23,6 +23,7 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
 	"github.com/carlchungus/durable-agent-handoff/internal/runtime"
 	"github.com/carlchungus/durable-agent-handoff/internal/service"
+	"github.com/carlchungus/durable-agent-handoff/internal/team"
 	"github.com/carlchungus/durable-agent-handoff/internal/tui"
 )
 
@@ -69,6 +70,8 @@ func run(args []string, out, errOut io.Writer) error {
 		return cmdDoctor(args[1:], out)
 	case "preference":
 		return cmdPreference(args[1:], out)
+	case "team":
+		return cmdTeam(args[1:], out)
 	case "discover":
 		return cmdDiscover(args[1:], out)
 	case "import":
@@ -489,6 +492,109 @@ func cmdPreference(args []string, out io.Writer) error {
 		return fmt.Errorf("unknown preference command %q", args[0])
 	}
 }
+
+func cmdTeam(args []string, out io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: handoff team create|status|apply|inbox")
+	}
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("team create", flag.ContinueOnError)
+		s := common(fs)
+		name := fs.String("name", "", "team name")
+		workflow := fs.String("workflow", "", "associated workflow id")
+		lead := fs.String("lead", "lead", "lead member id")
+		leadName := fs.String("lead-name", "Lead", "lead display name")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		st, err := team.OpenStore(stateDir(*s))
+		if err != nil {
+			return err
+		}
+		tm, err := st.Create(*name, *workflow, team.Member{ID: *lead, Name: *leadName})
+		if err != nil {
+			return err
+		}
+		return writeJSON(out, tm)
+	case "status":
+		fs := flag.NewFlagSet("team status", flag.ContinueOnError)
+		s := common(fs)
+		if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true})); err != nil {
+			return err
+		}
+		st, err := team.OpenStore(stateDir(*s))
+		if err != nil {
+			return err
+		}
+		if fs.NArg() == 1 {
+			tm, loadErr := st.Load(fs.Arg(0))
+			if loadErr != nil {
+				return loadErr
+			}
+			return writeJSON(out, tm)
+		}
+		teams, err := st.List()
+		if err != nil {
+			return err
+		}
+		return writeJSON(out, teams)
+	case "apply":
+		fs := flag.NewFlagSet("team apply", flag.ContinueOnError)
+		s := common(fs)
+		file := fs.String("file", "-", "team command JSON file or - for stdin")
+		if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true, "--file": true})); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return errors.New("team apply requires team id")
+		}
+		var reader io.Reader = os.Stdin
+		if *file != "-" {
+			f, err := os.Open(*file)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			reader = f
+		}
+		var command team.Command
+		if err := json.NewDecoder(reader).Decode(&command); err != nil {
+			return err
+		}
+		st, err := team.OpenStore(stateDir(*s))
+		if err != nil {
+			return err
+		}
+		tm, err := st.Apply(fs.Arg(0), command)
+		if err != nil {
+			return err
+		}
+		return writeJSON(out, tm)
+	case "inbox":
+		fs := flag.NewFlagSet("team inbox", flag.ContinueOnError)
+		s := common(fs)
+		member := fs.String("member", "", "member id")
+		after := fs.Uint64("after", 0, "messages after sequence")
+		if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true, "--member": true, "--after": true})); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 || *member == "" {
+			return errors.New("team inbox requires team id and --member")
+		}
+		st, err := team.OpenStore(stateDir(*s))
+		if err != nil {
+			return err
+		}
+		messages, err := st.Inbox(fs.Arg(0), *member, *after)
+		if err != nil {
+			return err
+		}
+		return writeJSON(out, messages)
+	default:
+		return fmt.Errorf("unknown team command %q", args[0])
+	}
+}
 func cmdDiscover(args []string, out io.Writer) error {
 	if len(args) == 0 || args[0] != "claude" {
 		return errors.New("usage: handoff discover claude [--since 8h] [--root PATH] [--json]")
@@ -663,6 +769,10 @@ Usage:
   handoff doctor [--json]
   handoff preference set ROLE --candidate runtime:model[:effort] [...]
   handoff preference list | health | reset
+  handoff team create --name NAME [--workflow ID]
+  handoff team status [TEAM_ID]
+  handoff team apply TEAM_ID [--file command.json]
+  handoff team inbox TEAM_ID --member MEMBER [--after N]
   handoff discover claude [--since 8h] [--json]
   handoff import claude --session ID [--runtime codex]
   handoff github merge --repo OWNER/REPO --pr N --gate EXACT_NAME

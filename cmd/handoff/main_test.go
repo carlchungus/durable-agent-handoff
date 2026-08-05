@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
+	"github.com/carlchungus/durable-agent-handoff/internal/team"
 )
 
 func TestStartAndStatusJSONContract(t *testing.T) {
@@ -56,5 +57,31 @@ func TestPreferenceCLIStoresOrderedLadder(t *testing.T) {
 	}
 	if !bytes.Contains(out.Bytes(), []byte(`"opus"`)) || !bytes.Contains(out.Bytes(), []byte(`"gpt-5.6-sol"`)) {
 		t.Fatalf("output=%s", out.String())
+	}
+}
+
+func TestTeamCLIProducesMachineReadableState(t *testing.T) {
+	state := t.TempDir()
+	var out, errOut bytes.Buffer
+	if err := run([]string{"team", "create", "--state", state, "--name", "review", "--workflow", "wf_1", "--lead", "captain"}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	var created team.Team
+	if err := json.Unmarshal(out.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ID == "" || created.LeadID != "captain" || created.WorkflowID != "wf_1" {
+		t.Fatalf("created=%+v", created)
+	}
+	out.Reset()
+	if err := run([]string{"team", "status", "--state", state, created.ID}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	var loaded team.Team
+	if err := json.Unmarshal(out.Bytes(), &loaded); err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ID != created.ID || loaded.Members["captain"] == nil {
+		t.Fatalf("loaded=%+v", loaded)
 	}
 }

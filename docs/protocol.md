@@ -33,6 +33,7 @@ Verifier results use an exact source-verdict allowlist. `pass`, `repair`, and `b
 | `pause` / `resume` | Stop or restart scheduling | human or supervisor only |
 | `set_session` | Persist an exact runtime session ID | supervisor/runtime result |
 | `set_runtime` | Persist an observable ladder selection | supervisor only |
+| `reopen_agent` | Wake a completed, waiting, or failed agent without changing its exact session ID | human or supervisor only |
 
 ## Node kinds
 
@@ -45,6 +46,14 @@ Verifier results use an exact source-verdict allowlist. `pass`, `repair`, and `b
 Fields are additive during the `0.x` series. Consumers must ignore unknown JSON fields and must not infer ordering from object keys. Event sequence numbers are the ordering contract.
 
 Provider health is available through `handoff preference health`. Each entry includes the runtime/model key, classified limit type, redacted reason, observation time, and cooldown deadline.
+
+## Durable agent session protocol
+
+Background agent identity and inbox state use a separate append-only ledger at `$HANDOFF_HOME/sessions/AGENT_ID/events.jsonl`; a replaceable `state.json` snapshot is rebuilt from that ledger after loss. The stable harness agent ID is derived from workflow and node identity. `runtime_session_id` is the exact opaque runtime identity and is never replaced by a global or most-recent session.
+
+`handoff agents --json` returns both `logical_state` (`working`, `needs_input`, `completed`, or `stopped`) and `process_state` (`starting`, `running`, or `exited`). Consumers must not infer one dimension from the other. `handoff agent inbox WORKFLOW_ID NODE_ID --after N` provides a cursor-readable inbox. `handoff agent reply WORKFLOW_ID NODE_ID --message TEXT` durably queues a human reply and reopens only an exact persisted session.
+
+Messages move `queued` to `dispatched` for one numbered runtime attempt, then to `delivered` only after that attempt emits and reduces a valid result. A failed or interrupted attempt requeues only messages fenced to that attempt. Reconciliation repairs the crash window between queueing a reply and reopening its node.
 
 ## Team protocol
 

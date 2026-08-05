@@ -57,6 +57,16 @@ $HANDOFF_HOME/workflows/WF_ID/
     result.schema.json
 ```
 
+Background sessions have their own event-sourced identity and inbox kernel:
+
+```text
+$HANDOFF_HOME/sessions/AGENT_ID/
+  events.jsonl
+  state.json
+```
+
+This is deliberately separate from workflow nodes: a node describes graph work, while an agent session describes a durable conversation and its queued replies. Logical state and process liveness are independent. Message dispatch is fenced to an attempt and acknowledged only after valid result reduction; interrupted attempts requeue their own messages. Exact opaque runtime session IDs are retained across process exit and reply-triggered restart.
+
 ## Scheduling
 
 `handoff serve` scans active workflows and runs ready nodes up to a configurable cross-workflow concurrency bound. Per-workflow writes remain serialized. It can run under launchd or systemd-user and resumes from durable state after restart.

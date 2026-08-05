@@ -35,12 +35,20 @@ func Serve(ctx context.Context, store *core.Store, prefs *preferences.Manager, i
 			return err
 		}
 		for _, w := range ws {
-			if w.Status != core.WorkflowActive || w.Paused {
+			if w.Paused {
 				continue
 			}
 			eng := &engine.Engine{Store: store, Preferences: prefs}
 			if err = eng.Reconcile(ctx, w.ID); err != nil {
 				logf("workflow=%s reconcile_error=%v", w.ID, err)
+				continue
+			}
+			w, err = store.Load(w.ID)
+			if err != nil {
+				logf("workflow=%s reload_error=%v", w.ID, err)
+				continue
+			}
+			if w.Status != core.WorkflowActive {
 				continue
 			}
 			mu.Lock()

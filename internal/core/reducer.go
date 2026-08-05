@@ -61,6 +61,23 @@ func validateMutation(w *Workflow, actor string, m Mutation) error {
 		if actor != "human" && actor != "supervisor" {
 			return errors.New("only a human or supervisor may pause or resume")
 		}
+	case "reopen_agent":
+		n := w.Nodes[m.NodeID]
+		if n == nil {
+			return fmt.Errorf("node %q does not exist", m.NodeID)
+		}
+		if actor != "human" && actor != "supervisor" {
+			return errors.New("only a human or supervisor may reopen an agent")
+		}
+		if n.Kind != "agent" {
+			return errors.New("reopen_agent requires an agent node")
+		}
+		if n.SessionID == "" {
+			return errors.New("reopen_agent requires an exact persisted session id")
+		}
+		if n.State != NodeCompleted && n.State != NodeWaiting && n.State != NodeFailed {
+			return fmt.Errorf("agent in state %s cannot be reopened", n.State)
+		}
 	case "add_node":
 		if m.Node == nil {
 			return errors.New("add_node requires node")
@@ -182,6 +199,9 @@ func applyMutation(w *Workflow, m Mutation, at time.Time) {
 		w.Paused = true
 	case "resume":
 		w.Paused = false
+	case "reopen_agent":
+		n := w.Nodes[m.NodeID]
+		n.State, n.UpdatedAt = NodeReady, at
 	case "add_node":
 		n := *m.Node
 		if n.State == "" {

@@ -19,6 +19,7 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
 	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 	hruntime "github.com/carlchungus/durable-agent-handoff/internal/runtime"
+	agentsession "github.com/carlchungus/durable-agent-handoff/internal/session"
 )
 
 type Result struct {
@@ -74,6 +75,7 @@ func (m *encodedMutation) UnmarshalJSON(data []byte) error {
 type Engine struct {
 	Store       *core.Store
 	Preferences *preferences.Manager
+	Sessions    *agentsession.Store
 }
 
 func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
@@ -114,6 +116,15 @@ func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 			node.Runtime, node.CandidateIndex = routed, index
 		}
 	}
+	if node.Kind == "agent" {
+		agent, sessionErr := e.ensureAgentSession(w, node)
+		if sessionErr != nil {
+			return nil, sessionErr
+		}
+		if sessionErr = e.sessionStoreObserve(agent.ID, agentsession.Observation{LogicalState: agentsession.LogicalWorking, ProcessState: agentsession.ProcessStarting}); sessionErr != nil {
+			return nil, sessionErr
+		}
+	}
 	if _, err = e.Store.Apply(core.Proposal{WorkflowID: id, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: node.ID, State: core.NodeRunning}}}); err != nil {
 		return nil, err
 	}
@@ -130,6 +141,52 @@ func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 // It never guesses from a PID alone and never reruns ambiguous side effects.
 func (e *Engine) Reconcile(_ context.Context, id string) error {
 	w, err := e.Store.Load(id)
+	if err != nil {
+		return err
+	}
+	if e.Sessions == nil {
+		e.Sessions, err = agentsession.OpenStore(e.Store.Dir())
+		if err != nil {
+			return err
+		}
+	}
+	for _, nodeID := range w.Order {
+		n := w.Nodes[nodeID]
+		if n == nil || n.Kind != "agent" || n.SessionID == "" || (n.State != core.NodeCompleted && n.State != core.NodeWaiting && n.State != core.NodeFailed) {
+			continue
+		}
+		agent, loadErr := e.Sessions.LoadByNode(w.ID, n.ID)
+		if errors.Is(loadErr, os.ErrNotExist) {
+			continue
+		}
+		if loadErr != nil {
+			return loadErr
+		}
+		if n.State == core.NodeCompleted {
+			for _, message := range agent.Inbox {
+				if message.State == agentsession.MessageDispatched && message.DeliveryAttempt == n.Attempt {
+					if err = e.Sessions.Deliver(agent.ID, n.Attempt); err != nil {
+						return err
+					}
+					agent, err = e.Sessions.Load(agent.ID)
+					if err != nil {
+						return err
+					}
+					break
+				}
+			}
+		}
+		queued := false
+		for _, message := range agent.Inbox {
+			queued = queued || message.State == agentsession.MessageQueued
+		}
+		if queued {
+			if _, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "reopen_agent", NodeID: n.ID}}, Rationale: "recover queued durable reply after supervisor interruption"}); err != nil {
+				return err
+			}
+		}
+	}
+	w, err = e.Store.Load(id)
 	if err != nil {
 		return err
 	}
@@ -185,10 +242,39 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 		if sessionID != "" && sessionID != n.SessionID {
 			mutations = append([]core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, mutations...)
 		}
+		if err = e.requeueInterruptedAttempt(w, n, n.Attempt, state); err != nil {
+			return err
+		}
 		_, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: mutations, Rationale: "reconcile interrupted runtime attempt"})
 		return err
 	}
 	return nil
+}
+
+func (e *Engine) requeueInterruptedAttempt(w *core.Workflow, n *core.Node, attempt int, next core.NodeState) error {
+	if e.Sessions == nil || n.Kind != "agent" {
+		return nil
+	}
+	agent, err := e.Sessions.LoadByNode(w.ID, n.ID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, message := range agent.Inbox {
+		if message.State == agentsession.MessageDispatched && message.DeliveryAttempt == attempt {
+			if err = e.Sessions.Requeue(agent.ID, attempt); err != nil {
+				return err
+			}
+			break
+		}
+	}
+	logical := agentsession.LogicalWorking
+	if next == core.NodeWaiting {
+		logical = agentsession.LogicalNeedsInput
+	}
+	return e.Sessions.Observe(agent.ID, agentsession.Observation{LogicalState: logical, ProcessState: agentsession.ProcessExited})
 }
 
 // RecoverAttempt reapplies a completed runtime result that an older or crashed
@@ -269,7 +355,22 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	prompt := contract(w, n)
+	agent, err := e.ensureAgentSession(w, n)
+	if err != nil {
+		return e.fail(w, n, err.Error())
+	}
+	defer func() {
+		_ = e.Sessions.Observe(agent.ID, agentsession.Observation{ProcessState: agentsession.ProcessExited})
+	}()
+	attempt := n.Attempt + 1
+	dispatched, err := e.Sessions.Dispatch(agent.ID, attempt)
+	if err != nil {
+		return e.fail(w, n, err.Error())
+	}
+	if len(dispatched) > 0 {
+		defer func() { _ = e.Sessions.Requeue(agent.ID, attempt) }()
+	}
+	prompt := contract(w, n, dispatched)
 	schema := filepath.Join(dir, "result.schema.json")
 	output := filepath.Join(dir, "last-message.json")
 	_ = os.WriteFile(schema, []byte(resultSchema), 0o600)
@@ -318,6 +419,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		})
 		return e.fail(w, n, err.Error())
 	}
+	_ = e.Sessions.Observe(agent.ID, agentsession.Observation{ProcessState: agentsession.ProcessRunning})
 	_ = recorder.Update(func(m *runstate.Manifest) {
 		m.Status = "running"
 		m.PID = cmd.Process.Pid
@@ -351,8 +453,10 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 			return
 		}
 		_, _ = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, Rationale: "persist runtime session identity before the process exits"})
+		_ = e.Sessions.Observe(agent.ID, agentsession.Observation{RuntimeSessionID: sessionID})
 	})
 	err = cmd.Wait()
+	_ = e.Sessions.Observe(agent.ID, agentsession.Observation{ProcessState: agentsession.ProcessExited})
 	close(heartbeatStop)
 	<-heartbeatDone
 	close(stopObserve)
@@ -410,6 +514,12 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 			{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("budget-%s-%d", n.ID, n.Attempt+1), NodeID: n.ID, Kind: "budget", Summary: summary}},
 			{Op: "set_state", NodeID: n.ID, State: core.NodeWaiting},
 		}, Rationale: "deterministic changed-file and diff-line budget"})
+		if applyErr == nil {
+			_ = e.Sessions.Observe(agent.ID, agentsession.Observation{LogicalState: agentsession.LogicalNeedsInput, ProcessState: agentsession.ProcessExited})
+			if len(dispatched) > 0 {
+				applyErr = e.Sessions.Deliver(agent.ID, attempt)
+			}
+		}
 		return applyErr
 	}
 	return e.applyAgentResult(w, n, result, extractSessionID(stdoutBytes), n.Attempt+1)
@@ -464,7 +574,63 @@ func (e *Engine) applyAgentResult(w *core.Workflow, n *core.Node, result Result,
 	if err != nil {
 		return e.fail(w, n, "runtime proposed an invalid workflow mutation: "+err.Error())
 	}
+	if n.Kind == "agent" {
+		agent, sessionErr := e.ensureAgentSession(w, n)
+		if sessionErr != nil {
+			return sessionErr
+		}
+		logical := logicalStateForResult(result.Status)
+		if sessionErr = e.Sessions.Observe(agent.ID, agentsession.Observation{RuntimeSessionID: sessionID, LogicalState: logical, ProcessState: agentsession.ProcessExited}); sessionErr != nil {
+			return sessionErr
+		}
+		if current, loadErr := e.Sessions.Load(agent.ID); loadErr == nil {
+			for _, message := range current.Inbox {
+				if message.State == agentsession.MessageDispatched && message.DeliveryAttempt == attempt {
+					return e.Sessions.Deliver(agent.ID, attempt)
+				}
+			}
+		}
+	}
 	return nil
+}
+
+func (e *Engine) ensureAgentSession(w *core.Workflow, n *core.Node) (*agentsession.Session, error) {
+	if e.Sessions == nil {
+		var err error
+		e.Sessions, err = agentsession.OpenStore(e.Store.Dir())
+		if err != nil {
+			return nil, err
+		}
+	}
+	agent, err := e.Sessions.Ensure(agentsession.Descriptor{
+		WorkflowID: w.ID, NodeID: n.ID, ParentAgentID: n.Metadata["parent_id"], Name: n.Title,
+		Runtime: n.Runtime.Name, RuntimeSessionID: n.SessionID, Worktree: workdir(w, n),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err = e.Sessions.Observe(agent.ID, agentsession.Observation{Runtime: n.Runtime.Name, RuntimeSessionID: n.SessionID, Worktree: workdir(w, n)}); err != nil {
+		return nil, err
+	}
+	return e.Sessions.Load(agent.ID)
+}
+
+func (e *Engine) sessionStoreObserve(id string, observation agentsession.Observation) error {
+	if e.Sessions == nil {
+		return errors.New("agent session store is not initialized")
+	}
+	return e.Sessions.Observe(id, observation)
+}
+
+func logicalStateForResult(status string) agentsession.LogicalState {
+	switch status {
+	case "completed", "blocked":
+		return agentsession.LogicalCompleted
+	case "needs_human":
+		return agentsession.LogicalNeedsInput
+	default:
+		return agentsession.LogicalWorking
+	}
 }
 
 func normalizeAttestation(a core.Attestation) core.Attestation {
@@ -646,7 +812,16 @@ func findSessionID(v any) string {
 	}
 	return ""
 }
-func contract(w *core.Workflow, n *core.Node) string {
+func contract(w *core.Workflow, n *core.Node, messages []agentsession.Message) string {
+	inbox := ""
+	if len(messages) > 0 {
+		var b strings.Builder
+		b.WriteString("\n\nDurable inbox messages for this exact attempt:\n")
+		for _, message := range messages {
+			fmt.Fprintf(&b, "[%s from %s] %s\n", message.ID, message.From, message.Body)
+		}
+		inbox = b.String()
+	}
 	return fmt.Sprintf(`Goal: %s
 
 Current dynamic task: %s
@@ -654,7 +829,7 @@ Task id: %s
 
 %s
 
-You own how to accomplish and verify this task. Inspect live state, adapt the plan when evidence changes, and propose new nodes or independent verifier work when useful. Do not push, merge, access production, or expand authority. End with one JSON result matching the supplied schema.`, w.Goal, n.Title, n.ID, n.Prompt)
+You own how to accomplish and verify this task. Inspect live state, adapt the plan when evidence changes, and propose new nodes or independent verifier work when useful. Do not push, merge, access production, or expand authority. End with one JSON result matching the supplied schema.%s`, w.Goal, n.Title, n.ID, n.Prompt, inbox)
 }
 
 const resultSchema = `{"type":"object","required":["status","summary","session_id","mutations","attestations"],"properties":{"status":{"enum":["completed","continue","blocked","needs_human"]},"summary":{"type":"string"},"session_id":{"type":"string"},"mutations":{"type":"array","description":"Workflow mutations. Each item is a JSON-encoded core Mutation object. Use an empty array when no graph change is needed.","items":{"type":"string"}},"attestations":{"type":"array","items":{"type":"object","required":["verifier","verdict","summary","evidence_ids"],"properties":{"verifier":{"type":"string"},"verdict":{"enum":["pass","repair","blocked","pass_with_limit","pass_with_runtime_limit","fail_blocking"]},"summary":{"type":"string"},"evidence_ids":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}}},"additionalProperties":false}`

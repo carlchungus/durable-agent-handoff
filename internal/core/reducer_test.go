@@ -117,3 +117,27 @@ func TestAttestationRejectsContradictoryRawVerdictAtomically(t *testing.T) {
 		t.Fatalf("rejected attestation mutated workflow: %+v", w.Attestations)
 	}
 }
+
+func TestReopenAgentRequiresExactPersistedSessionAndHumanAuthority(t *testing.T) {
+	w := fixtureWorkflow(t)
+	w.Nodes["agent"] = &Node{ID: "agent", Title: "agent", Kind: "agent", State: NodeCompleted, SessionID: "session-exact"}
+	w.Order = append(w.Order, "agent")
+
+	proposal := Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []Mutation{{Op: "reopen_agent", NodeID: "agent"}}}
+	if err := ApplyProposal(w, proposal, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if w.Nodes["agent"].State != NodeReady || w.Nodes["agent"].SessionID != "session-exact" {
+		t.Fatalf("agent=%+v", w.Nodes["agent"])
+	}
+
+	withoutSession := fixtureWorkflow(t)
+	withoutSession.Nodes["agent"] = &Node{ID: "agent", Title: "agent", Kind: "agent", State: NodeCompleted}
+	withoutSession.Order = append(withoutSession.Order, "agent")
+	if err := ApplyProposal(withoutSession, Proposal{WorkflowID: withoutSession.ID, Actor: "human", Mutations: []Mutation{{Op: "reopen_agent", NodeID: "agent"}}}, time.Now().UTC()); err == nil {
+		t.Fatal("reopened an agent without an exact session id")
+	}
+	if err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "agent", Mutations: []Mutation{{Op: "reopen_agent", NodeID: "agent"}}}, time.Now().UTC()); err == nil {
+		t.Fatal("agent reopened itself")
+	}
+}

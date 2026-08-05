@@ -16,6 +16,7 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/finalize"
 	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
+	agentsession "github.com/carlchungus/durable-agent-handoff/internal/session"
 )
 
 func TestResultSchemaDefinesArrayItems(t *testing.T) {
@@ -310,6 +311,46 @@ func TestEngineRunsGenericAgentAndPersistsSession(t *testing.T) {
 	}
 }
 
+func TestEngineDeliversDurableReplyToExactResumedAttempt(t *testing.T) {
+	if os.Getenv("GO_WANT_REPLY_HELPER") == "1" {
+		prompt := os.Args[len(os.Args)-1]
+		if !strings.Contains(prompt, "message-1") || !strings.Contains(prompt, "use blue") {
+			fmt.Fprintln(os.Stderr, "durable reply missing from prompt")
+			os.Exit(2)
+		}
+		fmt.Println(`{"thread_id":"session-exact-123"}`)
+		fmt.Println(`{"status":"completed","summary":"reply applied","session_id":"session-exact-123"}`)
+		os.Exit(0)
+	}
+	t.Setenv("GO_WANT_REPLY_HELPER", "1")
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	sessions, _ := agentsession.OpenStore(state)
+	w, _ := st.Create("continue exact session", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", SessionID: "session-exact-123", Runtime: core.RuntimeSpec{Name: "exec", Executable: os.Args[0], Args: []string{"-test.run=TestEngineDeliversDurableReplyToExactResumedAttempt"}}}
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	agent, err := sessions.Ensure(agentsession.Descriptor{WorkflowID: w.ID, NodeID: n.ID, Runtime: "exec", RuntimeSessionID: n.SessionID, Worktree: w.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = sessions.Queue(agent.ID, "human", "use blue"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = (&Engine{Store: st, Sessions: sessions}).RunOne(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := sessions.Load(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RuntimeSessionID != "session-exact-123" || len(got.Inbox) != 1 || got.Inbox[0].State != agentsession.MessageDelivered || got.Inbox[0].DeliveryAttempt != 1 {
+		t.Fatalf("session=%+v", got)
+	}
+	if got.LogicalState != agentsession.LogicalCompleted || got.ProcessState != agentsession.ProcessExited {
+		t.Fatalf("logical=%s process=%s", got.LogicalState, got.ProcessState)
+	}
+}
+
 func TestInvalidAgentMutationFailsClosed(t *testing.T) {
 	if os.Getenv("GO_WANT_BAD_HANDOFF_HELPER") == "1" {
 		fmt.Println(`{"status":"completed","summary":"tried to escalate","mutations":[{"op":"add_node","node":{"id":"merge-now","title":"merge","kind":"merge"}}]}`)
@@ -351,6 +392,51 @@ func TestReconcileResumesOnlyExactPersistedSession(t *testing.T) {
 	got, _ := st.Load(w.ID)
 	if got.Nodes["lead"].State != core.NodeReady || got.Nodes["lead"].SessionID != "019fd17f-f95a-76e2-b0fe-35efee5fabda" {
 		t.Fatalf("node=%+v", got.Nodes["lead"])
+	}
+}
+
+func TestReconcileReopensQueuedReplyAfterSupervisorCrash(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	sessions, _ := agentsession.OpenStore(state)
+	w, _ := st.Create("wake after crash", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "claude"}, SessionID: "session-exact-123"}
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: n.ID, State: core.NodeRunning}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: n.ID, Mutations: []core.Mutation{{Op: "set_state", NodeID: n.ID, State: core.NodeCompleted}}})
+	agent, _ := sessions.Ensure(agentsession.Descriptor{WorkflowID: w.ID, NodeID: n.ID, RuntimeSessionID: n.SessionID})
+	_, _ = sessions.Queue(agent.ID, "human", "continue")
+	if err := (&Engine{Store: st, Sessions: sessions}).Reconcile(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	w, _ = st.Load(w.ID)
+	if w.Nodes[n.ID].State != core.NodeReady || w.Nodes[n.ID].SessionID != "session-exact-123" {
+		t.Fatalf("node=%+v", w.Nodes[n.ID])
+	}
+}
+
+func TestReconcileRequeuesReplyFromInterruptedRuntimeAttempt(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	sessions, _ := agentsession.OpenStore(state)
+	w, _ := st.Create("resume interrupted reply", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "claude"}, SessionID: "session-exact-123"}
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: n.ID, State: core.NodeRunning}}})
+	agent, _ := sessions.Ensure(agentsession.Descriptor{WorkflowID: w.ID, NodeID: n.ID, RuntimeSessionID: n.SessionID})
+	_, _ = sessions.Queue(agent.ID, "human", "continue")
+	_, _ = sessions.Dispatch(agent.ID, 1)
+	dir := filepath.Join(state, "workflows", w.ID, "runs", n.ID, "1")
+	_, err := runstate.Create(filepath.Join(dir, "attempt.json"), runstate.Manifest{ID: "lead/1", WorkflowID: w.ID, NodeID: n.ID, Attempt: 1, Runtime: "claude", SessionID: n.SessionID, PID: 999999, ProcessStartToken: "gone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = (&Engine{Store: st, Sessions: sessions}).Reconcile(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	agent, _ = sessions.Load(agent.ID)
+	if agent.Inbox[0].State != agentsession.MessageQueued || agent.Inbox[0].DeliveryAttempt != 0 || agent.ProcessState != agentsession.ProcessExited {
+		t.Fatalf("session=%+v", agent)
 	}
 }
 

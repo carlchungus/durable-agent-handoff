@@ -23,6 +23,7 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
 	"github.com/carlchungus/durable-agent-handoff/internal/runtime"
 	"github.com/carlchungus/durable-agent-handoff/internal/service"
+	agentsession "github.com/carlchungus/durable-agent-handoff/internal/session"
 	"github.com/carlchungus/durable-agent-handoff/internal/team"
 	"github.com/carlchungus/durable-agent-handoff/internal/tui"
 )
@@ -72,6 +73,10 @@ func run(args []string, out, errOut io.Writer) error {
 		return cmdPreference(args[1:], out)
 	case "team":
 		return cmdTeam(args[1:], out)
+	case "agent":
+		return cmdAgent(args[1:], out)
+	case "agents":
+		return cmdAgents(args[1:], out)
 	case "discover":
 		return cmdDiscover(args[1:], out)
 	case "import":
@@ -84,6 +89,122 @@ func run(args []string, out, errOut io.Writer) error {
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
 	}
+}
+
+func cmdAgent(args []string, out io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: handoff agent reply|inbox WORKFLOW_ID NODE_ID")
+	}
+	switch args[0] {
+	case "reply":
+		args = reorderFlags(args[1:], map[string]bool{"--state": true, "--message": true})
+		fs := flag.NewFlagSet("agent reply", flag.ContinueOnError)
+		state := common(fs)
+		message := fs.String("message", "", "message to deliver to the exact durable agent session")
+		if err := fs.Parse(args); err != nil {
+			return err
+		}
+		if fs.NArg() != 2 || strings.TrimSpace(*message) == "" {
+			return errors.New("agent reply requires workflow id, node id, and --message")
+		}
+		st, err := store(*state)
+		if err != nil {
+			return err
+		}
+		w, err := st.Load(fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		n := w.Nodes[fs.Arg(1)]
+		if n == nil || n.Kind != "agent" || strings.TrimSpace(n.SessionID) == "" {
+			return errors.New("reply requires an agent node with an exact persisted runtime session id")
+		}
+		sessions, err := agentsession.OpenStore(stateDir(*state))
+		if err != nil {
+			return err
+		}
+		agent, err := sessions.Ensure(agentsession.Descriptor{WorkflowID: w.ID, NodeID: n.ID, ParentAgentID: n.Metadata["parent_id"], Name: n.Title, Runtime: n.Runtime.Name, RuntimeSessionID: n.SessionID, Worktree: agentWorktree(w, n), LogicalState: agentsession.LogicalNeedsInput, ProcessState: agentsession.ProcessExited})
+		if err != nil {
+			return err
+		}
+		if err = sessions.Observe(agent.ID, agentsession.Observation{Runtime: n.Runtime.Name, RuntimeSessionID: n.SessionID, Worktree: agentWorktree(w, n)}); err != nil {
+			return err
+		}
+		queued, err := sessions.Queue(agent.ID, "human", *message)
+		if err != nil {
+			return err
+		}
+		if n.State == core.NodeCompleted || n.State == core.NodeWaiting || n.State == core.NodeFailed {
+			if _, err = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "reopen_agent", NodeID: n.ID}}, Rationale: "wake exact durable agent session for queued reply"}); err != nil {
+				return err
+			}
+		}
+		return writeJSON(out, queued)
+	case "inbox":
+		args = reorderFlags(args[1:], map[string]bool{"--state": true, "--after": true})
+		fs := flag.NewFlagSet("agent inbox", flag.ContinueOnError)
+		state := common(fs)
+		after := fs.Uint64("after", 0, "only messages after sequence")
+		if err := fs.Parse(args); err != nil {
+			return err
+		}
+		if fs.NArg() != 2 {
+			return errors.New("agent inbox requires workflow id and node id")
+		}
+		sessions, err := agentsession.OpenStore(stateDir(*state))
+		if err != nil {
+			return err
+		}
+		agent, err := sessions.LoadByNode(fs.Arg(0), fs.Arg(1))
+		if err != nil {
+			return err
+		}
+		messages := make([]agentsession.Message, 0, len(agent.Inbox))
+		for _, message := range agent.Inbox {
+			if message.Sequence > *after {
+				messages = append(messages, message)
+			}
+		}
+		return writeJSON(out, messages)
+	default:
+		return fmt.Errorf("unknown agent command %q", args[0])
+	}
+}
+
+func cmdAgents(args []string, out io.Writer) error {
+	args = reorderFlags(args, map[string]bool{"--state": true, "--workflow": true, "--json": false})
+	fs := flag.NewFlagSet("agents", flag.ContinueOnError)
+	state := common(fs)
+	workflow := fs.String("workflow", "", "filter by workflow id")
+	_ = fs.Bool("json", false, "emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	sessions, err := agentsession.OpenStore(stateDir(*state))
+	if err != nil {
+		return err
+	}
+	agents, err := sessions.List()
+	if err != nil {
+		return err
+	}
+	if *workflow != "" {
+		filtered := agents[:0]
+		for _, agent := range agents {
+			if agent.WorkflowID == *workflow {
+				filtered = append(filtered, agent)
+			}
+		}
+		agents = filtered
+	}
+	return writeJSON(out, agents)
+}
+
+func agentWorktree(w *core.Workflow, n *core.Node) string {
+	if n.Worktree != "" {
+		return n.Worktree
+	}
+	return w.Root
 }
 
 func stateDir(v string) string {
@@ -775,6 +896,9 @@ Usage:
   handoff team status [TEAM_ID]
   handoff team apply TEAM_ID [--file command.json]
   handoff team inbox TEAM_ID --member MEMBER [--after N]
+  handoff agent reply WORKFLOW_ID NODE_ID --message TEXT
+  handoff agent inbox WORKFLOW_ID NODE_ID [--after N]
+  handoff agents [--workflow WORKFLOW_ID] --json
   handoff discover claude [--since 8h] [--json]
   handoff import claude --session ID [--runtime codex]
   handoff github merge --repo OWNER/REPO --pr N --gate EXACT_NAME

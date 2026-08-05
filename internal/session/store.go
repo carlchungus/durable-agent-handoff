@@ -23,8 +23,9 @@ import (
 var sessionIdentifier = regexp.MustCompile(`^agent_[a-f0-9]{24}$`)
 
 type Store struct {
-	dir string
-	mu  sync.Mutex
+	dir        string
+	mu         sync.Mutex
+	removeLock func(string) error
 }
 
 func OpenStore(dir string) (*Store, error) {
@@ -34,7 +35,7 @@ func OpenStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o700); err != nil {
 		return nil, err
 	}
-	return &Store{dir: dir}, nil
+	return &Store{dir: dir, removeLock: os.Remove}, nil
 }
 
 func (s *Store) Ensure(descriptor Descriptor) (*Session, error) {
@@ -525,27 +526,27 @@ func (s *Store) acquire(id string) (func(), error) {
 	path := filepath.Join(dir, ".write.lock")
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		owner := struct {
-			PID        int    `json:"pid"`
-			StartToken string `json:"start_token,omitempty"`
-		}{PID: os.Getpid(), StartToken: runstate.ProcessStartToken(os.Getpid())}
-		candidate := fmt.Sprintf("%s.%d.%d", path, os.Getpid(), time.Now().UnixNano())
-		b, _ := json.Marshal(owner)
-		if err := os.WriteFile(candidate, append(b, '\n'), 0o600); err != nil {
+		leaseID := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+		owner := sessionLockOwner{PID: os.Getpid(), StartToken: runstate.ProcessStartToken(os.Getpid()), LeaseID: leaseID}
+		candidate := path + "." + leaseID
+		if err := writeLockOwner(candidate, owner); err != nil {
 			return nil, err
 		}
 		err := os.Link(candidate, path)
-		_ = os.Remove(candidate)
 		if err == nil {
-			return func() { _ = os.Remove(path) }, nil
+			return func() { s.releaseLock(path, candidate) }, nil
 		}
+		_ = os.Remove(candidate)
 		if !errors.Is(err, os.ErrExist) {
 			if _, statErr := os.Stat(path); statErr != nil {
 				return nil, err
 			}
 		}
-		if staleLock(path) {
-			_ = os.Remove(path)
+		stale, staleOwner := staleLockOwner(path)
+		if stale {
+			if removeErr := os.Remove(path); removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
+				cleanupLockArtifacts(path, staleOwner)
+			}
 			continue
 		}
 		if time.Now().After(deadline) {
@@ -555,20 +556,124 @@ func (s *Store) acquire(id string) (func(), error) {
 	}
 }
 
+type sessionLockOwner struct {
+	PID        int    `json:"pid"`
+	StartToken string `json:"start_token,omitempty"`
+	LeaseID    string `json:"lease_id,omitempty"`
+}
+
+var lockLeaseIdentifier = regexp.MustCompile(`^[0-9]+-[0-9]+$`)
+
+func writeLockOwner(path string, owner sessionLockOwner) error {
+	b, err := json.Marshal(owner)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(append(b, '\n')); err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func (s *Store) releaseLock(path, candidate string) {
+	marker := candidate + ".released"
+	if err := writeReleaseMarker(marker); err != nil {
+		return
+	}
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for {
+		same, known := sameLockFile(path, candidate)
+		if known && !same {
+			_ = os.Remove(marker)
+			_ = os.Remove(candidate)
+			return
+		}
+		if known {
+			err := s.removeLock(path)
+			if err == nil || errors.Is(err, os.ErrNotExist) {
+				_ = os.Remove(marker)
+				_ = os.Remove(candidate)
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			// The durable marker lets another waiter reclaim the lock even if
+			// Windows still has a transient non-delete-sharing reader open.
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func sameLockFile(path, candidate string) (same, known bool) {
+	lockInfo, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, true
+	}
+	if err != nil {
+		return false, false
+	}
+	candidateInfo, err := os.Stat(candidate)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, true
+	}
+	if err != nil {
+		return false, false
+	}
+	return os.SameFile(lockInfo, candidateInfo), true
+}
+
+func writeReleaseMarker(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write([]byte("released\n")); err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
 func staleLock(path string) bool {
+	stale, _ := staleLockOwner(path)
+	return stale
+}
+
+func staleLockOwner(path string) (bool, sessionLockOwner) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return false
+		return false, sessionLockOwner{}
 	}
-	var owner struct {
-		PID        int    `json:"pid"`
-		StartToken string `json:"start_token"`
-	}
+	var owner sessionLockOwner
 	if json.Unmarshal(b, &owner) == nil && owner.PID > 0 {
-		return !runstate.ProcessMatches(runstate.Manifest{PID: owner.PID, ProcessStartToken: owner.StartToken})
+		if lockLeaseIdentifier.MatchString(owner.LeaseID) {
+			if _, markerErr := os.Stat(path + "." + owner.LeaseID + ".released"); markerErr == nil {
+				return true, owner
+			}
+		}
+		return !runstate.ProcessMatches(runstate.Manifest{PID: owner.PID, ProcessStartToken: owner.StartToken}), owner
 	}
 	info, statErr := os.Stat(path)
-	return statErr == nil && time.Since(info.ModTime()) > time.Minute
+	return statErr == nil && time.Since(info.ModTime()) > time.Minute, owner
+}
+
+func cleanupLockArtifacts(path string, owner sessionLockOwner) {
+	if !lockLeaseIdentifier.MatchString(owner.LeaseID) {
+		return
+	}
+	candidate := path + "." + owner.LeaseID
+	_ = os.Remove(candidate + ".released")
+	_ = os.Remove(candidate)
 }
 
 type ledgerEvent struct {

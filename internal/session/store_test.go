@@ -1,12 +1,15 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 )
 
 func TestDurableAgentReplySurvivesSnapshotLoss(t *testing.T) {
@@ -284,5 +287,61 @@ func TestSessionIDsCannotEscapeStateDirectory(t *testing.T) {
 		if _, err := store.Queue(id, "human", "hello"); err == nil {
 			t.Fatalf("Queue(%q) accepted unsafe id", id)
 		}
+	}
+}
+
+func TestReleasedLiveOwnerLockIsReclaimable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".write.lock")
+	owner := sessionLockOwner{PID: os.Getpid(), StartToken: runstate.ProcessStartToken(os.Getpid()), LeaseID: fmt.Sprintf("%d-1", os.Getpid())}
+	if err := writeLockOwner(path, owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReleaseMarker(path + "." + owner.LeaseID + ".released"); err != nil {
+		t.Fatal(err)
+	}
+	if !staleLock(path) {
+		t.Fatal("a durably released lock remained fenced by its live former owner")
+	}
+}
+
+func TestDeleteFailureLeavesReclaimableReleasedLock(t *testing.T) {
+	state := t.TempDir()
+	ownerStore, _ := OpenStore(state)
+	waiterStore, _ := OpenStore(state)
+	id := stableID("wf_windows", "lead")
+	release, err := ownerStore.acquire(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerStore.removeLock = func(string) error { return errors.New("simulated Windows sharing violation") }
+	release()
+
+	nextRelease, err := waiterStore.acquire(id)
+	if err != nil {
+		t.Fatalf("released lock was not reclaimable: %v", err)
+	}
+	nextRelease()
+}
+
+func TestOldReleaseCannotRemoveSuccessorLock(t *testing.T) {
+	state := t.TempDir()
+	store, _ := OpenStore(state)
+	id := stableID("wf_fenced", "lead")
+	release, err := store.acquire(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(state, "sessions", id, ".write.lock")
+	if err = os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	successor := sessionLockOwner{PID: os.Getpid(), StartToken: runstate.ProcessStartToken(os.Getpid()), LeaseID: fmt.Sprintf("%d-999", os.Getpid())}
+	if err = writeLockOwner(path, successor); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	_, got := staleLockOwner(path)
+	if got.LeaseID != successor.LeaseID {
+		t.Fatalf("old release removed or replaced successor: %+v", got)
 	}
 }

@@ -151,14 +151,16 @@ func ProcessMatches(manifest Manifest) bool {
 	if manifest.PID <= 0 {
 		return false
 	}
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", manifest.PID), "/FO", "CSV", "/NH").Output()
+		return err == nil && strings.Contains(string(out), fmt.Sprintf("\",\"%d\",", manifest.PID))
+	}
 	process, err := os.FindProcess(manifest.PID)
 	if err != nil {
 		return false
 	}
-	if runtime.GOOS != "windows" {
-		if err = process.Signal(syscall.Signal(0)); err != nil {
-			return false
-		}
+	if err = process.Signal(syscall.Signal(0)); err != nil {
+		return false
 	}
 	if manifest.ProcessStartToken == "" {
 		return true

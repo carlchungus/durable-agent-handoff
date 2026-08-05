@@ -100,7 +100,12 @@ func (s *Store) acquireWorkflowLock(id string) (func(), error) {
 			return func() { _ = os.Remove(path) }, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
-			return nil, err
+			// Windows may report sharing violations as permission errors while
+			// another process owns the lock. If the lock path exists, treat it as
+			// contention and retry rather than surfacing a spurious write failure.
+			if _, statErr := os.Stat(path); statErr != nil {
+				return nil, err
+			}
 		}
 		if staleWorkflowLock(path) {
 			_ = os.Remove(path)

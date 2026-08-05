@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/carlchungus/durable-agent-handoff/internal/core"
 )
 
 const (
@@ -47,13 +50,42 @@ type Completion struct {
 	Null        bool            `json:"null,omitempty"`
 }
 
+// ScriptCall identifies one deterministic evaluation of an orchestration
+// script. RunID is supplied by the caller and remains stable across supervisor
+// restarts; Fingerprint binds the run to the exact script, input, policy, and
+// resource limits.
+type ScriptCall struct {
+	RunID       string `json:"run_id"`
+	Fingerprint string `json:"fingerprint"`
+	SourceHash  string `json:"source_hash"`
+	Filename    string `json:"filename"`
+	Engine      string `json:"engine"`
+}
+
+type ScriptResult struct {
+	RunID       string        `json:"run_id"`
+	Fingerprint string        `json:"fingerprint"`
+	Proposal    core.Proposal `json:"proposal"`
+	FuelUsed    uint64        `json:"fuel_used,omitempty"`
+}
+
+type ScriptFailure struct {
+	RunID       string `json:"run_id"`
+	Fingerprint string `json:"fingerprint"`
+	Kind        string `json:"kind"`
+	Message     string `json:"message"`
+}
+
 type Event struct {
-	Sequence int             `json:"sequence"`
-	Type     string          `json:"type"`
-	At       time.Time       `json:"at"`
-	Call     *AgentCall      `json:"call,omitempty"`
-	Result   *Completion     `json:"result,omitempty"`
-	Data     json.RawMessage `json:"data,omitempty"`
+	Sequence      int             `json:"sequence"`
+	Type          string          `json:"type"`
+	At            time.Time       `json:"at"`
+	Call          *AgentCall      `json:"call,omitempty"`
+	Result        *Completion     `json:"result,omitempty"`
+	Script        *ScriptCall     `json:"script,omitempty"`
+	ScriptResult  *ScriptResult   `json:"script_result,omitempty"`
+	ScriptFailure *ScriptFailure  `json:"script_failure,omitempty"`
+	Data          json.RawMessage `json:"data,omitempty"`
 }
 
 type Journal struct {
@@ -67,11 +99,61 @@ func OpenJournal(path string) (*Journal, error) {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
+	if err == nil {
+		if err = truncateIncompleteTail(path); err != nil {
+			return nil, fmt.Errorf("repair truncated workflow journal tail: %w", err)
+		}
+	}
 	seq := 0
 	if len(events) > 0 {
 		seq = events[len(events)-1].Sequence
 	}
 	return &Journal{path: path, seq: seq}, nil
+}
+
+// truncateIncompleteTail removes only the final non-newline-terminated record.
+// Load intentionally ignores that record after a crash; repairing it here is
+// necessary so the next append cannot concatenate valid JSON onto the corrupt
+// fragment and make the recovery result unreadable too.
+func truncateIncompleteTail(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return err
+	}
+	var last [1]byte
+	if _, err = f.ReadAt(last[:], info.Size()-1); err != nil {
+		return err
+	}
+	if last[0] == '\n' {
+		return nil
+	}
+	const chunkSize int64 = 4096
+	end := info.Size()
+	truncateAt := int64(0)
+	for end > 0 {
+		start := end - chunkSize
+		if start < 0 {
+			start = 0
+		}
+		buf := make([]byte, end-start)
+		if _, err = f.ReadAt(buf, start); err != nil {
+			return err
+		}
+		if index := bytes.LastIndexByte(buf, '\n'); index >= 0 {
+			truncateAt = start + int64(index) + 1
+			break
+		}
+		end = start
+	}
+	if err = f.Truncate(truncateAt); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 func (j *Journal) Append(event Event) error {
@@ -186,3 +268,22 @@ func (r *Replayer) Resolve(fingerprint string) (Completion, bool) {
 }
 
 func (r *Replayer) Frontier() int { return r.cursor }
+
+// ReplayScript returns a completed script proposal only when both the durable
+// run identity and the complete evaluation fingerprint match. A started run
+// without a result is deliberately not cached: after a crash it executes from
+// the beginning against the same immutable input.
+func ReplayScript(events []Event, runID, fingerprint string) (ScriptResult, bool) {
+	started := false
+	for _, event := range events {
+		if event.Type == "script.started" && event.Script != nil &&
+			event.Script.RunID == runID && event.Script.Fingerprint == fingerprint {
+			started = true
+		}
+		if started && event.Type == "script.proposed" && event.ScriptResult != nil &&
+			event.ScriptResult.RunID == runID && event.ScriptResult.Fingerprint == fingerprint {
+			return *event.ScriptResult, true
+		}
+	}
+	return ScriptResult{}, false
+}

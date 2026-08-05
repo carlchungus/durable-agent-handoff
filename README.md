@@ -136,6 +136,14 @@ handoff propose --file proposal.json
 
 Events are newline-delimited JSON with monotonically increasing sequence numbers. Proposals are atomic: either every mutation passes policy or none is applied.
 
+The embedded dynamic-workflow kernel can also evaluate top-level-await
+JavaScript in a QuickJS-ng/WASM sandbox and return one policy-validated
+proposal. Its capability surface, replay fingerprint, limits, and current
+boundary are documented in
+[`docs/javascript-workflow-vm.md`](docs/javascript-workflow-vm.md). The public
+`agent()` / `pipeline()` CLI remains compatibility work; this kernel does not
+pretend that surface is complete.
+
 ```json
 {
   "workflow_id": "wf_1234",

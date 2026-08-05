@@ -5,9 +5,12 @@ go 1.25.0
 require (
 	charm.land/bubbletea/v2 v2.0.8
 	charm.land/lipgloss/v2 v2.0.5
+	github.com/aperturerobotics/go-quickjs-wasi-reactor/wazero-quickjs v0.0.0-20260705010951-74676ff0da98
+	github.com/tetratelabs/wazero v1.12.0
 )
 
 require (
+	github.com/aperturerobotics/go-quickjs-wasi-reactor v0.15.1 // indirect
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20260703014108-f5a850f9c2b7 // indirect
 	github.com/charmbracelet/x/ansi v0.11.7 // indirect

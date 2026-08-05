@@ -71,6 +71,16 @@ The durable journal records every `agent()` start in start order, its prompt/opt
 
 The compatibility profile targets Claude's documented 16 concurrent and 1,000 total agents. Policy may choose lower caps. The workflow program itself receives no filesystem, shell, network, process, import, or package-loader capability; only the agents it launches can request tools through their inherited capability envelope.
 
+The first embedded VM milestone evaluates async JavaScript function bodies in
+QuickJS-ng/WASM under wazero. The guest sees only frozen workflow, node,
+evidence, and structured-argument data plus a single `propose()` capability.
+Go validates the complete proposal against a cloned graph before returning it.
+WASI receives no filesystem preopens, environment, sockets, process surface, or
+host entropy; source/input/output, memory, stack, deterministic execution fuel,
+time, and mutation count are bounded. See
+[`javascript-workflow-vm.md`](javascript-workflow-vm.md) for the exact API and
+engine tradeoffs.
+
 ## Routing and usage limits
 
 Role-specific preference ladders are stored outside individual workflows. Before a node starts, the supervisor selects the first candidate without an active cooldown. A recognized quota/usage-limit or rate-limit failure records provider health, returns the node to `ready`, persists the next runtime choice, and appends evidence. Ordinary runtime, auth, model-name, code, and test failures stay on the normal failure path.

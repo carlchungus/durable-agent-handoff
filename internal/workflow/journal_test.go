@@ -65,6 +65,20 @@ func TestJournalSurvivesTruncatedTail(t *testing.T) {
 	if len(events) != 1 || events[0].Type != "agent.started" {
 		t.Fatalf("events=%+v", events)
 	}
+	j, err = OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = j.Append(Event{Type: "agent.result", Result: &Completion{CallID: "A", Fingerprint: "a", Null: true}}); err != nil {
+		t.Fatal(err)
+	}
+	events, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[1].Type != "agent.result" || events[1].Sequence != 2 {
+		t.Fatalf("journal did not recover after truncated tail: %+v", events)
+	}
 }
 
 func TestFingerprintPreservesStructuredOptions(t *testing.T) {

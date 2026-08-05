@@ -152,7 +152,7 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 	}
 	for _, nodeID := range w.Order {
 		n := w.Nodes[nodeID]
-		if n == nil || n.Kind != "agent" || n.SessionID == "" || n.State == core.NodeRunning {
+		if n == nil || n.Kind != "agent" || n.State == core.NodeRunning {
 			continue
 		}
 		agent, loadErr := e.Sessions.LoadByNode(w.ID, n.ID)
@@ -162,18 +162,25 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 		if loadErr != nil {
 			return loadErr
 		}
-		if hasEvidence(w, fmt.Sprintf("result-%s-%d", n.ID, n.Attempt)) {
-			for _, message := range agent.Inbox {
-				if message.State == agentsession.MessageDispatched && message.DeliveryAttempt == n.Attempt {
-					if err = e.Sessions.Deliver(agent.ID, n.Attempt); err != nil {
-						return err
-					}
-					agent, err = e.Sessions.Load(agent.ID)
-					if err != nil {
-						return err
-					}
-					break
-				}
+		outcomes := attemptOutcomesForNode(w, n.ID)
+		for _, message := range agent.Inbox {
+			if message.State != agentsession.MessageDispatched {
+				continue
+			}
+			outcome, outcomeErr := outcomeForDelivery(outcomes, message.DeliveryAttempt)
+			if outcomeErr != nil {
+				return outcomeErr
+			}
+			if outcome == nil {
+				continue
+			}
+			if outcome.InboxDisposition == "deliver" {
+				err = e.Sessions.Deliver(agent.ID, message.DeliveryAttempt)
+			} else {
+				err = e.Sessions.Requeue(agent.ID, message.DeliveryAttempt)
+			}
+			if err != nil {
+				return err
 			}
 			if err = e.Sessions.Observe(agent.ID, agentsession.Observation{LogicalState: logicalStateForNode(n.State), ProcessState: agentsession.ProcessExited}); err != nil {
 				return err
@@ -182,12 +189,13 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 			if err != nil {
 				return err
 			}
+			break
 		}
 		queued := false
 		for _, message := range agent.Inbox {
-			queued = queued || message.State == agentsession.MessageQueued
+			queued = queued || (message.State == agentsession.MessageQueued && message.DeliveryAttempt == 0)
 		}
-		if queued && (n.State == core.NodeCompleted || n.State == core.NodeWaiting || n.State == core.NodeFailed) {
+		if queued && n.SessionID != "" && (n.State == core.NodeCompleted || n.State == core.NodeWaiting || n.State == core.NodeFailed) {
 			if _, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "reopen_agent", NodeID: n.ID}}, Rationale: "recover queued durable reply after supervisor interruption"}); err != nil {
 				return err
 			}
@@ -245,26 +253,64 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 			state = core.NodeReady
 			summary = "restart-safe worker ended after supervisor interruption; scheduling a fresh attempt"
 		}
-		mutations := []core.Mutation{{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("recovery-%s-%d", n.ID, n.Attempt), NodeID: n.ID, Kind: "recovery", Summary: summary}}, {Op: "set_state", NodeID: n.ID, State: state}}
+		deliveryAttempt := 0
+		if n.Kind == "agent" {
+			deliveryAttempt, err = e.dispatchedDeliveryAttempt(w.ID, n.ID)
+			if err != nil {
+				return err
+			}
+		}
+		mutations := []core.Mutation{{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("recovery-%s-%d", n.ID, n.Attempt), NodeID: n.ID, Kind: "recovery", Summary: summary}}}
+		if n.Kind == "agent" {
+			mutations = append(mutations, attemptOutcomeMutation(n, n.Attempt, deliveryAttempt, "runtime_failure", "requeue", summary))
+		}
+		mutations = append(mutations, core.Mutation{Op: "set_state", NodeID: n.ID, State: state})
 		if sessionID != "" && sessionID != n.SessionID {
 			mutations = append([]core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, mutations...)
 		}
-		if err = e.requeueInterruptedAttempt(w, n, n.Attempt, state); err != nil {
+		_, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: mutations, Rationale: "reconcile interrupted runtime attempt"})
+		if err != nil || n.Kind != "agent" {
 			return err
 		}
-		_, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: mutations, Rationale: "reconcile interrupted runtime attempt"})
-		return err
+		agent, loadErr := e.Sessions.LoadByNode(w.ID, n.ID)
+		if errors.Is(loadErr, os.ErrNotExist) {
+			return nil
+		}
+		if loadErr != nil {
+			return loadErr
+		}
+		if deliveryAttempt > 0 {
+			if err = e.Sessions.Requeue(agent.ID, deliveryAttempt); err != nil {
+				return err
+			}
+		}
+		return e.Sessions.Observe(agent.ID, agentsession.Observation{LogicalState: logicalStateForNode(state), ProcessState: agentsession.ProcessExited})
 	}
 	return nil
 }
 
-func hasEvidence(w *core.Workflow, id string) bool {
+func attemptOutcomesForNode(w *core.Workflow, nodeID string) []core.Evidence {
+	var outcomes []core.Evidence
 	for _, evidence := range w.Evidence {
-		if evidence.ID == id {
-			return true
+		if evidence.NodeID == nodeID && evidence.Kind == "agent_attempt_outcome" {
+			outcomes = append(outcomes, evidence)
 		}
 	}
-	return false
+	return outcomes
+}
+
+func outcomeForDelivery(outcomes []core.Evidence, attempt int) (*core.Evidence, error) {
+	var matched *core.Evidence
+	for i := range outcomes {
+		if outcomes[i].DeliveryAttempt != attempt {
+			continue
+		}
+		if matched != nil && (matched.AttemptOutcome != outcomes[i].AttemptOutcome || matched.InboxDisposition != outcomes[i].InboxDisposition) {
+			return nil, fmt.Errorf("conflicting outcomes for inbox delivery attempt %d", attempt)
+		}
+		matched = &outcomes[i]
+	}
+	return matched, nil
 }
 
 func logicalStateForNode(state core.NodeState) agentsession.LogicalState {
@@ -276,32 +322,6 @@ func logicalStateForNode(state core.NodeState) agentsession.LogicalState {
 	default:
 		return agentsession.LogicalWorking
 	}
-}
-
-func (e *Engine) requeueInterruptedAttempt(w *core.Workflow, n *core.Node, attempt int, next core.NodeState) error {
-	if e.Sessions == nil || n.Kind != "agent" {
-		return nil
-	}
-	agent, err := e.Sessions.LoadByNode(w.ID, n.ID)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	for _, message := range agent.Inbox {
-		if message.State == agentsession.MessageDispatched && message.DeliveryAttempt == attempt {
-			if err = e.Sessions.Requeue(agent.ID, attempt); err != nil {
-				return err
-			}
-			break
-		}
-	}
-	logical := agentsession.LogicalWorking
-	if next == core.NodeWaiting {
-		logical = agentsession.LogicalNeedsInput
-	}
-	return e.Sessions.Observe(agent.ID, agentsession.Observation{LogicalState: logical, ProcessState: agentsession.ProcessExited})
 }
 
 // RecoverAttempt reapplies a completed runtime result that an older or crashed
@@ -378,24 +398,27 @@ func (e *Engine) runCommand(ctx context.Context, w *core.Workflow, n *core.Node)
 func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) error {
 	ctx, cancel := context.WithTimeout(ctx, w.Budget.MaxRuntime)
 	defer cancel()
+	attempt := n.Attempt + 1
 	dir := filepath.Join(e.Store.Dir(), "workflows", w.ID, "runs", n.ID, fmt.Sprintf("%d", n.Attempt+1))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	agent, err := e.ensureAgentSession(w, n)
 	if err != nil {
-		return e.fail(w, n, err.Error())
+		return e.failAgentAttempt(w, n, attempt, 0, "runtime_failure", err.Error())
 	}
 	defer func() {
 		_ = e.Sessions.Observe(agent.ID, agentsession.Observation{ProcessState: agentsession.ProcessExited})
 	}()
-	attempt := n.Attempt + 1
 	dispatched, err := e.Sessions.Dispatch(agent.ID, attempt)
 	if err != nil {
-		return e.fail(w, n, err.Error())
+		deliveryAttempt, _ := e.dispatchedDeliveryAttempt(w.ID, n.ID)
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
+	deliveryAttempt := 0
 	if len(dispatched) > 0 {
-		defer func() { _ = e.Sessions.Requeue(agent.ID, attempt) }()
+		deliveryAttempt = dispatched[0].DeliveryAttempt
+		defer func() { _ = e.Sessions.Requeue(agent.ID, deliveryAttempt) }()
 	}
 	prompt := contract(w, n, dispatched)
 	schema := filepath.Join(dir, "result.schema.json")
@@ -403,7 +426,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	_ = os.WriteFile(schema, []byte(resultSchema), 0o600)
 	c, err := hruntime.Build(n.Runtime, workdir(w, n), prompt, n.SessionID, schema, output)
 	if err != nil {
-		return e.fail(w, n, err.Error())
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
 	cmd := exec.CommandContext(ctx, c.Name, c.Args...)
 	cmd.Dir = workdir(w, n)
@@ -426,16 +449,16 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		RestartSafe:   n.Metadata["restart_safe"] == "true",
 	})
 	if err != nil {
-		return e.fail(w, n, err.Error())
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
 	stdout, err := os.OpenFile(stdoutPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return e.fail(w, n, err.Error())
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
 	defer stdout.Close()
 	stderr, err := os.OpenFile(stderrPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return e.fail(w, n, err.Error())
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
 	defer stderr.Close()
 	cmd.Stdout = stdout
@@ -444,7 +467,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		_ = recorder.Update(func(m *runstate.Manifest) {
 			m.Status, m.Error, m.FinishedAt = "failed", err.Error(), time.Now().UTC()
 		})
-		return e.fail(w, n, err.Error())
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
 	_ = e.Sessions.Observe(agent.ID, agentsession.Observation{ProcessState: agentsession.ProcessRunning})
 	_ = recorder.Update(func(m *runstate.Manifest) {
@@ -517,10 +540,10 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	}
 	if err != nil {
 		failure := fmt.Sprintf("runtime failed: %v: %s %s", err, truncate(string(stderrBytes), 1000), truncate(string(stdoutBytes), 1000))
-		if e.routeAfterLimit(w, n, failure, string(stderrBytes), string(stdoutBytes)) {
+		if e.routeAfterLimit(w, n, attempt, deliveryAttempt, failure, string(stderrBytes), string(stdoutBytes)) {
 			return nil
 		}
-		return e.fail(w, n, failure)
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", failure)
 	}
 	b := stdoutBytes
 	if data, readErr := os.ReadFile(output); readErr == nil && len(bytes.TrimSpace(data)) > 0 {
@@ -529,22 +552,23 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	result, err := parseResult(b)
 	if err != nil {
 		failure := err.Error() + ": " + truncate(string(stderrBytes), 1000) + " " + truncate(string(stdoutBytes), 1000)
-		if e.routeAfterLimit(w, n, failure, string(stderrBytes), string(stdoutBytes)) {
+		if e.routeAfterLimit(w, n, attempt, deliveryAttempt, failure, string(stderrBytes), string(stdoutBytes)) {
 			return nil
 		}
-		return e.fail(w, n, failure)
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "parse_failure", failure)
 	}
 	stats, inspectErr := finalize.InspectDiff(ctx, finalize.ExecRunner{Dir: workdir(w, n)}, workdir(w, n))
 	if inspectErr == nil && exceedsDiffBudget(w.Budget, stats) {
 		summary := fmt.Sprintf("worker stopped at deterministic diff budget: %d files / %d lines exceeds %d files / %d lines; result: %s", stats.Files, stats.Lines, w.Budget.MaxChangedFiles, w.Budget.MaxDiffLines, truncate(result.Summary, 1000))
 		_, applyErr := e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{
 			{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("budget-%s-%d", n.ID, n.Attempt+1), NodeID: n.ID, Kind: "budget", Summary: summary}},
+			attemptOutcomeMutation(n, attempt, deliveryAttempt, "diff_budget", "deliver", summary),
 			{Op: "set_state", NodeID: n.ID, State: core.NodeWaiting},
 		}, Rationale: "deterministic changed-file and diff-line budget"})
 		if applyErr == nil {
 			_ = e.Sessions.Observe(agent.ID, agentsession.Observation{LogicalState: agentsession.LogicalNeedsInput, ProcessState: agentsession.ProcessExited})
 			if len(dispatched) > 0 {
-				applyErr = e.Sessions.Deliver(agent.ID, attempt)
+				applyErr = e.Sessions.Deliver(agent.ID, deliveryAttempt)
 			}
 		}
 		return applyErr
@@ -557,9 +581,19 @@ func exceedsDiffBudget(budget core.Budget, stats finalize.DiffStats) bool {
 }
 
 func (e *Engine) applyAgentResult(w *core.Workflow, n *core.Node, result Result, streamSessionID string, attempt int) error {
+	deliveryAttempt, deliveryErr := e.dispatchedDeliveryAttempt(w.ID, n.ID)
+	if deliveryErr != nil {
+		return deliveryErr
+	}
+	if result.Status != "completed" && result.Status != "continue" && result.Status != "needs_human" && result.Status != "blocked" {
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "parse_failure", fmt.Sprintf("unsupported agent result status %q", result.Status))
+	}
 	mut := make([]core.Mutation, 0, len(result.Mutations)+4)
 	for _, proposed := range result.Mutations {
 		mutation := proposed.Mutation
+		if mutation.Op == "add_evidence" && mutation.Evidence != nil && mutation.Evidence.Kind == "agent_attempt_outcome" {
+			return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "parse_failure", "runtime attempted to forge reserved attempt outcome evidence")
+		}
 		if mutation.Op == "add_node" && mutation.Node != nil && mutation.Node.Runtime.Name == "" {
 			node := *mutation.Node
 			node.Runtime, node.Role = n.Runtime, n.Role
@@ -596,10 +630,14 @@ func (e *Engine) applyAgentResult(w *core.Workflow, n *core.Node, result Result,
 	if result.Status == "blocked" {
 		state = core.NodeFailed
 	}
-	mut = append(mut, core.Mutation{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("result-%s-%d", n.ID, attempt), NodeID: n.ID, Kind: "agent", Summary: result.Summary}}, core.Mutation{Op: "set_state", NodeID: n.ID, State: state})
+	mut = append(mut,
+		core.Mutation{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("result-%s-%d", n.ID, attempt), NodeID: n.ID, Kind: "agent", Summary: result.Summary}},
+		attemptOutcomeMutation(n, attempt, deliveryAttempt, result.Status, "deliver", result.Summary),
+		core.Mutation{Op: "set_state", NodeID: n.ID, State: state},
+	)
 	_, err := e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: n.ID, Mutations: mut, Rationale: result.Summary})
 	if err != nil {
-		return e.fail(w, n, "runtime proposed an invalid workflow mutation: "+err.Error())
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "parse_failure", "runtime proposed an invalid workflow mutation: "+err.Error())
 	}
 	if n.Kind == "agent" {
 		agent, sessionErr := e.ensureAgentSession(w, n)
@@ -612,8 +650,8 @@ func (e *Engine) applyAgentResult(w *core.Workflow, n *core.Node, result Result,
 		}
 		if current, loadErr := e.Sessions.Load(agent.ID); loadErr == nil {
 			for _, message := range current.Inbox {
-				if message.State == agentsession.MessageDispatched && message.DeliveryAttempt == attempt {
-					return e.Sessions.Deliver(agent.ID, attempt)
+				if message.State == agentsession.MessageDispatched && message.DeliveryAttempt == deliveryAttempt {
+					return e.Sessions.Deliver(agent.ID, deliveryAttempt)
 				}
 			}
 		}
@@ -718,7 +756,7 @@ func observeRuntimeEvents(path string, stop <-chan struct{}, onSession func(stri
 	return done
 }
 
-func (e *Engine) routeAfterLimit(w *core.Workflow, n *core.Node, failure string, rawOutput ...string) bool {
+func (e *Engine) routeAfterLimit(w *core.Workflow, n *core.Node, attempt, deliveryAttempt int, failure string, rawOutput ...string) bool {
 	if e.Preferences == nil || n.Role == "" {
 		return false
 	}
@@ -732,6 +770,7 @@ func (e *Engine) routeAfterLimit(w *core.Workflow, n *core.Node, failure string,
 	next, index, routeErr := e.Preferences.Resolve(n.Role, n.Runtime)
 	mutations := []core.Mutation{
 		{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("limit-%s-%d", n.ID, n.Attempt+1), NodeID: n.ID, Kind: "provider_limit", Summary: fmt.Sprintf("%s hit %s; %s", preferences.Key(n.Runtime), class, truncate(failure, 500))}},
+		attemptOutcomeMutation(n, attempt, deliveryAttempt, "provider_limit", "requeue", failure),
 		{Op: "refund_attempt", NodeID: n.ID},
 		{Op: "set_state", NodeID: n.ID, State: core.NodeReady},
 	}
@@ -740,6 +779,55 @@ func (e *Engine) routeAfterLimit(w *core.Workflow, n *core.Node, failure string,
 	}
 	_, err := e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: mutations, Rationale: "observable preference-ladder fallback"})
 	return err == nil
+}
+
+func attemptOutcomeMutation(n *core.Node, attempt, deliveryAttempt int, outcome, disposition, summary string) core.Mutation {
+	return core.Mutation{Op: "add_evidence", Evidence: &core.Evidence{
+		ID: fmt.Sprintf("attempt-outcome-%s-r%d-d%d-%s", n.ID, attempt, deliveryAttempt, outcome), NodeID: n.ID,
+		Kind: "agent_attempt_outcome", Summary: truncate(summary, 1000), Attempt: attempt,
+		DeliveryAttempt: deliveryAttempt, AttemptOutcome: outcome, InboxDisposition: disposition,
+	}}
+}
+
+func (e *Engine) dispatchedDeliveryAttempt(workflowID, nodeID string) (int, error) {
+	if e.Sessions == nil {
+		var err error
+		e.Sessions, err = agentsession.OpenStore(e.Store.Dir())
+		if err != nil {
+			return 0, err
+		}
+	}
+	agent, err := e.Sessions.LoadByNode(workflowID, nodeID)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	attempt := 0
+	for _, message := range agent.Inbox {
+		if message.State != agentsession.MessageDispatched {
+			continue
+		}
+		if attempt != 0 && attempt != message.DeliveryAttempt {
+			return 0, errors.New("agent session has multiple dispatched inbox attempts")
+		}
+		attempt = message.DeliveryAttempt
+	}
+	return attempt, nil
+}
+
+func (e *Engine) failAgentAttempt(w *core.Workflow, n *core.Node, attempt, deliveryAttempt int, outcome, reason string) error {
+	state := core.NodeFailed
+	if n.Attempt+1 < n.MaxAttempts {
+		state = core.NodeReady
+	}
+	_, err := e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{
+		{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("error-%s-%d", n.ID, attempt), NodeID: n.ID, Kind: "runtime_error", Summary: reason}},
+		attemptOutcomeMutation(n, attempt, deliveryAttempt, outcome, "requeue", reason),
+		{Op: "set_state", NodeID: n.ID, State: state},
+	}})
+	return err
 }
 
 func (e *Engine) fail(w *core.Workflow, n *core.Node, reason string) error {

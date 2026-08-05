@@ -67,13 +67,17 @@ type Node struct {
 }
 
 type Evidence struct {
-	ID        string    `json:"id"`
-	NodeID    string    `json:"node_id"`
-	Kind      string    `json:"kind"`
-	Summary   string    `json:"summary"`
-	URI       string    `json:"uri,omitempty"`
-	Digest    string    `json:"digest,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	ID               string    `json:"id"`
+	NodeID           string    `json:"node_id"`
+	Kind             string    `json:"kind"`
+	Summary          string    `json:"summary"`
+	URI              string    `json:"uri,omitempty"`
+	Digest           string    `json:"digest,omitempty"`
+	Attempt          int       `json:"attempt,omitempty"`
+	DeliveryAttempt  int       `json:"delivery_attempt,omitempty"`
+	AttemptOutcome   string    `json:"attempt_outcome,omitempty"`
+	InboxDisposition string    `json:"inbox_disposition,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 type Attestation struct {

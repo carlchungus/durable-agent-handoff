@@ -9,6 +9,7 @@ import (
 
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
+	agentsession "github.com/carlchungus/durable-agent-handoff/internal/session"
 )
 
 func TestUsageLimitFallsThroughConfiguredLadder(t *testing.T) {
@@ -31,10 +32,13 @@ func TestUsageLimitFallsThroughConfiguredLadder(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ := core.OpenStore(state)
+	sessions, _ := agentsession.OpenStore(state)
 	w, _ := st.Create("fallback", t.TempDir(), core.DefaultBudget())
 	n := &core.Node{ID: "plan", Title: "plan", Kind: "agent", Role: "planner", Runtime: primary}
 	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
-	eng := Engine{Store: st, Preferences: prefs}
+	agent, _ := sessions.Ensure(agentsession.Descriptor{WorkflowID: w.ID, NodeID: n.ID})
+	_, _ = sessions.Queue(agent.ID, "human", "keep this reply")
+	eng := Engine{Store: st, Preferences: prefs, Sessions: sessions}
 	if _, err := eng.RunOne(context.Background(), w.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -45,6 +49,10 @@ func TestUsageLimitFallsThroughConfiguredLadder(t *testing.T) {
 	if afterLimit.Nodes["plan"].Attempt != 0 {
 		t.Fatalf("provider routing consumed a task attempt: %d", afterLimit.Nodes["plan"].Attempt)
 	}
+	agent, _ = sessions.Load(agent.ID)
+	if agent.Inbox[0].State != agentsession.MessageQueued || agent.Inbox[0].DeliveryAttempt != 1 {
+		t.Fatalf("provider fallback did not preserve rejected delivery: %+v", agent.Inbox)
+	}
 	if _, err := eng.RunOne(context.Background(), w.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -54,5 +62,9 @@ func TestUsageLimitFallsThroughConfiguredLadder(t *testing.T) {
 	}
 	if done.Nodes["plan"].Attempt != 1 {
 		t.Fatalf("successful backup should be the first task attempt: %d", done.Nodes["plan"].Attempt)
+	}
+	agent, _ = sessions.Load(agent.ID)
+	if agent.Inbox[0].State != agentsession.MessageDelivered || agent.Inbox[0].DeliveryAttempt != 2 {
+		t.Fatalf("refunded node attempt reused inbox fence: %+v", agent.Inbox)
 	}
 }

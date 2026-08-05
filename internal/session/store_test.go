@@ -177,8 +177,15 @@ func TestInterruptedAttemptRequeuesOnlyItsOwnMessages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requeued.Inbox[0].State != MessageQueued || requeued.Inbox[0].DeliveryAttempt != 0 {
+	if requeued.Inbox[0].State != MessageQueued || requeued.Inbox[0].DeliveryAttempt != 2 {
 		t.Fatalf("inbox=%+v", requeued.Inbox)
+	}
+	redispatched, err := store.Dispatch(agent.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(redispatched) != 1 || redispatched[0].DeliveryAttempt != 3 {
+		t.Fatalf("refunded node attempt reused delivery fence: %+v", redispatched)
 	}
 }
 

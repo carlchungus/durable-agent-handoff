@@ -144,11 +144,19 @@ func (s *Store) Dispatch(id string, attempt int) ([]Message, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Node retry counters may be refunded after a provider limit. Delivery
+	// attempts never rewind: they fence one inbox batch independently.
+	deliveryAttempt := attempt
+	for _, message := range agent.Inbox {
+		if message.DeliveryAttempt >= deliveryAttempt {
+			deliveryAttempt = message.DeliveryAttempt + 1
+		}
+	}
 	var dispatched []Message
 	for _, message := range agent.Inbox {
 		if message.State == MessageQueued {
 			message.State = MessageDispatched
-			message.DeliveryAttempt = attempt
+			message.DeliveryAttempt = deliveryAttempt
 			dispatched = append(dispatched, message)
 		}
 	}
@@ -156,11 +164,11 @@ func (s *Store) Dispatch(id string, attempt int) ([]Message, error) {
 		return nil, nil
 	}
 	now := time.Now().UTC()
-	data := deliveryEvent{Attempt: attempt}
+	data := deliveryEvent{Attempt: deliveryAttempt}
 	if err = s.appendLocked(id, Event{SessionID: id, Type: "messages.dispatched", At: now, Data: data}); err != nil {
 		return nil, err
 	}
-	applyMessagesDispatched(agent, attempt, now)
+	applyMessagesDispatched(agent, deliveryAttempt, now)
 	if err = s.snapshotLocked(agent); err != nil {
 		return nil, err
 	}
@@ -416,7 +424,6 @@ func applyMessagesRequeued(agent *Session, attempt int, at time.Time) {
 	for i := range agent.Inbox {
 		if agent.Inbox[i].State == MessageDispatched && agent.Inbox[i].DeliveryAttempt == attempt {
 			agent.Inbox[i].State = MessageQueued
-			agent.Inbox[i].DeliveryAttempt = 0
 		}
 	}
 	agent.UpdatedAt = at

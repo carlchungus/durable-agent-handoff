@@ -65,7 +65,7 @@ $HANDOFF_HOME/sessions/AGENT_ID/
   state.json
 ```
 
-This is deliberately separate from workflow nodes: a node describes graph work, while an agent session describes a durable conversation and its queued replies. Logical state and process liveness are independent. Message dispatch is fenced to an attempt and acknowledged only after valid result reduction; interrupted attempts requeue their own messages. Exact opaque runtime session IDs are retained across process exit and reply-triggered restart.
+This is deliberately separate from workflow nodes: a node describes graph work, while an agent session describes a durable conversation and its queued replies. Logical state and process liveness are independent. Message dispatch uses a monotonic fence independent of refundable node retry counts. Every accepted or rejected agent exit records a typed attempt outcome atomically with its workflow transition; reconciliation delivers or requeues only the inbox batch named by that outcome. Exact opaque runtime session IDs are retained across process exit and reply-triggered restart.
 
 ## Scheduling
 

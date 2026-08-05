@@ -53,7 +53,9 @@ Background agent identity and inbox state use a separate append-only ledger at `
 
 `handoff agents --json` returns both `logical_state` (`working`, `needs_input`, `completed`, or `stopped`) and `process_state` (`starting`, `running`, or `exited`). Consumers must not infer one dimension from the other. `handoff agent inbox WORKFLOW_ID NODE_ID --after N` provides a cursor-readable inbox. `handoff agent reply WORKFLOW_ID NODE_ID --message TEXT` durably queues a human reply and reopens only an exact persisted session.
 
-Messages move `queued` to `dispatched` for one numbered runtime attempt, then to `delivered` only after that attempt emits and reduces a valid result. A failed or interrupted attempt requeues only messages fenced to that attempt. Reconciliation repairs the crash window between queueing a reply and reopening its node.
+Messages move `queued` to `dispatched` under a monotonic delivery-attempt fence. This identity never rewinds when a provider-limit transition refunds the node retry counter. Requeue preserves the former delivery attempt; a later dispatch receives a larger one. A queued message with delivery attempt zero has never been dispatched and may repair the crash window between a human reply and node wake-up.
+
+Every agent exit atomically records `agent_attempt_outcome` evidence with `attempt`, `delivery_attempt`, `attempt_outcome`, and `inbox_disposition`. `completed`, `continue`, `needs_human`, `blocked`, and `diff_budget` require `deliver`; `runtime_failure`, `parse_failure`, and `provider_limit` require `requeue`. Reconciliation matches this explicit evidence to a dispatched delivery attempt and applies its disposition exactly once. It never guesses consumption from node state or a legacy evidence name.
 
 ## Team protocol
 

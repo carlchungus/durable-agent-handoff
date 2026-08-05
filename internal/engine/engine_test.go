@@ -351,6 +351,93 @@ func TestEngineDeliversDurableReplyToExactResumedAttempt(t *testing.T) {
 	}
 }
 
+func TestAgentFailurePathsRecordRejectedAttemptOutcome(t *testing.T) {
+	if os.Getenv("GO_WANT_ATTEMPT_FAILURE_HELPER") == "1" {
+		if strings.Contains(strings.Join(os.Args, " "), "runtime-failure-mode") {
+			fmt.Fprintln(os.Stderr, "runtime exploded")
+			os.Exit(2)
+		}
+		fmt.Println("not a result")
+		os.Exit(0)
+	}
+	t.Setenv("GO_WANT_ATTEMPT_FAILURE_HELPER", "1")
+	for _, tc := range []struct{ mode, outcome string }{{"runtime-failure-mode", "runtime_failure"}, {"parse-failure-mode", "parse_failure"}} {
+		t.Run(tc.outcome, func(t *testing.T) {
+			state := t.TempDir()
+			st, _ := core.OpenStore(state)
+			sessions, _ := agentsession.OpenStore(state)
+			w, _ := st.Create("record rejected attempt", t.TempDir(), core.DefaultBudget())
+			n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "exec", Executable: os.Args[0], Args: []string{"-test.run=TestAgentFailurePathsRecordRejectedAttemptOutcome", tc.mode}}}
+			_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+			agent, _ := sessions.Ensure(agentsession.Descriptor{WorkflowID: w.ID, NodeID: n.ID})
+			_, _ = sessions.Queue(agent.ID, "human", "retry me")
+			if _, err := (&Engine{Store: st, Sessions: sessions}).RunOne(context.Background(), w.ID); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := st.Load(w.ID)
+			outcomes := attemptOutcomesForNode(got, n.ID)
+			if len(outcomes) != 1 || outcomes[0].AttemptOutcome != tc.outcome || outcomes[0].InboxDisposition != "requeue" || outcomes[0].DeliveryAttempt != 1 {
+				t.Fatalf("outcomes=%+v", outcomes)
+			}
+			agent, _ = sessions.Load(agent.ID)
+			if agent.Inbox[0].State != agentsession.MessageQueued || agent.Inbox[0].DeliveryAttempt != 1 {
+				t.Fatalf("session=%+v", agent)
+			}
+		})
+	}
+}
+
+func TestDiffBudgetRecordsAcceptedAttemptOutcome(t *testing.T) {
+	if os.Getenv("GO_WANT_DIFF_BUDGET_HELPER") == "1" {
+		fmt.Println(`{"status":"completed","summary":"implemented","attestations":[]}`)
+		os.Exit(0)
+	}
+	t.Setenv("GO_WANT_DIFF_BUDGET_HELPER", "1")
+	root := t.TempDir()
+	for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.com"}, {"config", "user.name", "Test"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "base.txt"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "base.txt"}, {"commit", "-m", "base"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "extra.txt"), []byte("over budget\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	sessions, _ := agentsession.OpenStore(state)
+	budget := core.DefaultBudget()
+	budget.MaxChangedFiles = 0
+	w, _ := st.Create("stop at diff budget", root, budget)
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "exec", Executable: os.Args[0], Args: []string{"-test.run=TestDiffBudgetRecordsAcceptedAttemptOutcome"}}}
+	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	agent, _ := sessions.Ensure(agentsession.Descriptor{WorkflowID: w.ID, NodeID: n.ID})
+	_, _ = sessions.Queue(agent.ID, "human", "apply this")
+	if _, err := (&Engine{Store: st, Sessions: sessions}).RunOne(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Load(w.ID)
+	outcomes := attemptOutcomesForNode(got, n.ID)
+	if got.Nodes[n.ID].State != core.NodeWaiting || len(outcomes) != 1 || outcomes[0].AttemptOutcome != "diff_budget" || outcomes[0].InboxDisposition != "deliver" {
+		t.Fatalf("node=%+v outcomes=%+v", got.Nodes[n.ID], outcomes)
+	}
+	agent, _ = sessions.Load(agent.ID)
+	if agent.Inbox[0].State != agentsession.MessageDelivered || agent.Inbox[0].DeliveryAttempt != 1 {
+		t.Fatalf("session=%+v", agent)
+	}
+}
+
 func TestInvalidAgentMutationFailsClosed(t *testing.T) {
 	if os.Getenv("GO_WANT_BAD_HANDOFF_HELPER") == "1" {
 		fmt.Println(`{"status":"completed","summary":"tried to escalate","mutations":[{"op":"add_node","node":{"id":"merge-now","title":"merge","kind":"merge"}}]}`)
@@ -435,47 +522,77 @@ func TestReconcileRequeuesReplyFromInterruptedRuntimeAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent, _ = sessions.Load(agent.ID)
-	if agent.Inbox[0].State != agentsession.MessageQueued || agent.Inbox[0].DeliveryAttempt != 0 || agent.ProcessState != agentsession.ProcessExited {
+	if agent.Inbox[0].State != agentsession.MessageQueued || agent.Inbox[0].DeliveryAttempt != 1 || agent.ProcessState != agentsession.ProcessExited {
 		t.Fatalf("session=%+v", agent)
 	}
 }
 
-func TestReconcileAcknowledgesReducedResultForEveryStatus(t *testing.T) {
-	states := []core.NodeState{core.NodeReady, core.NodeWaiting, core.NodeFailed, core.NodeCompleted}
-	for _, reducedState := range states {
-		t.Run(string(reducedState), func(t *testing.T) {
+func TestReconcileAppliesExplicitAttemptOutcomeExactlyOnce(t *testing.T) {
+	cases := []struct {
+		name        string
+		outcome     string
+		disposition string
+		state       core.NodeState
+		refund      bool
+		logical     agentsession.LogicalState
+	}{
+		{name: "completed", outcome: "completed", disposition: "deliver", state: core.NodeCompleted, logical: agentsession.LogicalCompleted},
+		{name: "continue", outcome: "continue", disposition: "deliver", state: core.NodeReady, logical: agentsession.LogicalWorking},
+		{name: "needs-human", outcome: "needs_human", disposition: "deliver", state: core.NodeWaiting, logical: agentsession.LogicalNeedsInput},
+		{name: "blocked", outcome: "blocked", disposition: "deliver", state: core.NodeFailed, logical: agentsession.LogicalCompleted},
+		{name: "diff-budget", outcome: "diff_budget", disposition: "deliver", state: core.NodeWaiting, logical: agentsession.LogicalNeedsInput},
+		{name: "runtime-failure", outcome: "runtime_failure", disposition: "requeue", state: core.NodeReady, logical: agentsession.LogicalWorking},
+		{name: "parse-failure", outcome: "parse_failure", disposition: "requeue", state: core.NodeFailed, logical: agentsession.LogicalCompleted},
+		{name: "provider-fallback-refunded", outcome: "provider_limit", disposition: "requeue", state: core.NodeReady, refund: true, logical: agentsession.LogicalWorking},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			state := t.TempDir()
 			st, _ := core.OpenStore(state)
 			sessions, _ := agentsession.OpenStore(state)
-			w, _ := st.Create("recover result ack", t.TempDir(), core.DefaultBudget())
+			w, _ := st.Create("recover attempt outcome", t.TempDir(), core.DefaultBudget())
 			n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "claude"}, SessionID: "session-exact-123"}
 			w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
 			w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: n.ID, State: core.NodeRunning}}})
 			agent, _ := sessions.Ensure(agentsession.Descriptor{WorkflowID: w.ID, NodeID: n.ID, RuntimeSessionID: n.SessionID})
 			_, _ = sessions.Queue(agent.ID, "human", "continue")
-			_, _ = sessions.Dispatch(agent.ID, 1)
-			_, err := st.Apply(core.Proposal{WorkflowID: w.ID, Actor: n.ID, Mutations: []core.Mutation{
-				{Op: "add_evidence", Evidence: &core.Evidence{ID: "result-lead-1", NodeID: n.ID, Kind: "agent", Summary: "valid result reduced"}},
-				{Op: "set_state", NodeID: n.ID, State: reducedState},
-			}})
+			deliveryAttempt := 1
+			if tc.refund {
+				deliveryAttempt = 2
+			}
+			_, _ = sessions.Dispatch(agent.ID, deliveryAttempt)
+			mutations := []core.Mutation{attemptOutcomeMutation(n, 1, deliveryAttempt, tc.outcome, tc.disposition, tc.name)}
+			if tc.refund {
+				mutations = append(mutations, core.Mutation{Op: "refund_attempt", NodeID: n.ID})
+			}
+			mutations = append(mutations, core.Mutation{Op: "set_state", NodeID: n.ID, State: tc.state})
+			_, err := st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: mutations})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err = (&Engine{Store: st, Sessions: sessions}).Reconcile(context.Background(), w.ID); err != nil {
-				t.Fatal(err)
+			eng := &Engine{Store: st, Sessions: sessions}
+			for i := 0; i < 2; i++ {
+				if err = eng.Reconcile(context.Background(), w.ID); err != nil {
+					t.Fatal(err)
+				}
 			}
 			agent, _ = sessions.Load(agent.ID)
-			if agent.Inbox[0].State != agentsession.MessageDelivered || agent.Inbox[0].DeliveryAttempt != 1 {
-				t.Fatalf("state=%s session=%+v", reducedState, agent)
+			wantMessageState := agentsession.MessageDelivered
+			if tc.disposition == "requeue" {
+				wantMessageState = agentsession.MessageQueued
 			}
-			wantLogical := agentsession.LogicalWorking
-			if reducedState == core.NodeWaiting {
-				wantLogical = agentsession.LogicalNeedsInput
-			} else if reducedState == core.NodeFailed || reducedState == core.NodeCompleted {
-				wantLogical = agentsession.LogicalCompleted
+			if agent.Inbox[0].State != wantMessageState || agent.Inbox[0].DeliveryAttempt != deliveryAttempt {
+				t.Fatalf("case=%s session=%+v", tc.name, agent)
 			}
-			if agent.LogicalState != wantLogical || agent.ProcessState != agentsession.ProcessExited {
-				t.Fatalf("state=%s logical=%s process=%s", reducedState, agent.LogicalState, agent.ProcessState)
+			if agent.LogicalState != tc.logical || agent.ProcessState != agentsession.ProcessExited {
+				t.Fatalf("case=%s logical=%s process=%s", tc.name, agent.LogicalState, agent.ProcessState)
+			}
+			got, _ := st.Load(w.ID)
+			if tc.refund && got.Nodes[n.ID].Attempt != 0 {
+				t.Fatalf("refunded node attempt=%d", got.Nodes[n.ID].Attempt)
+			}
+			if tc.state == core.NodeFailed && got.Nodes[n.ID].State != core.NodeFailed {
+				t.Fatalf("requeued failure was unexpectedly reopened: %+v", got.Nodes[n.ID])
 			}
 		})
 	}

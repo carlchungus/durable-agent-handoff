@@ -146,6 +146,14 @@ func validateMutation(w *Workflow, actor string, m Mutation) error {
 		if m.Evidence == nil || w.Nodes[m.Evidence.NodeID] == nil {
 			return errors.New("evidence requires an existing node")
 		}
+		if m.Evidence.Kind == "agent_attempt_outcome" {
+			if actor != "supervisor" && actor != m.Evidence.NodeID {
+				return errors.New("attempt outcome requires the supervisor or owning agent")
+			}
+			if err := validateAttemptOutcome(m.Evidence); err != nil {
+				return err
+			}
+		}
 	case "attest":
 		if m.Attestation == nil || w.Nodes[m.Attestation.NodeID] == nil {
 			return errors.New("attestation requires an existing node")
@@ -155,6 +163,25 @@ func validateMutation(w *Workflow, actor string, m Mutation) error {
 		}
 	default:
 		return fmt.Errorf("unknown mutation %q", m.Op)
+	}
+	return nil
+}
+
+func validateAttemptOutcome(e *Evidence) error {
+	if e.Attempt < 1 || e.DeliveryAttempt < 0 {
+		return errors.New("attempt outcome requires a positive runtime attempt and non-negative delivery attempt")
+	}
+	deliver := e.AttemptOutcome == "completed" || e.AttemptOutcome == "continue" || e.AttemptOutcome == "needs_human" || e.AttemptOutcome == "blocked" || e.AttemptOutcome == "diff_budget"
+	requeue := e.AttemptOutcome == "runtime_failure" || e.AttemptOutcome == "parse_failure" || e.AttemptOutcome == "provider_limit"
+	if !deliver && !requeue {
+		return fmt.Errorf("unknown agent attempt outcome %q", e.AttemptOutcome)
+	}
+	want := "deliver"
+	if requeue {
+		want = "requeue"
+	}
+	if e.InboxDisposition != want {
+		return fmt.Errorf("agent attempt outcome %q requires inbox disposition %q", e.AttemptOutcome, want)
 	}
 	return nil
 }

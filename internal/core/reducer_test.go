@@ -165,3 +165,21 @@ func TestSetSessionIsScopedToSupervisorOrOwningAgent(t *testing.T) {
 		t.Fatalf("lead=%+v review=%+v", w.Nodes["lead"], w.Nodes["review"])
 	}
 }
+
+func TestAttemptOutcomeEvidenceIsTypedAndCapabilityScoped(t *testing.T) {
+	w := fixtureWorkflow(t)
+	w.Nodes["lead"] = &Node{ID: "lead", Title: "lead", Kind: "agent", State: NodeRunning}
+	w.Order = append(w.Order, "lead")
+	valid := &Evidence{ID: "outcome", NodeID: "lead", Kind: "agent_attempt_outcome", Summary: "accepted", Attempt: 1, DeliveryAttempt: 2, AttemptOutcome: "continue", InboxDisposition: "deliver"}
+	if err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "lead", Mutations: []Mutation{{Op: "add_evidence", Evidence: valid}}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	bad := *valid
+	bad.ID, bad.AttemptOutcome, bad.InboxDisposition = "bad", "runtime_failure", "deliver"
+	if err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []Mutation{{Op: "add_evidence", Evidence: &bad}}}, time.Now().UTC()); err == nil || !strings.Contains(err.Error(), "requires inbox disposition") {
+		t.Fatalf("invalid outcome accepted: %v", err)
+	}
+	if err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "other", Mutations: []Mutation{{Op: "add_evidence", Evidence: valid}}}, time.Now().UTC()); err == nil || !strings.Contains(err.Error(), "owning agent") {
+		t.Fatalf("cross-agent outcome accepted: %v", err)
+	}
+}

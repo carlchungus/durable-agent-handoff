@@ -23,7 +23,10 @@ func (s *Supervisor) Start(descriptor Descriptor) (*Activity, Attempt, error) {
 	if err != nil {
 		return nil, Attempt{}, err
 	}
-	attempt, stdout, stderr, err := s.Store.PrepareAttempt(activity.ID, activity.Generation, AttemptStart{Runtime: descriptor.Launch.Runtime, Model: descriptor.Launch.Model})
+	attempt, stdout, stderr, err := s.Store.PrepareAttempt(activity.ID, activity.Generation, AttemptStart{
+		Runtime: descriptor.Launch.Runtime, Model: descriptor.Launch.Model,
+		LaunchDigest: runstate.CommandDigest(descriptor.Launch.Argv[0], descriptor.Launch.Argv[1:]),
+	})
 	if err != nil {
 		return nil, Attempt{}, err
 	}

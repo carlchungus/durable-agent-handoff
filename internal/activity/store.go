@@ -76,6 +76,27 @@ func (s *Store) Create(descriptor Descriptor) (*Activity, error) {
 	return result, err
 }
 
+func (s *Store) Ensure(descriptor Descriptor) (*Activity, error) {
+	if descriptor.ID == "" {
+		return s.Create(descriptor)
+	}
+	existing, err := s.Load(descriptor.ID)
+	if errors.Is(err, os.ErrNotExist) {
+		return s.Create(descriptor)
+	}
+	if err != nil {
+		return nil, err
+	}
+	digest, err := launchDigest(cloneLaunch(descriptor.Launch))
+	if err != nil {
+		return nil, err
+	}
+	if existing.OwnerSessionID != descriptor.OwnerSessionID || existing.LaunchDigest != digest {
+		return nil, fmt.Errorf("activity %s immutable launch does not match", descriptor.ID)
+	}
+	return existing, nil
+}
+
 func (s *Store) PrepareAttempt(id string, expectedGeneration uint64, start AttemptStart) (Attempt, *os.File, *os.File, error) {
 	var attempt Attempt
 	var stdout, stderr *os.File
@@ -110,7 +131,7 @@ func (s *Store) PrepareAttempt(id string, expectedGeneration uint64, start Attem
 		}
 		now := time.Now().UTC()
 		attempt = Attempt{
-			ID: attemptID, Ordinal: ordinal, Runtime: start.Runtime, Model: start.Model,
+			ID: attemptID, Ordinal: ordinal, Runtime: start.Runtime, Model: start.Model, LaunchDigest: start.LaunchDigest,
 			State: StateStarting, StartedAt: now,
 			Stdout: outputRef(id, attemptID, StreamStdout, stdoutName, stdoutPath),
 			Stderr: outputRef(id, attemptID, StreamStderr, stderrName, stderrPath),
@@ -156,6 +177,26 @@ func (s *Store) MarkRunning(id string, expectedGeneration uint64, attemptID stri
 		return snapshot(tx, activity)
 	})
 	return result, err
+}
+
+func (s *Store) FailPrepared(id string, expectedGeneration uint64, attemptID, reason string) error {
+	return s.ledger.Update(id, func(tx *secureledger.Txn) error {
+		activity, err := replay(tx.Replay)
+		if err != nil {
+			return err
+		}
+		current, ok := currentAttempt(activity)
+		if !ok || current.ID != attemptID || current.State != StateStarting || activity.State != StateStarting || activity.Generation != expectedGeneration {
+			return ErrFenced
+		}
+		now := time.Now().UTC()
+		data := preparedFailureEvent{AttemptID: attemptID, Error: reason}
+		if err = appendEvent(tx, Event{ActivityID: id, Type: "attempt.prepare_failed", At: now, Data: data}); err != nil {
+			return err
+		}
+		applyPreparedFailure(activity, data, now)
+		return snapshot(tx, activity)
+	})
 }
 
 func (s *Store) AdoptAttempt(id string, expectedGeneration uint64, expected AttemptIdentity) (Attempt, *Activity, error) {
@@ -350,6 +391,15 @@ func replay(run replayFn) (*Activity, error) {
 				return err
 			}
 			applyRunning(activity, data, event.At)
+		case "attempt.prepare_failed":
+			if activity == nil {
+				return errors.New("prepare failure preceded activity creation")
+			}
+			var data preparedFailureEvent
+			if err := json.Unmarshal(event.Data, &data); err != nil {
+				return err
+			}
+			applyPreparedFailure(activity, data, event.At)
 		case "attempt.adopted":
 			if activity == nil {
 				return errors.New("adoption preceded activity creation")
@@ -407,6 +457,11 @@ type adoptEvent struct {
 	Expected             AttemptIdentity `json:"expected"`
 	Generation           uint64          `json:"generation"`
 	SupervisorGeneration uint64          `json:"supervisor_generation"`
+}
+
+type preparedFailureEvent struct {
+	AttemptID string `json:"attempt_id"`
+	Error     string `json:"error"`
 }
 
 func appendEvent(tx *secureledger.Txn, event Event) error {
@@ -475,6 +530,22 @@ func applyAdopt(activity *Activity, data adoptEvent, at time.Time) {
 	activity.UpdatedAt = at
 }
 
+func applyPreparedFailure(activity *Activity, data preparedFailureEvent, at time.Time) {
+	for i := range activity.Attempts {
+		if activity.Attempts[i].ID == data.AttemptID {
+			activity.Attempts[i].State = StateFailed
+			activity.Attempts[i].Error = data.Error
+			activity.Attempts[i].FinishedAt = at
+			activity.Attempts[i].Stdout.Closed = true
+			activity.Attempts[i].Stderr.Closed = true
+			break
+		}
+	}
+	activity.State = StateFailed
+	activity.Revision++
+	activity.UpdatedAt = at
+}
+
 func currentAttempt(activity *Activity) (Attempt, bool) {
 	if len(activity.Attempts) == 0 {
 		return Attempt{}, false
@@ -534,6 +605,11 @@ func newID(prefix string) (string, error) {
 		return "", err
 	}
 	return prefix + "_" + hex.EncodeToString(bytes), nil
+}
+
+func StableID(parts ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return "activity_" + hex.EncodeToString(sum[:12])
 }
 
 func cloneLaunch(launch LaunchSpec) LaunchSpec {

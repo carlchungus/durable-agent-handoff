@@ -105,6 +105,23 @@ func TestActivityLaunchIsImmutableAndOutputIdentityIsExact(t *testing.T) {
 	}
 }
 
+func TestEnsureReusesOnlyTheExactImmutableLaunch(t *testing.T) {
+	store, _ := OpenStore(t.TempDir())
+	descriptor := Descriptor{ID: StableID("wf", "node", "1"), OwnerSessionID: "agent_owner", Launch: LaunchSpec{Kind: "agent", Argv: []string{"codex", "exec"}, Cwd: "/tmp", Runtime: "codex", Model: "sol"}}
+	first, err := store.Ensure(descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := store.Ensure(descriptor)
+	if err != nil || again.ID != first.ID || again.LaunchDigest != first.LaunchDigest {
+		t.Fatalf("again=%+v err=%v", again, err)
+	}
+	descriptor.Launch.Model = "other"
+	if _, err = store.Ensure(descriptor); err == nil {
+		t.Fatal("ensure accepted a changed immutable launch")
+	}
+}
+
 func identity(attempt Attempt) AttemptIdentity {
 	return AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorGeneration: attempt.SupervisorGeneration}
 }

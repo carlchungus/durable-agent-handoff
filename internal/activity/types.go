@@ -51,6 +51,7 @@ type Attempt struct {
 	Ordinal              int       `json:"ordinal"`
 	Runtime              string    `json:"runtime,omitempty"`
 	Model                string    `json:"model,omitempty"`
+	LaunchDigest         string    `json:"launch_digest,omitempty"`
 	PID                  int       `json:"pid"`
 	ProcessStartToken    string    `json:"process_start_token"`
 	SupervisorGeneration uint64    `json:"supervisor_generation"`
@@ -64,8 +65,9 @@ type Attempt struct {
 }
 
 type AttemptStart struct {
-	Runtime string
-	Model   string
+	Runtime      string
+	Model        string
+	LaunchDigest string
 }
 
 type ProcessIdentity struct {

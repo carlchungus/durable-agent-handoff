@@ -33,6 +33,8 @@ type Manifest struct {
 	WorkflowID               string    `json:"workflow_id"`
 	NodeID                   string    `json:"node_id"`
 	Attempt                  int       `json:"attempt"`
+	ActivityID               string    `json:"activity_id,omitempty"`
+	ActivityAttemptID        string    `json:"activity_attempt_id,omitempty"`
 	Status                   string    `json:"status"`
 	Runtime                  string    `json:"runtime"`
 	Model                    string    `json:"model,omitempty"`
@@ -47,6 +49,8 @@ type Manifest struct {
 	Worktree                 string    `json:"worktree"`
 	RestartSafe              bool      `json:"restart_safe"`
 	EventOffset              int64     `json:"event_offset,omitempty"`
+	StdoutPath               string    `json:"stdout_path,omitempty"`
+	StderrPath               string    `json:"stderr_path,omitempty"`
 	StartedAt                time.Time `json:"started_at"`
 	HeartbeatAt              time.Time `json:"heartbeat_at"`
 	FinishedAt               time.Time `json:"finished_at,omitempty"`

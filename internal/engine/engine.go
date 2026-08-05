@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/carlchungus/durable-agent-handoff/internal/activity"
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/finalize"
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
@@ -76,6 +77,7 @@ type Engine struct {
 	Store       *core.Store
 	Preferences *preferences.Manager
 	Sessions    *agentsession.Store
+	Activities  *activity.Store
 }
 
 func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
@@ -142,6 +144,15 @@ func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 func (e *Engine) Reconcile(_ context.Context, id string) error {
 	w, err := e.Store.Load(id)
 	if err != nil {
+		return err
+	}
+	if e.Activities == nil {
+		e.Activities, err = activity.OpenStore(e.Store.Dir())
+		if err != nil {
+			return err
+		}
+	}
+	if _, err = (&activity.Supervisor{Store: e.Activities}).Recover(); err != nil {
 		return err
 	}
 	if e.Sessions == nil {
@@ -218,7 +229,7 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 				return claimErr
 			}
 			if claimed && n.SessionID == "" {
-				if stream, readErr := os.ReadFile(filepath.Join(dir, "events.jsonl")); readErr == nil {
+				if stream, readErr := os.ReadFile(manifestOutputPath(manifest, dir, true)); readErr == nil {
 					if sessionID := extractSessionID(stream); sessionID != "" {
 						_, _ = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, Rationale: "adopt live attempt and preserve exact runtime session"})
 					}
@@ -230,7 +241,7 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 		outputPath := filepath.Join(dir, "last-message.json")
 		b, readErr := os.ReadFile(outputPath)
 		if readErr != nil || len(bytes.TrimSpace(b)) == 0 {
-			b, _ = os.ReadFile(filepath.Join(dir, "events.jsonl"))
+			b, _ = os.ReadFile(manifestOutputPath(manifest, dir, true))
 		}
 		if result, parseErr := parseResult(b); parseErr == nil {
 			sessionID := result.SessionID
@@ -342,7 +353,8 @@ func (e *Engine) RecoverAttempt(id, nodeID string, attempt int) error {
 	dir := filepath.Join(e.Store.Dir(), "workflows", w.ID, "runs", n.ID, fmt.Sprint(attempt))
 	b, readErr := os.ReadFile(filepath.Join(dir, "last-message.json"))
 	if readErr != nil || len(bytes.TrimSpace(b)) == 0 {
-		b, readErr = os.ReadFile(filepath.Join(dir, "events.jsonl"))
+		manifest, _ := runstate.Load(filepath.Join(dir, "attempt.json"))
+		b, readErr = os.ReadFile(manifestOutputPath(manifest, dir, true))
 	}
 	if readErr != nil {
 		return readErr
@@ -351,7 +363,8 @@ func (e *Engine) RecoverAttempt(id, nodeID string, attempt int) error {
 	if err != nil {
 		return err
 	}
-	stream, _ := os.ReadFile(filepath.Join(dir, "events.jsonl"))
+	manifest, _ := runstate.Load(filepath.Join(dir, "attempt.json"))
+	stream, _ := os.ReadFile(manifestOutputPath(manifest, dir, true))
 	return e.applyAgentResult(w, n, result, extractSessionID(stream), attempt)
 }
 
@@ -428,52 +441,89 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	if err != nil {
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
+	if e.Activities == nil {
+		e.Activities, err = activity.OpenStore(e.Store.Dir())
+		if err != nil {
+			return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
+		}
+	}
+	activityID := activity.StableID(w.ID, n.ID, fmt.Sprint(attempt))
+	activityRecord, err := e.Activities.Ensure(activity.Descriptor{
+		ID:             activityID,
+		OwnerSessionID: agent.ID,
+		Launch: activity.LaunchSpec{
+			Kind: "agent", Argv: []string{"agent-turn"}, Cwd: workdir(w, n),
+		},
+	})
+	if err != nil {
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
+	}
+	activityAttempt, stdout, stderr, err := e.Activities.PrepareAttempt(activityRecord.ID, activityRecord.Generation, activity.AttemptStart{
+		Runtime: n.Runtime.Name, Model: n.Runtime.Model, LaunchDigest: runstate.CommandDigest(c.Name, c.Args),
+	})
+	if err != nil {
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
+	}
 	cmd := exec.CommandContext(ctx, c.Name, c.Args...)
 	cmd.Dir = workdir(w, n)
 	if c.PromptOnStdin {
 		cmd.Stdin = strings.NewReader(prompt)
 	}
-	stdoutPath := filepath.Join(dir, "events.jsonl")
-	stderrPath := filepath.Join(dir, "stderr.log")
+	stdoutPath := activityAttempt.Stdout.Path
+	stderrPath := activityAttempt.Stderr.Path
 	recorder, err := runstate.Create(filepath.Join(dir, "attempt.json"), runstate.Manifest{
-		ID:            fmt.Sprintf("%s/%d", n.ID, n.Attempt+1),
-		WorkflowID:    w.ID,
-		NodeID:        n.ID,
-		Attempt:       n.Attempt + 1,
-		Runtime:       n.Runtime.Name,
-		Model:         n.Runtime.Model,
-		Effort:        n.Runtime.Effort,
-		SessionID:     n.SessionID,
-		CommandDigest: runstate.CommandDigest(c.Name, c.Args),
-		Worktree:      workdir(w, n),
-		RestartSafe:   n.Metadata["restart_safe"] == "true",
+		ID:                fmt.Sprintf("%s/%d", n.ID, n.Attempt+1),
+		WorkflowID:        w.ID,
+		NodeID:            n.ID,
+		Attempt:           n.Attempt + 1,
+		ActivityID:        activityRecord.ID,
+		ActivityAttemptID: activityAttempt.ID,
+		Runtime:           n.Runtime.Name,
+		Model:             n.Runtime.Model,
+		Effort:            n.Runtime.Effort,
+		SessionID:         n.SessionID,
+		CommandDigest:     runstate.CommandDigest(c.Name, c.Args),
+		Worktree:          workdir(w, n),
+		RestartSafe:       n.Metadata["restart_safe"] == "true",
+		StdoutPath:        stdoutPath,
+		StderrPath:        stderrPath,
 	})
 	if err != nil {
-		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
-	}
-	stdout, err := os.OpenFile(stdoutPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
+		_ = stdout.Close()
+		_ = stderr.Close()
+		_ = e.Activities.FailPrepared(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, err.Error())
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
 	defer stdout.Close()
-	stderr, err := os.OpenFile(stderrPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
-	}
 	defer stderr.Close()
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err = cmd.Start(); err != nil {
+		_ = e.Activities.FailPrepared(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, err.Error())
 		_ = recorder.Update(func(m *runstate.Manifest) {
 			m.Status, m.Error, m.FinishedAt = "failed", err.Error(), time.Now().UTC()
 		})
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
+	}
+	processToken := waitForProcessStartToken(cmd.Process.Pid, 2*time.Second)
+	if processToken == "" {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		failure := "could not establish exact process start token"
+		_ = e.Activities.FailPrepared(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, failure)
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", failure)
+	}
+	activityAttempt, err = e.Activities.MarkRunning(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, activity.ProcessIdentity{PID: cmd.Process.Pid, ProcessStartToken: processToken, SupervisorGeneration: 1})
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
 	_ = e.Sessions.Observe(agent.ID, agentsession.Observation{ProcessState: agentsession.ProcessRunning})
 	_ = recorder.Update(func(m *runstate.Manifest) {
 		m.Status = "running"
 		m.PID = cmd.Process.Pid
-		m.ProcessStartToken = runstate.ProcessStartToken(cmd.Process.Pid)
+		m.ProcessStartToken = processToken
 	})
 	heartbeatStop := make(chan struct{})
 	heartbeatDone := make(chan struct{})
@@ -515,6 +565,23 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	_ = stderr.Sync()
 	stdoutBytes, _ := os.ReadFile(stdoutPath)
 	stderrBytes, _ := os.ReadFile(stderrPath)
+	activityState := activity.StateCompleted
+	activityError := ""
+	if err != nil {
+		activityState = activity.StateFailed
+		activityError = err.Error()
+	}
+	activityExitCode := 0
+	if cmd.ProcessState != nil {
+		activityExitCode = cmd.ProcessState.ExitCode()
+	}
+	finishActivityErr := e.Activities.FinishAttempt(activityRecord.ID, activityRecord.Generation, activity.AttemptIdentity{ID: activityAttempt.ID, PID: activityAttempt.PID, ProcessStartToken: activityAttempt.ProcessStartToken, SupervisorGeneration: activityAttempt.SupervisorGeneration}, activity.ExitResult{State: activityState, ExitCode: &activityExitCode, Error: activityError})
+	if errors.Is(finishActivityErr, activity.ErrFenced) {
+		return nil
+	}
+	if finishActivityErr != nil {
+		return finishActivityErr
+	}
 	finalRecordErr := recorder.Update(func(m *runstate.Manifest) {
 		m.FinishedAt = time.Now().UTC()
 		m.EventOffset = int64(len(stdoutBytes))
@@ -754,6 +821,32 @@ func observeRuntimeEvents(path string, stop <-chan struct{}, onSession func(stri
 		}
 	}()
 	return done
+}
+
+func manifestOutputPath(manifest runstate.Manifest, legacyDir string, stdout bool) string {
+	if stdout && manifest.StdoutPath != "" {
+		return manifest.StdoutPath
+	}
+	if !stdout && manifest.StderrPath != "" {
+		return manifest.StderrPath
+	}
+	if stdout {
+		return filepath.Join(legacyDir, "events.jsonl")
+	}
+	return filepath.Join(legacyDir, "stderr.log")
+}
+
+func waitForProcessStartToken(pid int, timeout time.Duration) string {
+	deadline := time.Now().Add(timeout)
+	for {
+		if token := runstate.ProcessStartToken(pid); token != "" {
+			return token
+		}
+		if time.Now().After(deadline) {
+			return ""
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func (e *Engine) routeAfterLimit(w *core.Workflow, n *core.Node, attempt, deliveryAttempt int, failure string, rawOutput ...string) bool {

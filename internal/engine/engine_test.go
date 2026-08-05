@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/carlchungus/durable-agent-handoff/internal/activity"
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/finalize"
 	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
@@ -308,6 +309,58 @@ func TestEngineRunsGenericAgentAndPersistsSession(t *testing.T) {
 	}
 	if got.Nodes["lead"].State != core.NodeCompleted || got.Status != core.WorkflowCompleted {
 		t.Fatalf("node=%s workflow=%s", got.Nodes["lead"].State, got.Status)
+	}
+	activities, err := eng.Activities.List()
+	if err != nil || len(activities) != 1 {
+		t.Fatalf("activities=%+v err=%v", activities, err)
+	}
+	agent, err := eng.Sessions.LoadByNode(w.ID, "lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracked := activities[0]
+	if tracked.OwnerSessionID != agent.ID || tracked.State != activity.StateCompleted || len(tracked.Attempts) != 1 || tracked.Attempts[0].LaunchDigest == "" {
+		t.Fatalf("activity=%+v agent=%+v", tracked, agent)
+	}
+	chunk, err := eng.Activities.ReadOutput(tracked.ID, activity.OutputCursor{AttemptID: tracked.Attempts[0].ID, Stream: activity.StreamStdout, OutputID: tracked.Attempts[0].Stdout.ID}, 64<<10)
+	if err != nil || !strings.Contains(string(chunk.Data), "implemented safely") {
+		t.Fatalf("durable activity output=%q err=%v", chunk.Data, err)
+	}
+}
+
+func TestDelegatedAgentTurnGetsParentSessionAndOwnActivity(t *testing.T) {
+	if os.Getenv("GO_WANT_SUBAGENT_ACTIVITY_HELPER") == "1" {
+		fmt.Println(`{"status":"completed","summary":"child-safe","attestations":[{"verifier":"helper","verdict":"pass","summary":"checked"}]}`)
+		os.Exit(0)
+	}
+	t.Setenv("GO_WANT_SUBAGENT_ACTIVITY_HELPER", "1")
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("run delegated agent", t.TempDir(), core.DefaultBudget())
+	runtimeSpec := core.RuntimeSpec{Name: "exec", Executable: os.Args[0], Args: []string{"-test.run=TestDelegatedAgentTurnGetsParentSessionAndOwnActivity"}}
+	parent := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: runtimeSpec}
+	child := &core.Node{ID: "child", Title: "child", Kind: "agent", Runtime: runtimeSpec, DependsOn: []string{"lead"}, Metadata: map[string]string{"parent_id": "lead"}}
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: parent}, {Op: "add_node", Node: child}}})
+	eng := &Engine{Store: st}
+	if _, err := eng.RunOne(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.RunOne(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	childSession, err := eng.Sessions.LoadByNode(w.ID, "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childSession.ParentAgentID != "lead" {
+		t.Fatalf("child session=%+v", childSession)
+	}
+	childActivity, err := eng.Activities.Load(activity.StableID(w.ID, "child", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childActivity.OwnerSessionID != childSession.ID || childActivity.State != activity.StateCompleted {
+		t.Fatalf("child activity=%+v session=%+v", childActivity, childSession)
 	}
 }
 

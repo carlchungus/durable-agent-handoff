@@ -37,6 +37,7 @@ type GatedCommand struct {
 	Command *exec.Cmd
 	gate    io.WriteCloser
 	request runnerRequest
+	tree    *processTreeReservation
 	once    sync.Once
 }
 
@@ -52,11 +53,23 @@ func PrepareGatedCommand(argv []string, cwd string, env []string, stdin []byte) 
 	command.Dir = cwd
 	command.Env = append(append(os.Environ(), env...), runnerEnvironment+"=1")
 	ConfigureBackgroundProcess(command)
-	gate, err := command.StdinPipe()
+	tree, err := prepareProcessTree(command)
 	if err != nil {
 		return nil, err
 	}
-	return &GatedCommand{Command: command, gate: gate, request: runnerRequest{Argv: append([]string(nil), argv...), Stdin: append([]byte(nil), stdin...)}}, nil
+	gate, err := command.StdinPipe()
+	if err != nil {
+		tree.close()
+		return nil, err
+	}
+	return &GatedCommand{Command: command, gate: gate, tree: tree, request: runnerRequest{Argv: append([]string(nil), argv...), Stdin: append([]byte(nil), stdin...)}}, nil
+}
+
+func (g *GatedCommand) BindProcessTree(pid int, token string) (string, error) {
+	if g == nil || g.tree == nil {
+		return "", errors.New("gated activity process tree is not initialized")
+	}
+	return g.tree.bind(pid, token)
 }
 
 func (g *GatedCommand) Release() error {
@@ -71,6 +84,7 @@ func (g *GatedCommand) Release() error {
 		if err := g.gate.Close(); result == nil {
 			result = err
 		}
+		g.tree.close()
 	})
 	return result
 }
@@ -79,7 +93,10 @@ func (g *GatedCommand) Abort() {
 	if g == nil || g.gate == nil {
 		return
 	}
-	g.once.Do(func() { _ = g.gate.Close() })
+	g.once.Do(func() {
+		_ = g.gate.Close()
+		g.tree.close()
+	})
 }
 
 func init() {

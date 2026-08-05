@@ -61,7 +61,7 @@ func (s *Supervisor) Start(descriptor Descriptor) (*Activity, Attempt, error) {
 		_ = s.Store.FailPrepared(activity.ID, activity.Generation, attempt.ID, "could not establish exact process start token")
 		return nil, Attempt{}, errors.New("could not establish exact process start token")
 	}
-	treeID, treeErr := BindProcessTree(command.Process.Pid, token)
+	treeID, treeErr := gated.BindProcessTree(command.Process.Pid, token)
 	if treeErr != nil {
 		gated.Abort()
 		_ = command.Process.Kill()

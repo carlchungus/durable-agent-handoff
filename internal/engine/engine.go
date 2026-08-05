@@ -611,7 +611,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		_ = e.Activities.FailPrepared(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, failure)
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", failure)
 	}
-	treeID, treeErr := activity.BindProcessTree(cmd.Process.Pid, processToken)
+	treeID, treeErr := gated.BindProcessTree(cmd.Process.Pid, processToken)
 	if treeErr != nil {
 		gated.Abort()
 		_ = cmd.Process.Kill()

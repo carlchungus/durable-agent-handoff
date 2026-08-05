@@ -9,7 +9,13 @@ import (
 	"syscall"
 )
 
-func BindProcessTree(pid int, _ string) (string, error) {
+type processTreeReservation struct{}
+
+func prepareProcessTree(_ *exec.Cmd) (*processTreeReservation, error) {
+	return &processTreeReservation{}, nil
+}
+
+func (r *processTreeReservation) bind(pid int, _ string) (string, error) {
 	pgid, err := syscall.Getpgid(pid)
 	if err != nil {
 		return "", err
@@ -19,6 +25,8 @@ func BindProcessTree(pid int, _ string) (string, error) {
 	}
 	return fmt.Sprint(pgid), nil
 }
+
+func (r *processTreeReservation) close() {}
 
 func ConfigureBackgroundProcess(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

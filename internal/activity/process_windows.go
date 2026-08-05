@@ -3,6 +3,8 @@
 package activity
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -16,26 +18,50 @@ var openJobObjectW = windows.NewLazySystemDLL("kernel32.dll").NewProc("OpenJobOb
 
 const jobObjectTerminate = 0x0008
 
-func BindProcessTree(pid int, token string) (string, error) {
-	name := fmt.Sprintf("Local\\handoff-activity-%d-%s", pid, token)
+type processTreeReservation struct {
+	name   string
+	handle windows.Handle
+}
+
+func prepareProcessTree(command *exec.Cmd) (*processTreeReservation, error) {
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return nil, err
+	}
+	name := "Local\\handoff-activity-" + hex.EncodeToString(random)
 	namePtr, err := windows.UTF16PtrFromString(name)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	job, err := windows.CreateJobObject(nil, namePtr)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	defer windows.CloseHandle(job)
+	if err = windows.SetHandleInformation(job, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
+		windows.CloseHandle(job)
+		return nil, err
+	}
+	command.SysProcAttr.AdditionalInheritedHandles = append(command.SysProcAttr.AdditionalInheritedHandles, syscall.Handle(job))
+	return &processTreeReservation{name: name, handle: job}, nil
+}
+
+func (r *processTreeReservation) bind(pid int, _ string) (string, error) {
 	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
 		return "", err
 	}
 	defer windows.CloseHandle(process)
-	if err = windows.AssignProcessToJobObject(job, process); err != nil {
+	if err = windows.AssignProcessToJobObject(r.handle, process); err != nil {
 		return "", fmt.Errorf("assign activity runner to Windows Job Object: %w", err)
 	}
-	return name, nil
+	return r.name, nil
+}
+
+func (r *processTreeReservation) close() {
+	if r != nil && r.handle != 0 {
+		_ = windows.CloseHandle(r.handle)
+		r.handle = 0
+	}
 }
 
 func ConfigureBackgroundProcess(command *exec.Cmd) {

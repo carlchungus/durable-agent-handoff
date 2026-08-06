@@ -55,6 +55,7 @@ type Attempt struct {
 	Runtime              string    `json:"runtime,omitempty"`
 	Model                string    `json:"model,omitempty"`
 	CommandDigest        string    `json:"command_digest,omitempty"`
+	ResultPath           string    `json:"result_path,omitempty"`
 	PID                  int       `json:"pid"`
 	ProcessStartToken    string    `json:"process_start_token"`
 	ProcessTreeID        string    `json:"process_tree_id,omitempty"`
@@ -73,6 +74,7 @@ type AttemptStart struct {
 	Runtime       string
 	Model         string
 	CommandDigest string
+	ResultPath    string
 }
 
 type ProcessIdentity struct {

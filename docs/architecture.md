@@ -106,7 +106,9 @@ supervisor death, and uses `KILL_ON_JOB_CLOSE` so runner death contains every
 remaining descendant. Stop reopens and terminates the kernel job identity
 rather than re-resolving a PID ancestry snapshot. Attempt output filenames are
 reserved by the prepared event ordinal; orphan files left before that event are
-safely replaced on retry.
+safely replaced on retry. Agent Attempts also persist the exact structured-result
+path. An absent path identifies the shared layout used by pre-v0.4 development
+builds, so migration never guesses from an ordinal or consumes a stale artifact.
 
 The ledger reducer produces the sole Activity projection used by the human TUI,
 JSON/JSONL CLI surfaces, and policy. `activity follow` advances an exact output

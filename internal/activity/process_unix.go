@@ -3,6 +3,7 @@
 package activity
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -36,21 +37,24 @@ func startProcessTreeWatchdog() (*processTreeWatchdog, error) {
 	return &processTreeWatchdog{command: command, gate: gate}, nil
 }
 
-func (w *processTreeWatchdog) complete() error {
-	_, writeErr := w.gate.Write([]byte{1})
+func (w *processTreeWatchdog) complete(completion *runnerCompletion, result ExitResult) error {
+	writeErr := json.NewEncoder(w.gate).Encode(watchdogRequest{Completion: completion, Result: result})
 	closeErr := w.gate.Close()
 	waitErr := w.command.Wait()
 	return errors.Join(writeErr, closeErr, waitErr)
 }
 
 func runProcessTreeWatchdog(input io.Reader) {
-	var signal [1]byte
-	if n, _ := input.Read(signal[:]); n == 1 && signal[0] == 1 {
-		return
+	var request watchdogRequest
+	if err := json.NewDecoder(io.LimitReader(input, 1<<20)).Decode(&request); err == nil && request.Completion != nil {
+		if store, openErr := OpenStore(request.Completion.Root); openErr == nil {
+			_ = finishRunnerAttempt(store, request.Completion, request.Result, os.Getppid())
+		}
 	}
-	// The watchdog remains a member of the original dedicated process group,
-	// so that group cannot be recycled while this kill is issued. EOF means
-	// the runner died before durably recording and acknowledging completion.
+	// Whether the runner died or requested terminal completion, the watchdog
+	// remains in the exact dedicated group while terminating every member. On
+	// normal completion it writes the fenced terminal record first, then kills
+	// the runner and any background descendants as one contained tree.
 	_ = syscall.Kill(-syscall.Getpgrp(), syscall.SIGKILL)
 }
 

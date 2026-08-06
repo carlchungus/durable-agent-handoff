@@ -774,6 +774,7 @@ func TestReconcileReadsOnlyCurrentActivityAttemptResult(t *testing.T) {
 	n = w.Nodes["lead"]
 	activities, _ := activity.OpenStore(state)
 	tracked, _ := activities.Create(activity.Descriptor{ID: activity.StableID(w.ID, n.ID, "1"), Work: activity.WorkSpec{Kind: "agent", Cwd: w.Root, Intent: w.ID + "/lead"}})
+	baseDir := filepath.Join(state, "workflows", w.ID, "runs", "lead", "1")
 	first, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{})
 	_ = stdout.Close()
 	_ = stderr.Close()
@@ -781,7 +782,6 @@ func TestReconcileReadsOnlyCurrentActivityAttemptResult(t *testing.T) {
 	firstIdentity := activity.AttemptIdentity{ID: first.ID, PID: first.PID, ProcessStartToken: first.ProcessStartToken, SupervisorID: first.SupervisorID, SupervisorGeneration: first.SupervisorGeneration}
 	code := 1
 	_ = activities.FinishAttempt(tracked.ID, tracked.Generation, firstIdentity, activity.ExitResult{State: activity.StateFailed, ExitCode: &code, Error: "provider limit"})
-	baseDir := filepath.Join(state, "workflows", w.ID, "runs", "lead", "1")
 	for _, path := range []string{filepath.Join(baseDir, "last-message.json"), filepath.Join(baseDir, "activity-attempt-1", "last-message.json")} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatal(err)
@@ -790,7 +790,8 @@ func TestReconcileReadsOnlyCurrentActivityAttemptResult(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	current, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{})
+	currentResult := filepath.Join(baseDir, "activity-attempt-2", "last-message.json")
+	current, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{ResultPath: currentResult})
 	_, _ = stdout.WriteString(`{"status":"completed","summary":"current attempt","mutations":[],"attestations":[]}`)
 	_ = stdout.Close()
 	_ = stderr.Close()
@@ -805,6 +806,80 @@ func TestReconcileReadsOnlyCurrentActivityAttemptResult(t *testing.T) {
 	got, _ := st.Load(w.ID)
 	if got.Nodes["lead"].State != core.NodeCompleted || got.Evidence[len(got.Evidence)-1].Summary != "current attempt" {
 		t.Fatalf("stale result crossed Activity attempt boundary: node=%+v evidence=%+v", got.Nodes["lead"], got.Evidence)
+	}
+}
+
+func TestReconcileReadsLegacyResultForPreVersionedSecondActivityAttempt(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("upgrade legacy retry", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "exec"}}
+	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "lead", State: core.NodeRunning}}})
+	activities, _ := activity.OpenStore(state)
+	tracked, _ := activities.Create(activity.Descriptor{ID: activity.StableID(w.ID, "lead", "1"), Work: activity.WorkSpec{Kind: "agent", Cwd: w.Root, Intent: w.ID + "/lead"}})
+	first, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{})
+	_ = stdout.Close()
+	_ = stderr.Close()
+	first, _ = activities.MarkRunning(tracked.ID, tracked.Generation, first.ID, activity.ProcessIdentity{PID: 7101, ProcessStartToken: "dead-1", SupervisorID: "owner-1", SupervisorGeneration: 1})
+	firstIdentity := activity.AttemptIdentity{ID: first.ID, PID: first.PID, ProcessStartToken: first.ProcessStartToken, SupervisorID: first.SupervisorID, SupervisorGeneration: first.SupervisorGeneration}
+	code := 1
+	_ = activities.FinishAttempt(tracked.ID, tracked.Generation, firstIdentity, activity.ExitResult{State: activity.StateFailed, ExitCode: &code, Error: "provider limit"})
+	second, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{})
+	_ = stdout.Close()
+	_ = stderr.Close()
+	second, _ = activities.MarkRunning(tracked.ID, tracked.Generation, second.ID, activity.ProcessIdentity{PID: 7102, ProcessStartToken: "dead-2", SupervisorID: "owner-2", SupervisorGeneration: 1})
+	secondIdentity := activity.AttemptIdentity{ID: second.ID, PID: second.PID, ProcessStartToken: second.ProcessStartToken, SupervisorID: second.SupervisorID, SupervisorGeneration: second.SupervisorGeneration}
+	code = 0
+	_ = activities.FinishAttempt(tracked.ID, tracked.Generation, secondIdentity, activity.ExitResult{State: activity.StateCompleted, ExitCode: &code})
+	legacyPath := filepath.Join(state, "workflows", w.ID, "runs", "lead", "1", "last-message.json")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(`{"status":"completed","summary":"legacy second attempt","mutations":[],"attestations":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Engine{Store: st, Activities: activities}).Reconcile(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Load(w.ID)
+	if got.Nodes["lead"].State != core.NodeCompleted || got.Evidence[len(got.Evidence)-1].Summary != "legacy second attempt" {
+		t.Fatalf("legacy ordinal-2 result was not recovered: node=%+v evidence=%+v", got.Nodes["lead"], got.Evidence)
+	}
+}
+
+func TestReconcileDoesNotUseLegacyResultForVersionedFirstActivityAttempt(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("fence versioned result", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "exec"}}
+	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "lead", State: core.NodeRunning}}})
+	baseDir := filepath.Join(state, "workflows", w.ID, "runs", "lead", "1")
+	legacyPath := filepath.Join(baseDir, "last-message.json")
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(`{"status":"completed","summary":"stale legacy result","mutations":[],"attestations":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	activities, _ := activity.OpenStore(state)
+	tracked, _ := activities.Create(activity.Descriptor{ID: activity.StableID(w.ID, "lead", "1"), Work: activity.WorkSpec{Kind: "agent", Cwd: w.Root, Intent: w.ID + "/lead"}})
+	missingExact := filepath.Join(baseDir, "activity-attempt-1", "last-message.json")
+	attempt, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{ResultPath: missingExact})
+	_, _ = stdout.WriteString(`{"status":"completed","summary":"current stdout result","mutations":[],"attestations":[]}`)
+	_ = stdout.Close()
+	_ = stderr.Close()
+	attempt, _ = activities.MarkRunning(tracked.ID, tracked.Generation, attempt.ID, activity.ProcessIdentity{PID: 7201, ProcessStartToken: "dead", SupervisorID: "owner", SupervisorGeneration: 1})
+	identity := activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
+	code := 0
+	_ = activities.FinishAttempt(tracked.ID, tracked.Generation, identity, activity.ExitResult{State: activity.StateCompleted, ExitCode: &code})
+	if err := (&Engine{Store: st, Activities: activities}).Reconcile(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Load(w.ID)
+	if got.Nodes["lead"].State != core.NodeCompleted || got.Evidence[len(got.Evidence)-1].Summary != "current stdout result" {
+		t.Fatalf("versioned attempt consumed legacy result: node=%+v evidence=%+v", got.Nodes["lead"], got.Evidence)
 	}
 }
 

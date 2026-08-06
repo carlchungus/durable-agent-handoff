@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"syscall"
 	"unsafe"
@@ -30,7 +31,16 @@ func startProcessTreeWatchdog() (*processTreeWatchdog, error) {
 	return &processTreeWatchdog{}, nil
 }
 
-func (w *processTreeWatchdog) complete() error { return nil }
+func (w *processTreeWatchdog) complete(completion *runnerCompletion, result ExitResult) error {
+	if completion == nil {
+		return nil
+	}
+	store, err := OpenStore(completion.Root)
+	if err != nil {
+		return err
+	}
+	return finishRunnerAttempt(store, completion, result, os.Getpid())
+}
 
 func runProcessTreeWatchdog(_ io.Reader) {}
 

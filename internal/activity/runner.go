@@ -29,6 +29,11 @@ type runnerCompletion struct {
 	Identity   AttemptIdentity `json:"identity"`
 }
 
+type watchdogRequest struct {
+	Completion *runnerCompletion `json:"completion,omitempty"`
+	Result     ExitResult        `json:"result"`
+}
+
 func (g *GatedCommand) CompleteActivity(root, activityID string, generation uint64, identity AttemptIdentity) {
 	g.request.Completion = &runnerCompletion{Root: root, ActivityID: activityID, Generation: generation, Identity: identity}
 }
@@ -144,22 +149,13 @@ func runGatedTarget(input io.Reader, stdout, stderr io.Writer) (int, error) {
 	if command.ProcessState != nil {
 		code = command.ProcessState.ExitCode()
 	}
-	if request.Completion != nil {
-		state := StateCompleted
-		errorText := ""
-		if err != nil {
-			state = StateFailed
-			errorText = err.Error()
-		}
-		store, openErr := OpenStore(request.Completion.Root)
-		if openErr != nil {
-			return code, fmt.Errorf("open completion store: %w", openErr)
-		}
-		if finishErr := finishRunnerAttempt(store, request.Completion, ExitResult{State: state, ExitCode: &code, Error: errorText}); finishErr != nil {
-			return code, fmt.Errorf("persist completion: %w", finishErr)
-		}
+	state := StateCompleted
+	errorText := ""
+	if err != nil {
+		state = StateFailed
+		errorText = err.Error()
 	}
-	if err := watchdog.complete(); err != nil {
+	if err := watchdog.complete(request.Completion, ExitResult{State: state, ExitCode: &code, Error: errorText}); err != nil {
 		return code, fmt.Errorf("complete process-tree watchdog: %w", err)
 	}
 	return code, nil
@@ -168,7 +164,7 @@ func runGatedTarget(input io.Reader, stdout, stderr io.Writer) (int, error) {
 // finishRunnerAttempt permits a recovered supervisor to advance ownership
 // while the same exact runner continues. The runner retries with the current
 // owner fence only when attempt ID, PID, and birth token still name itself.
-func finishRunnerAttempt(store *Store, completion *runnerCompletion, result ExitResult) error {
+func finishRunnerAttempt(store *Store, completion *runnerCompletion, result ExitResult, runnerPID int) error {
 	for range 4 {
 		current, err := store.Load(completion.ActivityID)
 		if err != nil {
@@ -178,7 +174,7 @@ func finishRunnerAttempt(store *Store, completion *runnerCompletion, result Exit
 			return nil
 		}
 		attempt, ok := currentAttempt(current)
-		if !ok || attempt.ID != completion.Identity.ID || attempt.PID != os.Getpid() || attempt.PID != completion.Identity.PID || attempt.ProcessStartToken != completion.Identity.ProcessStartToken || attempt.ProcessTreeID != completion.Identity.ProcessTreeID || !processMatches(identityOf(attempt)) {
+		if !ok || attempt.ID != completion.Identity.ID || attempt.PID != runnerPID || attempt.PID != completion.Identity.PID || attempt.ProcessStartToken != completion.Identity.ProcessStartToken || attempt.ProcessTreeID != completion.Identity.ProcessTreeID || !processMatches(identityOf(attempt)) {
 			return ErrFenced
 		}
 		if err = store.FinishAttempt(current.ID, current.Generation, identityOf(attempt), result); err == nil {

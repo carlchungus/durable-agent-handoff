@@ -147,7 +147,8 @@ func (s *Store) PrepareAttempt(id string, expectedGeneration uint64, start Attem
 		now := time.Now().UTC()
 		attempt = Attempt{
 			ID: attemptID, Ordinal: ordinal, Runtime: start.Runtime, Model: start.Model, CommandDigest: start.CommandDigest,
-			State: StateStarting, StartedAt: now,
+			ResultPath: start.ResultPath,
+			State:      StateStarting, StartedAt: now,
 			Stdout: outputRef(id, attemptID, StreamStdout, stdoutName, stdoutPath),
 			Stderr: outputRef(id, attemptID, StreamStderr, stderrName, stderrPath),
 		}

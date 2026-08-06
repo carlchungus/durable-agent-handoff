@@ -578,7 +578,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
 	activityAttempt, stdout, stderr, err := e.Activities.PrepareAttempt(activityRecord.ID, activityRecord.Generation, activity.AttemptStart{
-		Runtime: n.Runtime.Name, Model: n.Runtime.Model, CommandDigest: runstate.CommandDigest(c.Name, c.Args),
+		Runtime: n.Runtime.Name, Model: n.Runtime.Model, CommandDigest: runstate.CommandDigest(c.Name, c.Args), ResultPath: output,
 	})
 	if err != nil {
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
@@ -689,6 +689,9 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		if loadErr != nil || (current.State != activity.StateCompleted && current.State != activity.StateFailed) {
 			return nil
 		}
+		if current.State == activity.StateCompleted {
+			err = nil
+		}
 		finishActivityErr = nil
 	}
 	if finishActivityErr != nil {
@@ -733,13 +736,12 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 }
 
 func readActivityAttemptResult(baseDir string, attempt activity.Attempt) ([]byte, error) {
-	path := filepath.Join(baseDir, fmt.Sprintf("activity-attempt-%d", attempt.Ordinal), "last-message.json")
-	b, err := os.ReadFile(path)
-	if (err != nil || len(bytes.TrimSpace(b)) == 0) && attempt.Ordinal == 1 {
-		// Compatibility for Activities created by pre-v0.4 development builds.
-		return os.ReadFile(filepath.Join(baseDir, "last-message.json"))
+	if attempt.ResultPath != "" {
+		return os.ReadFile(attempt.ResultPath)
 	}
-	return b, err
+	// Attempts from pre-v0.4 development builds did not persist an artifact
+	// identity and always shared this legacy path, including ordinal 2+ retries.
+	return os.ReadFile(filepath.Join(baseDir, "last-message.json"))
 }
 
 func exceedsDiffBudget(budget core.Budget, stats finalize.DiffStats) bool {

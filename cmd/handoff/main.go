@@ -17,6 +17,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/carlchungus/durable-agent-handoff/internal/activity"
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/discovery"
 	"github.com/carlchungus/durable-agent-handoff/internal/engine"
@@ -78,6 +79,8 @@ func run(args []string, out, errOut io.Writer) error {
 		return cmdAgent(args[1:], out)
 	case "agents":
 		return cmdAgents(args[1:], out)
+	case "activity":
+		return cmdActivity(args[1:], out)
 	case "discover":
 		return cmdDiscover(args[1:], out)
 	case "import":
@@ -90,6 +93,186 @@ func run(args []string, out, errOut io.Writer) error {
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
 	}
+}
+
+func cmdActivity(args []string, out io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: handoff activity list|read|follow|stop")
+	}
+	switch args[0] {
+	case "list":
+		fs := flag.NewFlagSet("activity list", flag.ContinueOnError)
+		state := common(fs)
+		jsonOut := fs.Bool("json", false, "emit JSON")
+		if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true, "--json": false})); err != nil {
+			return err
+		}
+		store, err := activity.OpenStore(stateDir(*state))
+		if err != nil {
+			return err
+		}
+		activities, err := store.List()
+		if err != nil {
+			return err
+		}
+		if *jsonOut {
+			return writeJSON(out, activities)
+		}
+		table := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(table, "ACTIVITY\tSTATE\tGEN\tREV\tATTEMPTS\tOWNER\tKIND")
+		for _, item := range activities {
+			fmt.Fprintf(table, "%s\t%s\t%d\t%d\t%d\t%s\t%s\n", item.ID, item.State, item.Generation, item.Revision, len(item.Attempts), item.OwnerSessionID, item.Work.Kind)
+		}
+		return table.Flush()
+	case "read":
+		fs := flag.NewFlagSet("activity read", flag.ContinueOnError)
+		state := common(fs)
+		jsonOut := fs.Bool("json", false, "emit JSON")
+		if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true, "--json": false})); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return errors.New("activity read requires an activity id")
+		}
+		store, err := activity.OpenStore(stateDir(*state))
+		if err != nil {
+			return err
+		}
+		item, err := store.Load(fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		if *jsonOut {
+			return writeJSON(out, item)
+		}
+		fmt.Fprintf(out, "%s  %s  generation=%d revision=%d\n", item.ID, item.State, item.Generation, item.Revision)
+		fmt.Fprintf(out, "work: %s\n", item.Work.Kind)
+		if item.Work.Intent != "" {
+			fmt.Fprintf(out, "intent: %s\n", item.Work.Intent)
+		}
+		for _, attempt := range item.Attempts {
+			fmt.Fprintf(out, "%s  %s  pid=%d supervisor=%s generation=%d\n", attempt.ID, attempt.State, attempt.PID, attempt.SupervisorID, attempt.SupervisorGeneration)
+			fmt.Fprintf(out, "  stdout: %s  %s\n  stderr: %s  %s\n", attempt.Stdout.ID, attempt.Stdout.Path, attempt.Stderr.ID, attempt.Stderr.Path)
+		}
+		return nil
+	case "follow":
+		fs := flag.NewFlagSet("activity follow", flag.ContinueOnError)
+		state := common(fs)
+		stream := fs.String("stream", "stdout", "stdout or stderr")
+		outputID := fs.String("output", "", "exact output identity for reconnect")
+		after := fs.Int64("after", 0, "byte cursor")
+		jsonOut := fs.Bool("json", false, "emit JSONL chunks")
+		known := map[string]bool{"--state": true, "--stream": true, "--output": true, "--after": true, "--json": false}
+		if err := fs.Parse(reorderFlags(args[1:], known)); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 || *after < 0 {
+			return errors.New("activity follow requires an activity id and a non-negative cursor")
+		}
+		store, err := activity.OpenStore(stateDir(*state))
+		if err != nil {
+			return err
+		}
+		selectedStream := activity.Stream(*stream)
+		item, err := store.Load(fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		attemptID, exactOutput, err := selectActivityOutput(item, selectedStream, *outputID)
+		if err != nil {
+			return err
+		}
+		cursor := activity.OutputCursor{AttemptID: attemptID, Stream: selectedStream, OutputID: exactOutput, After: *after}
+		for {
+			chunk, readErr := store.ReadOutput(item.ID, cursor, 64<<10)
+			if readErr != nil {
+				return readErr
+			}
+			if len(chunk.Data) > 0 {
+				if *jsonOut {
+					if err = writeJSON(out, chunk); err != nil {
+						return err
+					}
+				} else if _, err = out.Write(chunk.Data); err != nil {
+					return err
+				}
+				cursor.After = chunk.End
+			}
+			if chunk.Closed && cursor.After >= chunk.Size {
+				return nil
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	case "stop":
+		fs := flag.NewFlagSet("activity stop", flag.ContinueOnError)
+		state := common(fs)
+		expectedGeneration := fs.Uint64("if-generation", 0, "expected activity generation")
+		expectedAttempt := fs.String("if-attempt", "", "expected attempt id")
+		jsonOut := fs.Bool("json", false, "emit JSON")
+		known := map[string]bool{"--state": true, "--if-generation": true, "--if-attempt": true, "--json": false}
+		if err := fs.Parse(reorderFlags(args[1:], known)); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return errors.New("activity stop requires an activity id")
+		}
+		store, err := activity.OpenStore(stateDir(*state))
+		if err != nil {
+			return err
+		}
+		supervisor := &activity.Supervisor{Store: store}
+		var stopped *activity.Activity
+		if *expectedGeneration == 0 && *expectedAttempt == "" {
+			stopped, err = supervisor.Stop(fs.Arg(0))
+		} else {
+			if *expectedGeneration == 0 || *expectedAttempt == "" {
+				return errors.New("--if-generation and --if-attempt must be provided together")
+			}
+			current, loadErr := store.Load(fs.Arg(0))
+			if loadErr != nil {
+				return loadErr
+			}
+			identity, identityErr := activityAttemptIdentity(current, *expectedAttempt)
+			if identityErr != nil {
+				return identityErr
+			}
+			stopped, err = supervisor.StopExpected(current.ID, activity.ControlRequest{ExpectedGeneration: *expectedGeneration, ExpectedAttempt: identity})
+		}
+		if err != nil {
+			return err
+		}
+		if *jsonOut {
+			return writeJSON(out, stopped)
+		}
+		fmt.Fprintf(out, "%s  %s\n", stopped.ID, stopped.State)
+		return nil
+	default:
+		return fmt.Errorf("unknown activity command %q", args[0])
+	}
+}
+
+func selectActivityOutput(item *activity.Activity, stream activity.Stream, requested string) (string, string, error) {
+	for i := len(item.Attempts) - 1; i >= 0; i-- {
+		output := item.Attempts[i].Stdout
+		if stream == activity.StreamStderr {
+			output = item.Attempts[i].Stderr
+		} else if stream != activity.StreamStdout {
+			return "", "", fmt.Errorf("invalid output stream %q", stream)
+		}
+		if requested == "" || output.ID == requested {
+			return item.Attempts[i].ID, output.ID, nil
+		}
+	}
+	return "", "", fmt.Errorf("output %q was not found", requested)
+}
+
+func activityAttemptIdentity(item *activity.Activity, attemptID string) (activity.AttemptIdentity, error) {
+	for _, attempt := range item.Attempts {
+		if attempt.ID == attemptID {
+			return activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, ProcessTreeID: attempt.ProcessTreeID, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}, nil
+		}
+	}
+	return activity.AttemptIdentity{}, fmt.Errorf("attempt %q was not found", attemptID)
 }
 
 func cmdAgent(args []string, out io.Writer) error {
@@ -908,6 +1091,7 @@ Usage:
   handoff agent reply WORKFLOW_ID NODE_ID --message TEXT
   handoff agent inbox WORKFLOW_ID NODE_ID [--after N]
   handoff agents [--workflow WORKFLOW_ID] --json
+  handoff activity list | read ID | follow ID | stop ID
   handoff discover claude [--since 8h] [--json]
   handoff import claude --session ID [--runtime codex]
   handoff github merge --repo OWNER/REPO --pr N --gate EXACT_NAME

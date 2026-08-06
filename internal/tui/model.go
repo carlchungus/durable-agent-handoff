@@ -2,7 +2,9 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -10,6 +12,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/carlchungus/durable-agent-handoff/internal/activity"
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/engine"
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
@@ -22,8 +25,15 @@ type loadMsg struct {
 	workflows []*core.Workflow
 	teams     []*coord.Team
 	events    []core.Event
-	attempts  map[string]runstate.Manifest
+	attempts  map[string]attemptView
 	err       error
+}
+type attemptView struct {
+	PID                  int
+	SupervisorGeneration uint64
+	SessionID            string
+	StartedAt            time.Time
+	OutputBytes          int64
 }
 type runMsg struct{ err error }
 
@@ -33,7 +43,7 @@ type Model struct {
 	workflows  []*core.Workflow
 	teams      []*coord.Team
 	events     []core.Event
-	attempts   map[string]runstate.Manifest
+	attempts   map[string]attemptView
 	cursor     int
 	teamCursor int
 	mode       string
@@ -73,7 +83,10 @@ func Snapshot(store *core.Store) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		m.attempts = loadAttempts(store, ws[0])
+		m.attempts, err = loadAttempts(store, ws[0])
+		if err != nil {
+			return "", err
+		}
 	}
 	return m.RenderPlain(), nil
 }
@@ -89,31 +102,53 @@ func (m Model) load() tea.Cmd {
 			teams, err = m.teamStore.List()
 		}
 		var events []core.Event
-		attempts := map[string]runstate.Manifest{}
+		attempts := map[string]attemptView{}
 		if err == nil && len(ws) > 0 {
 			selected := ws[min(m.cursor, len(ws)-1)]
 			events, err = m.store.Events(selected.ID, 0)
 			if len(events) > 12 {
 				events = events[len(events)-12:]
 			}
-			attempts = loadAttempts(m.store, selected)
+			attempts, err = loadAttempts(m.store, selected)
 		}
 		return loadMsg{workflows: ws, teams: teams, events: events, attempts: attempts, err: err}
 	}
 }
 
-func loadAttempts(store *core.Store, workflow *core.Workflow) map[string]runstate.Manifest {
-	attempts := map[string]runstate.Manifest{}
+func loadAttempts(store *core.Store, workflow *core.Workflow) (map[string]attemptView, error) {
+	attempts := map[string]attemptView{}
+	activities, err := activity.OpenStore(store.Dir())
+	if err != nil {
+		return nil, err
+	}
 	for _, n := range workflow.Nodes {
 		if n.State != core.NodeRunning || n.Attempt < 1 {
 			continue
 		}
+		if activities != nil {
+			tracked, loadErr := activities.Load(activity.StableID(workflow.ID, n.ID, fmt.Sprint(n.Attempt)))
+			if loadErr == nil {
+				if len(tracked.Attempts) == 0 {
+					return nil, fmt.Errorf("activity %s has no attempts", tracked.ID)
+				}
+				current := tracked.Attempts[len(tracked.Attempts)-1]
+				size := int64(0)
+				if info, statErr := os.Stat(current.Stdout.Path); statErr == nil {
+					size = info.Size()
+				}
+				attempts[n.ID] = attemptView{PID: current.PID, SupervisorGeneration: current.SupervisorGeneration, SessionID: n.SessionID, StartedAt: current.StartedAt, OutputBytes: size}
+				continue
+			}
+			if !errors.Is(loadErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("load activity for node %s: %w", n.ID, loadErr)
+			}
+		}
 		path := filepath.Join(store.Dir(), "workflows", workflow.ID, "runs", n.ID, fmt.Sprint(n.Attempt), "attempt.json")
 		if attempt, err := runstate.Load(path); err == nil {
-			attempts[n.ID] = attempt
+			attempts[n.ID] = attemptView{PID: attempt.PID, SupervisorGeneration: attempt.SupervisorGeneration, SessionID: attempt.SessionID, StartedAt: attempt.StartedAt, OutputBytes: attempt.EventOffset}
 		}
 	}
-	return attempts
+	return attempts, nil
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -369,15 +404,15 @@ func (m Model) detail(width int) string {
 		}
 		lines = append(lines, fmt.Sprintf(" %s %-18s %s%s", m.nodeGlyph(n.State), truncate(n.Title, 18), lipgloss.NewStyle().Foreground(muted).Render(string(n.State)+runtime), lipgloss.NewStyle().Foreground(muted).Render(deps)))
 		if attempt, ok := m.attempts[n.ID]; ok {
-			heartbeat := time.Since(attempt.HeartbeatAt).Round(time.Second)
-			if heartbeat < 0 {
-				heartbeat = 0
+			runtimeAge := time.Since(attempt.StartedAt).Round(time.Second)
+			if runtimeAge < 0 {
+				runtimeAge = 0
 			}
 			session := attempt.SessionID
 			if len(session) > 12 {
 				session = session[:12] + "…"
 			}
-			lines = append(lines, lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("    ↳ pid %d · supervisor g%d · heartbeat %s · %s · %.1f KB", attempt.PID, attempt.SupervisorGeneration, heartbeat, session, float64(attempt.EventOffset)/1024)))
+			lines = append(lines, lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("    ↳ pid %d · supervisor g%d · runtime %s · %s · %.1f KB", attempt.PID, attempt.SupervisorGeneration, runtimeAge, session, float64(attempt.OutputBytes)/1024)))
 		}
 	}
 	lines = append(lines, "", title.Render("EVENTS"))

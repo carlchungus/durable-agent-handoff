@@ -35,6 +35,20 @@ handoff doctor
 
 Release binaries for macOS, Linux, and Windows are attached to tagged GitHub releases. No Node or Python runtime is required. The coding harnesses you choose (`codex`, `claude`, `pi`, or `omp`) must already be installed and authenticated.
 
+For example, install the Apple Silicon archive with the GitHub CLI:
+
+```sh
+gh release download v0.4.0 \
+  --repo carlchungus/durable-agent-handoff \
+  --pattern 'durable-agent-handoff_0.4.0_darwin_arm64.tar.gz'
+tar -xzf durable-agent-handoff_0.4.0_darwin_arm64.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 0755 handoff "$HOME/.local/bin/handoff"
+"$HOME/.local/bin/handoff" doctor
+```
+
+Use the corresponding versioned `durable-agent-handoff_0.4.0_<os>_<arch>` archive for other platforms. GoReleaser uses lowercase OS names (`darwin`, `linux`, `windows`). Verify downloads against the release's `checksums.txt` before installation.
+
 State defaults to the OS user-config directory. Set `HANDOFF_HOME` to put it elsewhere. Keep that directory supervisor-private and outside every worker-writable worktree or sandbox mount; do not point it into the repository being edited.
 
 ## Start a workflow
@@ -83,6 +97,27 @@ Use `--sandbox read-only` for discovery and independent verification. Codex uses
 When a limit is observed, `handoff` records the provider/model cooldown durably, appends routing evidence to the workflow, and selects the next healthy candidate. Usage-limit cooldowns default to one hour; transient rate limits default to five minutes. If every candidate is cooling down, the node remains ready and the scheduler waits rather than treating the work as failed. Reset observed health explicitly with `handoff preference reset [runtime/model]`.
 
 Claude's own headless `--fallback-model` can still be useful within Claude for overload, but the external ladder is what crosses harness and billing boundaries. Model names are deliberately not hardcoded; inspect the live runtime catalog (for example, `pi --list-models kimi`) before choosing aliases.
+
+Fallback changes execution capacity, never authority: sandbox selection takes the narrower of the job and candidate, so a `read-only` job remains read-only even if a configured candidate requests workspace-write.
+
+## Observe and control background work
+
+Activities are the process-lifecycle side of agent Sessions. They retain each runtime attempt, exact process identity, and stdout/stderr even when the scheduler dies. A gated runner prevents the target from executing until that identity is durable, then records its fenced completion before exiting; new agent turns do not maintain a competing process manifest.
+
+```sh
+handoff activity list --json
+handoff activity read ACTIVITY_ID --json
+
+# Reattach to an exact output at a durable byte cursor.
+handoff activity follow ACTIVITY_ID \
+  --stream stdout --output OUTPUT_ID --after BYTE_OFFSET --json
+
+# Automation should fence control with values returned by read/list.
+handoff activity stop ACTIVITY_ID \
+  --if-generation GENERATION --if-attempt ATTEMPT_ID --json
+```
+
+`read` returns lifecycle metadata; `follow` reads output. Omitting `--output` follows the newest attempt, which is convenient for humans but not a safe reconnect contract for automation. Disconnecting a follower never stops the worker. A fenced stop is rejected if recovery, fallback, or another controller changed the Activity generation or exact Attempt.
 
 ## Recover stopped Claude Code work
 

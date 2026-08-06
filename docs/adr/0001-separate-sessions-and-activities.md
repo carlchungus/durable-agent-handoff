@@ -20,7 +20,7 @@ Use four distinct resources:
 
 1. **Session** owns conversation identity, lineage, inbox, workspace, and
    capability policy.
-2. **Activity** owns a durable work lifecycle, immutable launch specification,
+2. **Activity** owns a durable work lifecycle, immutable logical work specification,
    output streams, and terminal result.
 3. **Attempt** records one immutable process execution for an Activity.
 4. **Attachment** is an ephemeral cursor-based reader and never owns lifecycle
@@ -53,4 +53,3 @@ or lifecycle boundary. Checklist tasks remain a separate UI/domain concept.
 - Treating a workflow node as the only durable execution record.
 - Using an in-memory process registry as canonical state.
 - Copying an upstream all-purpose task executor or compatibility event enum.
-

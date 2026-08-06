@@ -95,6 +95,9 @@ func (m *Manager) Resolve(role string, explicit core.RuntimeSpec) (core.RuntimeS
 	for i, c := range candidates {
 		h, blocked := health.Providers[Key(c)]
 		if !blocked || !h.UnavailableUntil.After(now) {
+			// The ladder chooses execution capacity, not authority. Preserve the
+			// job's sandbox across providers so fallback can never widen access.
+			c.Sandbox = narrowerSandbox(explicit.Sandbox, c.Sandbox)
 			return c, i, nil
 		}
 		if earliest.IsZero() || h.UnavailableUntil.Before(earliest) {
@@ -102,6 +105,16 @@ func (m *Manager) Resolve(role string, explicit core.RuntimeSpec) (core.RuntimeS
 		}
 	}
 	return core.RuntimeSpec{}, 0, &CooldownError{Role: role, Until: earliest}
+}
+
+func narrowerSandbox(job, candidate string) string {
+	if job == "read-only" || candidate == "read-only" {
+		return "read-only"
+	}
+	if candidate != "" {
+		return candidate
+	}
+	return job
 }
 func (m *Manager) Record(spec core.RuntimeSpec, class, reason string) error {
 	m.mu.Lock()

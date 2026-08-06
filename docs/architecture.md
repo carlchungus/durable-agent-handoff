@@ -51,10 +51,9 @@ $HANDOFF_HOME/workflows/WF_ID/
   events.jsonl
   state.json
   runs/NODE_ID/ATTEMPT/
-    events.jsonl
-    stderr.log
-    last-message.json
-    result.schema.json
+    activity-attempt-N/
+      last-message.json
+      result.schema.json
 ```
 
 Background sessions have their own event-sourced identity and inbox kernel:
@@ -73,9 +72,8 @@ Independently controllable work uses a separate Activity ledger:
 $HANDOFF_HOME/activities/ACTIVITY_ID/
   events.jsonl
   state.json
-  attempts/ATTEMPT_ID/
-    stdout.log
-    stderr.log
+  ATTEMPT_ID_stdout.log
+  ATTEMPT_ID_stderr.log
 ```
 
 A Session owns conversational identity; an Activity owns work lifecycle and
@@ -87,16 +85,48 @@ processes.
 An attachment is an ephemeral reader over an Activity revision and byte cursor.
 Disconnecting it has no lifecycle effect. Stop, signal, adopt, and restart are
 durable control intents that include the expected Activity generation and exact
-Attempt process identity (PID plus platform start token). Stale controllers and
-PID reuse fail closed.
+Attempt process identity (attempt ID, PID plus platform start token, supervisor
+ID, and supervisor generation). A live process is adopted once per supervisor
+incarnation; routine reconciliation by the same owner does not churn fencing
+tokens. Stale controllers and PID reuse fail closed.
 
-The ledger reducer produces the sole Activity projection used by human TUI,
-JSON/JSONL, RPC, and policy. A combined snapshot-and-subscribe operation orders
-subscriber registration with the initial read so reconnect cannot lose events
-between snapshot and follow. The prior-art evidence and license boundary are in
+Every new Attempt starts through a tiny gated runner. The runner establishes a
+dedicated process tree, but cannot execute the target until the supervisor has
+fsynced the exact PID, birth token, owner, and generation to the Activity
+ledger. Supervisor death before that release closes the inherited gate and the
+target never starts. After release, the runner waits for the target and writes
+its exact completion back through the same fenced Activity transaction before
+exiting. Recovery can therefore adopt a live runner or replay its terminal
+record without a second process-authority file. `attempt.json` is read only as
+legacy compatibility for pre-v0.4 workflows.
+
+On Unix the runner owns a dedicated process group. On Windows it is assigned to
+a uniquely named Job Object before release, inherits the job handle across
+supervisor death, and uses `KILL_ON_JOB_CLOSE` so runner death contains every
+remaining descendant. Stop reopens and terminates the kernel job identity
+rather than re-resolving a PID ancestry snapshot. Attempt output filenames are
+reserved by the prepared event ordinal; orphan files left before that event are
+safely replaced on retry. Agent Attempts also persist the exact structured-result
+path. An absent path identifies the shared layout used by pre-v0.4 development
+builds, so migration never guesses from an ordinal or consumes a stale artifact.
+
+The ledger reducer produces the sole Activity projection used by the human TUI,
+JSON/JSONL CLI surfaces, and policy. `activity follow` advances an exact output
+cursor by polling the same durable ledger, so reconnect resumes without replaying
+or skipping bytes. The prior-art evidence and license boundary are in
 [`prior-art-codex-pi-omp.md`](prior-art-codex-pi-omp.md); the domain decision is
 recorded in
 [`ADR 0001`](adr/0001-separate-sessions-and-activities.md).
+
+The ledger root is a supervisor-private trust boundary and must remain outside
+worker-writable sandboxes. Descriptor-relative opens, ownership/mode checks,
+single-link regular files, pinned identities, locks, fsync, and replay repair
+fail closed on accidental or uncoordinated path replacement. They do not claim
+to isolate an actively malicious unsandboxed process running as the supervisor's
+same OS user; such a process can also inspect or signal the supervisor directly.
+Windows fsyncs ledger files but exposes no POSIX directory-fsync contract through
+Go's directory handles; process-crash recovery is covered, while metadata
+durability across sudden power loss remains filesystem-defined on Windows.
 
 ## Scheduling
 

@@ -3,18 +3,20 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/carlchungus/durable-agent-handoff/internal/activity"
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/finalize"
+	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
 	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 	agentsession "github.com/carlchungus/durable-agent-handoff/internal/session"
 )
@@ -34,6 +36,31 @@ func TestResultSchemaDefinesArrayItems(t *testing.T) {
 		if property.Type != "array" || len(property.Items) == 0 {
 			t.Fatalf("%s must define array items: %s", name, resultSchema)
 		}
+	}
+}
+
+func TestFinalizeDoesNotRequireAgentRuntimePreference(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("guarded merge", t.TempDir(), core.DefaultBudget())
+	finalizer := &core.Node{ID: "finalize", Title: "merge after gates", Kind: "finalize"}
+	_, err := st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{
+		{Op: "add_node", Node: finalizer},
+		{Op: "attest", Attestation: &core.Attestation{ID: "pass", NodeID: "finalize", Verifier: "independent", Verdict: "pass", Summary: "verified"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, runErr := (&Engine{Store: st, Preferences: preferences.Open(state)}).RunOne(context.Background(), w.ID)
+	if node == nil || node.ID != "finalize" {
+		t.Fatalf("finalizer was blocked by irrelevant runtime routing: node=%+v err=%v", node, runErr)
+	}
+	if runErr != nil && strings.Contains(runErr.Error(), "runtime or preference ladder") {
+		t.Fatalf("finalizer used agent runtime routing: %v", runErr)
+	}
+	got, _ := st.Load(w.ID)
+	if got.Nodes["finalize"].Attempt != 1 || len(got.Evidence) == 0 || strings.Contains(got.Evidence[len(got.Evidence)-1].Summary, "runtime or preference ladder") {
+		t.Fatalf("deterministic finalizer did not execute: %+v", got.Nodes["finalize"])
 	}
 }
 
@@ -308,6 +335,58 @@ func TestEngineRunsGenericAgentAndPersistsSession(t *testing.T) {
 	}
 	if got.Nodes["lead"].State != core.NodeCompleted || got.Status != core.WorkflowCompleted {
 		t.Fatalf("node=%s workflow=%s", got.Nodes["lead"].State, got.Status)
+	}
+	activities, err := eng.Activities.List()
+	if err != nil || len(activities) != 1 {
+		t.Fatalf("activities=%+v err=%v", activities, err)
+	}
+	agent, err := eng.Sessions.LoadByNode(w.ID, "lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracked := activities[0]
+	if tracked.OwnerSessionID != agent.ID || tracked.State != activity.StateCompleted || len(tracked.Attempts) != 1 || tracked.Attempts[0].CommandDigest == "" {
+		t.Fatalf("activity=%+v agent=%+v", tracked, agent)
+	}
+	chunk, err := eng.Activities.ReadOutput(tracked.ID, activity.OutputCursor{AttemptID: tracked.Attempts[0].ID, Stream: activity.StreamStdout, OutputID: tracked.Attempts[0].Stdout.ID}, 64<<10)
+	if err != nil || !strings.Contains(string(chunk.Data), "implemented safely") {
+		t.Fatalf("durable activity output=%q err=%v", chunk.Data, err)
+	}
+}
+
+func TestDelegatedAgentTurnGetsParentSessionAndOwnActivity(t *testing.T) {
+	if os.Getenv("GO_WANT_SUBAGENT_ACTIVITY_HELPER") == "1" {
+		fmt.Println(`{"status":"completed","summary":"child-safe","attestations":[{"verifier":"helper","verdict":"pass","summary":"checked"}]}`)
+		os.Exit(0)
+	}
+	t.Setenv("GO_WANT_SUBAGENT_ACTIVITY_HELPER", "1")
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("run delegated agent", t.TempDir(), core.DefaultBudget())
+	runtimeSpec := core.RuntimeSpec{Name: "exec", Executable: os.Args[0], Args: []string{"-test.run=TestDelegatedAgentTurnGetsParentSessionAndOwnActivity"}}
+	parent := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: runtimeSpec}
+	child := &core.Node{ID: "child", Title: "child", Kind: "agent", Runtime: runtimeSpec, DependsOn: []string{"lead"}, Metadata: map[string]string{"parent_id": "lead"}}
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: parent}, {Op: "add_node", Node: child}}})
+	eng := &Engine{Store: st}
+	if _, err := eng.RunOne(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.RunOne(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	childSession, err := eng.Sessions.LoadByNode(w.ID, "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childSession.ParentAgentID != "lead" {
+		t.Fatalf("child session=%+v", childSession)
+	}
+	childActivity, err := eng.Activities.Load(activity.StableID(w.ID, "child", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childActivity.OwnerSessionID != childSession.ID || childActivity.State != activity.StateCompleted {
+		t.Fatalf("child activity=%+v session=%+v", childActivity, childSession)
 	}
 }
 
@@ -643,6 +722,193 @@ func TestReconcileStopsOnAmbiguousNonIdempotentAttempt(t *testing.T) {
 	}
 }
 
+func TestReconcileUsesActivityBeforeConflictingLegacyManifest(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("prefer activity authority", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "exec"}}
+	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "lead", State: core.NodeRunning}}})
+	n = w.Nodes["lead"]
+	activities, _ := activity.OpenStore(state)
+	tracked, _ := activities.Create(activity.Descriptor{ID: activity.StableID(w.ID, n.ID, "1"), Work: activity.WorkSpec{Kind: "agent", Cwd: w.Root, Intent: w.ID + "/lead"}})
+	attempt, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{CommandDigest: "exact"})
+	_, _ = stdout.WriteString(`{"status":"completed","summary":"activity won","mutations":[],"attestations":[]}`)
+	_ = stdout.Close()
+	_ = stderr.Close()
+	attempt, _ = activities.MarkRunning(tracked.ID, tracked.Generation, attempt.ID, activity.ProcessIdentity{PID: 8888, ProcessStartToken: "dead", SupervisorID: "dead:owner", SupervisorGeneration: 1})
+	if err := activities.FinishAttempt(tracked.ID, tracked.Generation, activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}, activity.ExitResult{State: activity.StateCompleted}); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(state, "workflows", w.ID, "runs", "lead", "1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := runstate.Create(filepath.Join(dir, "attempt.json"), runstate.Manifest{ID: "legacy", WorkflowID: w.ID, NodeID: "lead", Attempt: 1, Status: "running", PID: os.Getpid(), ProcessStartToken: runstate.ProcessStartToken(os.Getpid()), SupervisorID: runstate.SupervisorIdentity(), SupervisorGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = legacy
+	if err = (&Engine{Store: st, Activities: activities}).Reconcile(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Load(w.ID)
+	if got.Nodes["lead"].State != core.NodeCompleted || len(got.Evidence) == 0 || got.Evidence[len(got.Evidence)-1].Summary != "activity won" {
+		t.Fatalf("workflow did not reduce authoritative Activity: state=%s evidence=%+v", got.Nodes["lead"].State, got.Evidence)
+	}
+}
+
+func TestReconcileDoesNotApplyValidOutputFromFailedActivity(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("reject stale failed output", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "exec"}}
+	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "lead", State: core.NodeRunning}}})
+	n = w.Nodes["lead"]
+	activities, _ := activity.OpenStore(state)
+	tracked, _ := activities.Create(activity.Descriptor{ID: activity.StableID(w.ID, n.ID, "1"), Work: activity.WorkSpec{Kind: "agent", Cwd: w.Root, Intent: w.ID + "/lead"}})
+	attempt, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{})
+	_, _ = stdout.WriteString(`{"status":"completed","summary":"must not apply","mutations":[],"attestations":[]}`)
+	_ = stdout.Close()
+	_ = stderr.Close()
+	attempt, _ = activities.MarkRunning(tracked.ID, tracked.Generation, attempt.ID, activity.ProcessIdentity{PID: 7777, ProcessStartToken: "dead", SupervisorID: "dead:owner", SupervisorGeneration: 1})
+	code := 1
+	identity := activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
+	_ = activities.FinishAttempt(tracked.ID, tracked.Generation, identity, activity.ExitResult{State: activity.StateFailed, ExitCode: &code, Error: "exit status 1"})
+	if err := (&Engine{Store: st, Activities: activities}).Reconcile(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Load(w.ID)
+	if got.Nodes["lead"].State == core.NodeCompleted {
+		t.Fatalf("failed Activity output was applied: evidence=%+v", got.Evidence)
+	}
+	for _, evidence := range got.Evidence {
+		if evidence.Summary == "must not apply" {
+			t.Fatalf("stale failed result was reduced: %+v", got.Evidence)
+		}
+	}
+}
+
+func TestReconcileReadsOnlyCurrentActivityAttemptResult(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("isolate provider attempts", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "exec"}}
+	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "lead", State: core.NodeRunning}}})
+	n = w.Nodes["lead"]
+	activities, _ := activity.OpenStore(state)
+	tracked, _ := activities.Create(activity.Descriptor{ID: activity.StableID(w.ID, n.ID, "1"), Work: activity.WorkSpec{Kind: "agent", Cwd: w.Root, Intent: w.ID + "/lead"}})
+	baseDir := filepath.Join(state, "workflows", w.ID, "runs", "lead", "1")
+	first, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{})
+	_ = stdout.Close()
+	_ = stderr.Close()
+	first, _ = activities.MarkRunning(tracked.ID, tracked.Generation, first.ID, activity.ProcessIdentity{PID: 7001, ProcessStartToken: "dead-1", SupervisorID: "owner-1", SupervisorGeneration: 1})
+	firstIdentity := activity.AttemptIdentity{ID: first.ID, PID: first.PID, ProcessStartToken: first.ProcessStartToken, SupervisorID: first.SupervisorID, SupervisorGeneration: first.SupervisorGeneration}
+	code := 1
+	_ = activities.FinishAttempt(tracked.ID, tracked.Generation, firstIdentity, activity.ExitResult{State: activity.StateFailed, ExitCode: &code, Error: "provider limit"})
+	for _, path := range []string{filepath.Join(baseDir, "last-message.json"), filepath.Join(baseDir, "activity-attempt-1", "last-message.json")} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(`{"status":"completed","summary":"stale attempt","mutations":[],"attestations":[]}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	currentResult := filepath.Join(baseDir, "activity-attempt-2", "last-message.json")
+	current, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{ResultPath: currentResult})
+	_, _ = stdout.WriteString(`{"status":"completed","summary":"current attempt","mutations":[],"attestations":[]}`)
+	_ = stdout.Close()
+	_ = stderr.Close()
+	current, _ = activities.MarkRunning(tracked.ID, tracked.Generation, current.ID, activity.ProcessIdentity{PID: 7002, ProcessStartToken: "dead-2", SupervisorID: "owner-2", SupervisorGeneration: 1})
+	currentIdentity := activity.AttemptIdentity{ID: current.ID, PID: current.PID, ProcessStartToken: current.ProcessStartToken, SupervisorID: current.SupervisorID, SupervisorGeneration: current.SupervisorGeneration}
+	code = 0
+	_ = activities.FinishAttempt(tracked.ID, tracked.Generation, currentIdentity, activity.ExitResult{State: activity.StateCompleted, ExitCode: &code})
+
+	if err := (&Engine{Store: st, Activities: activities}).Reconcile(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Load(w.ID)
+	if got.Nodes["lead"].State != core.NodeCompleted || got.Evidence[len(got.Evidence)-1].Summary != "current attempt" {
+		t.Fatalf("stale result crossed Activity attempt boundary: node=%+v evidence=%+v", got.Nodes["lead"], got.Evidence)
+	}
+}
+
+func TestReconcileReadsLegacyResultForPreVersionedSecondActivityAttempt(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("upgrade legacy retry", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "exec"}}
+	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "lead", State: core.NodeRunning}}})
+	activities, _ := activity.OpenStore(state)
+	tracked, _ := activities.Create(activity.Descriptor{ID: activity.StableID(w.ID, "lead", "1"), Work: activity.WorkSpec{Kind: "agent", Cwd: w.Root, Intent: w.ID + "/lead"}})
+	first, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{})
+	_ = stdout.Close()
+	_ = stderr.Close()
+	first, _ = activities.MarkRunning(tracked.ID, tracked.Generation, first.ID, activity.ProcessIdentity{PID: 7101, ProcessStartToken: "dead-1", SupervisorID: "owner-1", SupervisorGeneration: 1})
+	firstIdentity := activity.AttemptIdentity{ID: first.ID, PID: first.PID, ProcessStartToken: first.ProcessStartToken, SupervisorID: first.SupervisorID, SupervisorGeneration: first.SupervisorGeneration}
+	code := 1
+	_ = activities.FinishAttempt(tracked.ID, tracked.Generation, firstIdentity, activity.ExitResult{State: activity.StateFailed, ExitCode: &code, Error: "provider limit"})
+	second, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{})
+	_ = stdout.Close()
+	_ = stderr.Close()
+	second, _ = activities.MarkRunning(tracked.ID, tracked.Generation, second.ID, activity.ProcessIdentity{PID: 7102, ProcessStartToken: "dead-2", SupervisorID: "owner-2", SupervisorGeneration: 1})
+	secondIdentity := activity.AttemptIdentity{ID: second.ID, PID: second.PID, ProcessStartToken: second.ProcessStartToken, SupervisorID: second.SupervisorID, SupervisorGeneration: second.SupervisorGeneration}
+	code = 0
+	_ = activities.FinishAttempt(tracked.ID, tracked.Generation, secondIdentity, activity.ExitResult{State: activity.StateCompleted, ExitCode: &code})
+	legacyPath := filepath.Join(state, "workflows", w.ID, "runs", "lead", "1", "last-message.json")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(`{"status":"completed","summary":"legacy second attempt","mutations":[],"attestations":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Engine{Store: st, Activities: activities}).Reconcile(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Load(w.ID)
+	if got.Nodes["lead"].State != core.NodeCompleted || got.Evidence[len(got.Evidence)-1].Summary != "legacy second attempt" {
+		t.Fatalf("legacy ordinal-2 result was not recovered: node=%+v evidence=%+v", got.Nodes["lead"], got.Evidence)
+	}
+}
+
+func TestReconcileDoesNotUseLegacyResultForVersionedFirstActivityAttempt(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("fence versioned result", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "exec"}}
+	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "lead", State: core.NodeRunning}}})
+	baseDir := filepath.Join(state, "workflows", w.ID, "runs", "lead", "1")
+	legacyPath := filepath.Join(baseDir, "last-message.json")
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(`{"status":"completed","summary":"stale legacy result","mutations":[],"attestations":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	activities, _ := activity.OpenStore(state)
+	tracked, _ := activities.Create(activity.Descriptor{ID: activity.StableID(w.ID, "lead", "1"), Work: activity.WorkSpec{Kind: "agent", Cwd: w.Root, Intent: w.ID + "/lead"}})
+	missingExact := filepath.Join(baseDir, "activity-attempt-1", "last-message.json")
+	attempt, stdout, stderr, _ := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{ResultPath: missingExact})
+	_, _ = stdout.WriteString(`{"status":"completed","summary":"current stdout result","mutations":[],"attestations":[]}`)
+	_ = stdout.Close()
+	_ = stderr.Close()
+	attempt, _ = activities.MarkRunning(tracked.ID, tracked.Generation, attempt.ID, activity.ProcessIdentity{PID: 7201, ProcessStartToken: "dead", SupervisorID: "owner", SupervisorGeneration: 1})
+	identity := activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
+	code := 0
+	_ = activities.FinishAttempt(tracked.ID, tracked.Generation, identity, activity.ExitResult{State: activity.StateCompleted, ExitCode: &code})
+	if err := (&Engine{Store: st, Activities: activities}).Reconcile(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Load(w.ID)
+	if got.Nodes["lead"].State != core.NodeCompleted || got.Evidence[len(got.Evidence)-1].Summary != "current stdout result" {
+		t.Fatalf("versioned attempt consumed legacy result: node=%+v evidence=%+v", got.Nodes["lead"], got.Evidence)
+	}
+}
+
 func TestRuntimeChildSurvivesSupervisorCrashAndReconciles(t *testing.T) {
 	if os.Getenv("GO_WANT_CRASH_RUNTIME") == "1" && len(os.Args) > 2 {
 		fmt.Println(`{"type":"thread.started","thread_id":"019fd17f-f95a-76e2-b0fe-35efee5fabda"}`)
@@ -660,10 +926,6 @@ func TestRuntimeChildSurvivesSupervisorCrashAndReconciles(t *testing.T) {
 		_, _ = (&Engine{Store: st}).RunOne(context.Background(), os.Getenv("HANDOFF_TEST_WORKFLOW"))
 		os.Exit(0)
 	}
-	if runtime.GOOS == "windows" {
-		t.Skip("process adoption is covered by the Windows service integration suite")
-	}
-
 	state := t.TempDir()
 	st, _ := core.OpenStore(state)
 	w, _ := st.Create("survive a supervisor crash", t.TempDir(), core.DefaultBudget())
@@ -675,43 +937,66 @@ func TestRuntimeChildSurvivesSupervisorCrashAndReconciles(t *testing.T) {
 	if err := supervisor.Start(); err != nil {
 		t.Fatal(err)
 	}
-	manifestPath := filepath.Join(state, "workflows", w.ID, "runs", "lead", "1", "attempt.json")
-	var manifest runstate.Manifest
+	activities, err := activity.OpenStore(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activityID := activity.StableID(w.ID, "lead", "1")
+	var tracked *activity.Activity
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		manifest, _ = runstate.Load(manifestPath)
-		if manifest.Status == "running" && manifest.PID > 0 && manifest.SessionID != "" {
+		tracked, _ = activities.Load(activityID)
+		current, _ := st.Load(w.ID)
+		if tracked != nil && tracked.State == activity.StateRunning && len(tracked.Attempts) == 1 && tracked.Attempts[0].PID > 0 && current.Nodes["lead"].SessionID != "" {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if manifest.PID == 0 || manifest.SessionID == "" {
+	if tracked == nil || len(tracked.Attempts) != 1 || tracked.Attempts[0].PID == 0 {
 		_ = supervisor.Process.Kill()
-		t.Fatalf("worker identity was not persisted before crash: %+v", manifest)
+		t.Fatalf("worker identity was not persisted before crash: %+v", tracked)
+	}
+	workerAttempt := tracked.Attempts[0]
+	if !workerIsDetached(supervisor.Process.Pid, workerAttempt.PID) {
+		_ = supervisor.Process.Kill()
+		t.Fatalf("worker %d shares supervisor %d process group", workerAttempt.PID, supervisor.Process.Pid)
 	}
 	if err := supervisor.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
 	_, _ = supervisor.Process.Wait()
+	if err := (&Engine{Store: st}).Reconcile(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := activities.Load(activityID)
+	if err != nil || adopted.Generation != 2 || adopted.Attempts[0].SupervisorGeneration != 2 {
+		t.Fatalf("live runner was not adopted exactly once: activity=%+v err=%v", adopted, err)
+	}
 
-	eventsPath := filepath.Join(state, "workflows", w.ID, "runs", "lead", "1", "events.jsonl")
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		b, _ := os.ReadFile(eventsPath)
-		if strings.Contains(string(b), "survived supervisor crash") {
+		chunk, _ := activities.ReadOutput(activityID, activity.OutputCursor{AttemptID: workerAttempt.ID, Stream: activity.StreamStdout, OutputID: workerAttempt.Stdout.ID}, 64<<10)
+		if strings.Contains(string(chunk.Data), "survived supervisor crash") {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if runstate.ProcessMatches(manifest) {
-		process, _ := os.FindProcess(manifest.PID)
-		_ = process.Kill()
+	var got *core.Workflow
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := (&Engine{Store: st}).Reconcile(context.Background(), w.ID); err != nil {
+			t.Fatal(err)
+		}
+		got, _ = st.Load(w.ID)
+		if got.Nodes["lead"].State == core.NodeCompleted {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if err := (&Engine{Store: st}).Reconcile(context.Background(), w.ID); err != nil {
-		t.Fatal(err)
-	}
-	got, _ := st.Load(w.ID)
 	if got.Nodes["lead"].State != core.NodeCompleted || got.Status != core.WorkflowCompleted {
 		t.Fatalf("reconciled node=%s workflow=%s evidence=%+v", got.Nodes["lead"].State, got.Status, got.Evidence)
+	}
+	if _, err = os.Stat(filepath.Join(state, "workflows", w.ID, "runs", "lead", "1", "attempt.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("new agent turn wrote legacy process authority: %v", err)
 	}
 }

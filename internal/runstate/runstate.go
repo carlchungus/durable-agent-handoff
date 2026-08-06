@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -34,6 +33,8 @@ type Manifest struct {
 	WorkflowID               string    `json:"workflow_id"`
 	NodeID                   string    `json:"node_id"`
 	Attempt                  int       `json:"attempt"`
+	ActivityID               string    `json:"activity_id,omitempty"`
+	ActivityAttemptID        string    `json:"activity_attempt_id,omitempty"`
 	Status                   string    `json:"status"`
 	Runtime                  string    `json:"runtime"`
 	Model                    string    `json:"model,omitempty"`
@@ -48,6 +49,8 @@ type Manifest struct {
 	Worktree                 string    `json:"worktree"`
 	RestartSafe              bool      `json:"restart_safe"`
 	EventOffset              int64     `json:"event_offset,omitempty"`
+	StdoutPath               string    `json:"stdout_path,omitempty"`
+	StderrPath               string    `json:"stderr_path,omitempty"`
 	StartedAt                time.Time `json:"started_at"`
 	HeartbeatAt              time.Time `json:"heartbeat_at"`
 	FinishedAt               time.Time `json:"finished_at,omitempty"`
@@ -177,6 +180,18 @@ func SupervisorIdentity() string {
 	return supervisorIdentity
 }
 
+func SupervisorMatches(identity string) bool {
+	separator := strings.IndexByte(identity, ':')
+	if separator <= 0 || separator == len(identity)-1 {
+		return false
+	}
+	pid, err := strconv.Atoi(identity[:separator])
+	if err != nil {
+		return false
+	}
+	return ProcessMatches(Manifest{PID: pid, ProcessStartToken: identity[separator+1:]})
+}
+
 // ClaimSupervisor adopts an attempt after the prior lease expires. The
 // generation is a fencing token: recorders from older owners can no longer
 // overwrite the manifest after this call succeeds.
@@ -269,14 +284,10 @@ func staleFileLock(path string) bool {
 }
 
 func ProcessStartToken(pid int) string {
-	if pid <= 0 || runtime.GOOS == "windows" {
+	if pid <= 0 {
 		return ""
 	}
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
+	return platformProcessStartToken(pid)
 }
 
 func ProcessMatches(manifest Manifest) bool {
@@ -284,8 +295,7 @@ func ProcessMatches(manifest Manifest) bool {
 		return false
 	}
 	if runtime.GOOS == "windows" {
-		out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", manifest.PID), "/FO", "CSV", "/NH").Output()
-		return err == nil && strings.Contains(string(out), fmt.Sprintf("\",\"%d\",", manifest.PID))
+		return manifest.ProcessStartToken != "" && ProcessStartToken(manifest.PID) == manifest.ProcessStartToken
 	}
 	process, err := os.FindProcess(manifest.PID)
 	if err != nil {

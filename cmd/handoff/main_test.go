@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/carlchungus/durable-agent-handoff/internal/activity"
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	agentsession "github.com/carlchungus/durable-agent-handoff/internal/session"
 	"github.com/carlchungus/durable-agent-handoff/internal/team"
@@ -138,5 +139,68 @@ func TestAgentReplyInboxAndViewAreMachineReadable(t *testing.T) {
 	}
 	if json.Valid(out.Bytes()) || !bytes.Contains(out.Bytes(), []byte("LOGICAL")) || !bytes.Contains(out.Bytes(), []byte("needs_input")) || !bytes.Contains(out.Bytes(), []byte("session-exact-123")) {
 		t.Fatalf("human agent view=%q", out.String())
+	}
+}
+
+func TestActivityCLIUsesTheDurableProjectionAndOutputCursor(t *testing.T) {
+	state := t.TempDir()
+	store, err := activity.OpenStore(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := store.Create(activity.Descriptor{ID: "activity_abcdefabcdefabcdefabcdef", Work: activity.WorkSpec{Kind: "command", Cwd: t.TempDir(), Intent: "test command"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, stdout, stderr, err := store.PrepareAttempt(item.ID, item.Generation, activity.AttemptStart{Runtime: "exec"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err = store.MarkRunning(item.ID, item.Generation, attempt.ID, activity.ProcessIdentity{PID: 123, ProcessStartToken: "exact", SupervisorID: "supervisor-a", SupervisorGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = stdout.WriteString("hello\n"); err == nil {
+		err = stdout.Sync()
+	}
+	_ = stdout.Close()
+	_ = stderr.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
+	if err = store.FinishAttempt(item.ID, item.Generation, identity, activity.ExitResult{State: activity.StateCompleted}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	if err = run([]string{"activity", "list", "--state", state, "--json"}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	var listed []*activity.Activity
+	if err = json.Unmarshal(out.Bytes(), &listed); err != nil || len(listed) != 1 || listed[0].ID != item.ID {
+		t.Fatalf("listed=%+v err=%v", listed, err)
+	}
+	out.Reset()
+	if err = run([]string{"activity", "read", "--state", state, item.ID, "--json"}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	var read activity.Activity
+	if err = json.Unmarshal(out.Bytes(), &read); err != nil || read.State != activity.StateCompleted {
+		t.Fatalf("read=%+v err=%v", read, err)
+	}
+	out.Reset()
+	if err = run([]string{"activity", "read", "--state", state, item.ID}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte(attempt.Stdout.ID)) || !bytes.Contains(out.Bytes(), []byte("supervisor-a")) {
+		t.Fatalf("human activity read omitted reconnect identity: %q", out.String())
+	}
+	out.Reset()
+	if err = run([]string{"activity", "follow", "--state", state, item.ID, "--stream", "stdout", "--output", attempt.Stdout.ID, "--after", "0"}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "hello\n" {
+		t.Fatalf("follow=%q", out.String())
 	}
 }

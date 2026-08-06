@@ -22,7 +22,7 @@ Read `../../docs/claude-workflows-compatibility.md` before changing these semant
 ## Keep durable identities separate
 
 - A **Session** owns conversation identity, lineage, inbox, workspace, and the exact native runtime resume handle. It never owns a PID or output pipe.
-- An **Activity** owns independently controllable work, its immutable launch specification, durable output, lifecycle ledger, and ordered Attempts.
+- An **Activity** owns independently controllable work, its immutable logical work specification, durable output, lifecycle ledger, and ordered Attempts. Exact command digests belong to Attempts; command arguments are not persisted because they can contain prompts or credentials.
 - An **Attempt** is one immutable process execution with runtime/model, PID plus start token, supervisor generation, output identities, and terminal result.
 - An **Attachment** is only an ephemeral reader at an output identity, byte cursor, and snapshot revision. Disconnecting it must not stop work.
 - A stop, signal, adopt, or restart is a durable control intent fenced by Activity generation and exact Attempt identity. PID-only control fails closed.
@@ -37,7 +37,8 @@ Do not add process/task fields to Session, use a workflow node as the only execu
 4. Use one worktree per mutable worker. Never overlap writers.
 5. Resume exact runtime session IDs; never use a global last-session selector. Revalidate imported claims against the live checkout.
 6. Configure role ladders with `handoff preference set ROLE --candidate runtime:model:effort ...`. Provider quota and rate exhaustion may advance the ladder; auth, invalid-model, code, and test failures may not.
-7. Run under `handoff serve` or `handoff service install --enable`. Observe through the TUI, JSON status, JSONL events, durable attempt logs, and provider health.
+7. Run under `handoff serve` or `handoff service install --enable`. Observe through the TUI, JSON status, JSONL events, `handoff activity list|read|follow`, and provider health.
+8. For automated output reconnect, retain the exact output ID and byte cursor. For automated stop, pass the Activity generation and Attempt ID returned by `read`; never control a PID directly.
 
 ## Durability contract
 
@@ -52,7 +53,7 @@ Do not add process/task fields to Session, use a workflow node as the only execu
 
 - Prefer the user's role ladder. A useful planner example is `claude:opus:xhigh`, then `codex:gpt-5.6-sol:xhigh`, then `pi:openrouter/moonshotai/kimi-latest:xhigh`.
 - Claude uses strict declared MCP configuration. Codex uses an explicit workspace sandbox and exact thread resume. Pi/OhMyPi require external isolation because they do not provide an OS sandbox.
-- Children inherit authority and may narrow it; they may not grant themselves more tools, filesystem scope, credentials, or merge rights.
+- Children and provider fallbacks inherit authority and may narrow it; they may not grant themselves more tools, filesystem scope, credentials, sandbox access, or merge rights.
 - Hooks and evaluators may block, retry, inject context, or attest, but deterministic policy owns roots, budgets, privileged actions, and merge gates.
 
 ## GitHub boundary

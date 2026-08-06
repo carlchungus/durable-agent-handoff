@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"syscall"
 )
 
@@ -37,6 +38,22 @@ func killProcessGroup(identity AttemptIdentity) error {
 		return ErrFenced
 	}
 	if err := syscall.Kill(-identity.PID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	return nil
+}
+
+func cleanupOrphanedProcessTree(identity AttemptIdentity) error {
+	if identity.ProcessTreeID == "" {
+		return nil
+	}
+	pgid, err := strconv.Atoi(identity.ProcessTreeID)
+	if err != nil || pgid != identity.PID {
+		return ErrFenced
+	}
+	// While any descendant remains, this dedicated PGID still names the exact
+	// original group and cannot be reused. ESRCH means the tree is already gone.
+	if err = syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return err
 	}
 	return nil

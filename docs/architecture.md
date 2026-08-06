@@ -100,10 +100,12 @@ record without a second process-authority file. `attempt.json` is read only as
 legacy compatibility for pre-v0.4 workflows.
 
 On Unix the runner owns a dedicated process group. On Windows it is assigned to
-a uniquely named Job Object before release, and descendants remain in that job;
-stop reopens and terminates the kernel job identity rather than re-resolving a
-PID ancestry snapshot. Attempt output filenames are reserved by the prepared
-event ordinal; orphan files left before that event are safely replaced on retry.
+a uniquely named Job Object before release, inherits the job handle across
+supervisor death, and uses `KILL_ON_JOB_CLOSE` so runner death contains every
+remaining descendant. Stop reopens and terminates the kernel job identity
+rather than re-resolving a PID ancestry snapshot. Attempt output filenames are
+reserved by the prepared event ordinal; orphan files left before that event are
+safely replaced on retry.
 
 The ledger reducer produces the sole Activity projection used by human TUI,
 JSON/JSONL, RPC, and policy. A combined snapshot-and-subscribe operation orders

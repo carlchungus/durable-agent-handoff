@@ -113,6 +113,9 @@ func (s *Supervisor) Recover() ([]*Activity, error) {
 			continue
 		}
 		if !processMatches(identity) {
+			if cleanupErr := cleanupOrphanedProcessTree(identity); cleanupErr != nil && !errors.Is(cleanupErr, ErrFenced) {
+				return nil, cleanupErr
+			}
 			state := StateLost
 			reason := "exact process identity is no longer live"
 			if activity.State == StateStopping {
@@ -144,21 +147,8 @@ func (s *Supervisor) Recover() ([]*Activity, error) {
 			}
 			continue
 		}
-		go s.monitorRecovered(adopted.ID, adopted.Generation, adoptedIdentity)
 	}
 	return recovered, nil
-}
-
-func (s *Supervisor) monitorRecovered(activityID string, generation uint64, identity AttemptIdentity) {
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-	for range ticker.C {
-		if processMatches(identity) {
-			continue
-		}
-		_ = s.Store.FinishAttempt(activityID, generation, identity, ExitResult{State: StateLost, Error: "recovered process exited without an exact child exit receipt"})
-		return
-	}
 }
 
 func (s *Supervisor) Stop(id string) (*Activity, error) {

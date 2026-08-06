@@ -6,9 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 )
 
 const (
@@ -154,9 +157,77 @@ func TestActivityWorkerHelper(t *testing.T) {
 	if os.Getenv(workerHelperEnv) != "1" {
 		return
 	}
-	fmt.Fprint(os.Stdout, "one\n")
+	fmt.Fprintf(os.Stdout, "one\nworker:%d\n", os.Getpid())
 	for {
 		time.Sleep(time.Hour)
+	}
+}
+
+func TestRecoverContainsTreeWhenAdoptedRunnerDies(t *testing.T) {
+	state := t.TempDir()
+	helper := exec.Command(os.Args[0], "-test.run=^TestActivitySupervisorCrashHelper$")
+	helper.Env = append(os.Environ(), crashHelperEnv+"=1", stateHelperEnv+"="+state)
+	readyPipe, err := helper.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper.Stderr = os.Stderr
+	if err = helper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var ready crashReady
+	if err = json.NewDecoder(readyPipe).Decode(&ready); err != nil {
+		_ = helper.Process.Kill()
+		t.Fatal(err)
+	}
+	if err = helper.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = helper.Process.Wait()
+	store, _ := OpenStore(state)
+	supervisor := &Supervisor{Store: store}
+	if recovered, recoverErr := supervisor.Recover(); recoverErr != nil || len(recovered) != 1 {
+		t.Fatalf("recovered=%+v err=%v", recovered, recoverErr)
+	}
+	chunk, err := store.ReadOutput(ready.ActivityID, OutputCursor{AttemptID: ready.Attempt.ID, Stream: StreamStdout, OutputID: ready.Attempt.Stdout.ID}, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerPID := 0
+	for _, line := range strings.Split(string(chunk.Data), "\n") {
+		if strings.HasPrefix(line, "worker:") {
+			workerPID, _ = strconv.Atoi(strings.TrimPrefix(line, "worker:"))
+		}
+	}
+	if workerPID == 0 {
+		t.Fatalf("worker pid missing from %q", chunk.Data)
+	}
+	t.Cleanup(func() {
+		if process, findErr := os.FindProcess(workerPID); findErr == nil {
+			_ = process.Kill()
+		}
+	})
+	runner, _ := os.FindProcess(ready.Attempt.PID)
+	if err = runner.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for processMatches(identityOf(ready.Attempt)) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err = supervisor.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for runstate.ProcessStartToken(workerPID) != "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if runstate.ProcessStartToken(workerPID) != "" {
+		t.Fatalf("worker %d escaped after its adopted runner died", workerPID)
+	}
+	finished, _ := store.Load(ready.ActivityID)
+	if finished.State != StateLost {
+		t.Fatalf("activity state=%s", finished.State)
 	}
 }
 

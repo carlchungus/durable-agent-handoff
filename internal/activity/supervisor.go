@@ -4,14 +4,16 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 )
 
 type Supervisor struct {
-	Store *Store
-	Env   []string
+	Store    *Store
+	Env      []string
+	children sync.Map
 }
 
 func (s *Supervisor) ownerID() string { return runstate.SupervisorIdentity() }
@@ -87,7 +89,9 @@ func (s *Supervisor) Start(descriptor Descriptor) (*Activity, Attempt, error) {
 	if err != nil {
 		return nil, Attempt{}, err
 	}
-	go s.waitChild(activity.ID, command, identityOf(attempt))
+	done := make(chan struct{})
+	s.children.Store(activity.ID, done)
+	go s.waitChild(activity.ID, command, identityOf(attempt), done)
 	return activity, attempt, nil
 }
 
@@ -189,6 +193,7 @@ func (s *Supervisor) StopExpected(id string, request ControlRequest) (*Activity,
 		return nil, loadErr
 	}
 	if terminal(current.State) {
+		s.waitTrackedChild(id)
 		return current, nil
 	}
 	if processMatches(identity) {
@@ -197,10 +202,18 @@ func (s *Supervisor) StopExpected(id string, request ControlRequest) (*Activity,
 	if err = s.Store.FinishAttempt(id, current.Generation, identity, ExitResult{State: StateStopped}); err != nil && !errors.Is(err, ErrFenced) {
 		return current, err
 	}
-	return s.Store.Load(id)
+	current, err = s.Store.Load(id)
+	if err == nil {
+		s.waitTrackedChild(id)
+	}
+	return current, err
 }
 
-func (s *Supervisor) waitChild(activityID string, command *exec.Cmd, identity AttemptIdentity) {
+func (s *Supervisor) waitChild(activityID string, command *exec.Cmd, identity AttemptIdentity, done chan struct{}) {
+	defer func() {
+		close(done)
+		s.children.Delete(activityID)
+	}()
 	err := command.Wait()
 	activity, loadErr := s.Store.Load(activityID)
 	if loadErr != nil || terminal(activity.State) {
@@ -221,6 +234,12 @@ func (s *Supervisor) waitChild(activityID string, command *exec.Cmd, identity At
 		result.Error = err.Error()
 	}
 	_ = s.Store.FinishAttempt(activityID, activity.Generation, identity, result)
+}
+
+func (s *Supervisor) waitTrackedChild(activityID string) {
+	if value, ok := s.children.Load(activityID); ok {
+		<-value.(chan struct{})
+	}
 }
 
 func waitForStartToken(pid int, timeout time.Duration) string {

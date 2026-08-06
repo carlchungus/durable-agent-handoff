@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -82,7 +83,10 @@ func Snapshot(store *core.Store) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		m.attempts = loadAttempts(store, ws[0])
+		m.attempts, err = loadAttempts(store, ws[0])
+		if err != nil {
+			return "", err
+		}
 	}
 	return m.RenderPlain(), nil
 }
@@ -105,22 +109,28 @@ func (m Model) load() tea.Cmd {
 			if len(events) > 12 {
 				events = events[len(events)-12:]
 			}
-			attempts = loadAttempts(m.store, selected)
+			attempts, err = loadAttempts(m.store, selected)
 		}
 		return loadMsg{workflows: ws, teams: teams, events: events, attempts: attempts, err: err}
 	}
 }
 
-func loadAttempts(store *core.Store, workflow *core.Workflow) map[string]attemptView {
+func loadAttempts(store *core.Store, workflow *core.Workflow) (map[string]attemptView, error) {
 	attempts := map[string]attemptView{}
-	activities, _ := activity.OpenStore(store.Dir())
+	activities, err := activity.OpenStore(store.Dir())
+	if err != nil {
+		return nil, err
+	}
 	for _, n := range workflow.Nodes {
 		if n.State != core.NodeRunning || n.Attempt < 1 {
 			continue
 		}
 		if activities != nil {
-			tracked, err := activities.Load(activity.StableID(workflow.ID, n.ID, fmt.Sprint(n.Attempt)))
-			if err == nil && len(tracked.Attempts) > 0 {
+			tracked, loadErr := activities.Load(activity.StableID(workflow.ID, n.ID, fmt.Sprint(n.Attempt)))
+			if loadErr == nil {
+				if len(tracked.Attempts) == 0 {
+					return nil, fmt.Errorf("activity %s has no attempts", tracked.ID)
+				}
 				current := tracked.Attempts[len(tracked.Attempts)-1]
 				size := int64(0)
 				if info, statErr := os.Stat(current.Stdout.Path); statErr == nil {
@@ -129,13 +139,16 @@ func loadAttempts(store *core.Store, workflow *core.Workflow) map[string]attempt
 				attempts[n.ID] = attemptView{PID: current.PID, SupervisorGeneration: current.SupervisorGeneration, SessionID: n.SessionID, StartedAt: current.StartedAt, OutputBytes: size}
 				continue
 			}
+			if !errors.Is(loadErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("load activity for node %s: %w", n.ID, loadErr)
+			}
 		}
 		path := filepath.Join(store.Dir(), "workflows", workflow.ID, "runs", n.ID, fmt.Sprint(n.Attempt), "attempt.json")
 		if attempt, err := runstate.Load(path); err == nil {
 			attempts[n.ID] = attemptView{PID: attempt.PID, SupervisorGeneration: attempt.SupervisorGeneration, SessionID: attempt.SessionID, StartedAt: attempt.StartedAt, OutputBytes: attempt.EventOffset}
 		}
 	}
-	return attempts
+	return attempts, nil
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {

@@ -51,8 +51,9 @@ $HANDOFF_HOME/workflows/WF_ID/
   events.jsonl
   state.json
   runs/NODE_ID/ATTEMPT/
-    last-message.json
-    result.schema.json
+    activity-attempt-N/
+      last-message.json
+      result.schema.json
 ```
 
 Background sessions have their own event-sourced identity and inbox kernel:
@@ -107,10 +108,10 @@ rather than re-resolving a PID ancestry snapshot. Attempt output filenames are
 reserved by the prepared event ordinal; orphan files left before that event are
 safely replaced on retry.
 
-The ledger reducer produces the sole Activity projection used by human TUI,
-JSON/JSONL, RPC, and policy. A combined snapshot-and-subscribe operation orders
-subscriber registration with the initial read so reconnect cannot lose events
-between snapshot and follow. The prior-art evidence and license boundary are in
+The ledger reducer produces the sole Activity projection used by the human TUI,
+JSON/JSONL CLI surfaces, and policy. `activity follow` advances an exact output
+cursor by polling the same durable ledger, so reconnect resumes without replaying
+or skipping bytes. The prior-art evidence and license boundary are in
 [`prior-art-codex-pi-omp.md`](prior-art-codex-pi-omp.md); the domain decision is
 recorded in
 [`ADR 0001`](adr/0001-separate-sessions-and-activities.md).

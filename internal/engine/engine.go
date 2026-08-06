@@ -286,7 +286,7 @@ func (e *Engine) reconcileActivity(w *core.Workflow, n *core.Node, tracked *acti
 	attempt := tracked.Attempts[len(tracked.Attempts)-1]
 	dir := filepath.Join(e.Store.Dir(), "workflows", w.ID, "runs", n.ID, fmt.Sprint(n.Attempt))
 	stdout, _ := os.ReadFile(attempt.Stdout.Path)
-	b, readErr := os.ReadFile(filepath.Join(dir, "last-message.json"))
+	b, readErr := readActivityAttemptResult(dir, attempt)
 	if readErr != nil || len(bytes.TrimSpace(b)) == 0 {
 		b = stdout
 	}
@@ -445,7 +445,7 @@ func (e *Engine) RecoverAttempt(id, nodeID string, attempt int) error {
 			return fmt.Errorf("activity %s has no attempt", tracked.ID)
 		}
 		activityAttempt := tracked.Attempts[len(tracked.Attempts)-1]
-		b, readErr := os.ReadFile(filepath.Join(dir, "last-message.json"))
+		b, readErr := readActivityAttemptResult(dir, activityAttempt)
 		stdout, _ := os.ReadFile(activityAttempt.Stdout.Path)
 		if readErr != nil || len(bytes.TrimSpace(b)) == 0 {
 			b = stdout
@@ -527,10 +527,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	ctx, cancel := context.WithTimeout(ctx, w.Budget.MaxRuntime)
 	defer cancel()
 	attempt := n.Attempt + 1
-	dir := filepath.Join(e.Store.Dir(), "workflows", w.ID, "runs", n.ID, fmt.Sprintf("%d", n.Attempt+1))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
+	baseDir := filepath.Join(e.Store.Dir(), "workflows", w.ID, "runs", n.ID, fmt.Sprint(attempt))
 	agent, err := e.ensureAgentSession(w, n)
 	if err != nil {
 		return e.failAgentAttempt(w, n, attempt, 0, "runtime_failure", err.Error())
@@ -549,13 +546,6 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		defer func() { _ = e.Sessions.Requeue(agent.ID, deliveryAttempt) }()
 	}
 	prompt := contract(w, n, dispatched)
-	schema := filepath.Join(dir, "result.schema.json")
-	output := filepath.Join(dir, "last-message.json")
-	_ = os.WriteFile(schema, []byte(resultSchema), 0o600)
-	c, err := hruntime.Build(n.Runtime, workdir(w, n), prompt, n.SessionID, schema, output)
-	if err != nil {
-		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
-	}
 	if e.Activities == nil {
 		e.Activities, err = activity.OpenStore(e.Store.Dir())
 		if err != nil {
@@ -573,11 +563,32 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	if err != nil {
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
 	}
+	expectedOrdinal := len(activityRecord.Attempts) + 1
+	dir := filepath.Join(baseDir, fmt.Sprintf("activity-attempt-%d", expectedOrdinal))
+	if err = os.MkdirAll(dir, 0o700); err != nil {
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
+	}
+	schema := filepath.Join(dir, "result.schema.json")
+	output := filepath.Join(dir, "last-message.json")
+	if err = os.WriteFile(schema, []byte(resultSchema), 0o600); err != nil {
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
+	}
+	c, err := hruntime.Build(n.Runtime, workdir(w, n), prompt, n.SessionID, schema, output)
+	if err != nil {
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
+	}
 	activityAttempt, stdout, stderr, err := e.Activities.PrepareAttempt(activityRecord.ID, activityRecord.Generation, activity.AttemptStart{
 		Runtime: n.Runtime.Name, Model: n.Runtime.Model, CommandDigest: runstate.CommandDigest(c.Name, c.Args),
 	})
 	if err != nil {
 		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", err.Error())
+	}
+	if activityAttempt.Ordinal != expectedOrdinal {
+		_ = stdout.Close()
+		_ = stderr.Close()
+		failure := fmt.Sprintf("activity attempt ordinal changed concurrently: expected %d, got %d", expectedOrdinal, activityAttempt.Ordinal)
+		_ = e.Activities.FailPrepared(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, failure)
+		return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", failure)
 	}
 	var stdin []byte
 	if c.PromptOnStdin {
@@ -719,6 +730,16 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 		return applyErr
 	}
 	return e.applyAgentResult(w, n, result, extractSessionID(stdoutBytes), n.Attempt+1)
+}
+
+func readActivityAttemptResult(baseDir string, attempt activity.Attempt) ([]byte, error) {
+	path := filepath.Join(baseDir, fmt.Sprintf("activity-attempt-%d", attempt.Ordinal), "last-message.json")
+	b, err := os.ReadFile(path)
+	if (err != nil || len(bytes.TrimSpace(b)) == 0) && attempt.Ordinal == 1 {
+		// Compatibility for Activities created by pre-v0.4 development builds.
+		return os.ReadFile(filepath.Join(baseDir, "last-message.json"))
+	}
+	return b, err
 }
 
 func exceedsDiffBudget(budget core.Budget, stats finalize.DiffStats) bool {

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -61,6 +62,28 @@ func TestSnapshotShowsActivityBackedAttemptWithoutLegacyManifest(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Errorf("missing %q in\n%s", want, view)
 		}
+	}
+}
+
+func TestSnapshotDoesNotFallBackWhenActivityLedgerIsCorrupt(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("reject split authority", t.TempDir(), core.DefaultBudget())
+	_, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: &core.Node{ID: "lead", Title: "working", Kind: "agent", Runtime: core.RuntimeSpec{Name: "codex"}}}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "lead", State: core.NodeRunning}}})
+	activities, _ := activity.OpenStore(state)
+	tracked, _ := activities.Create(activity.Descriptor{ID: activity.StableID(w.ID, "lead", "1"), Work: activity.WorkSpec{Kind: "agent", Cwd: w.Root, Intent: w.ID + "/lead"}})
+	legacyPath := filepath.Join(state, "workflows", w.ID, "runs", "lead", "1", "attempt.json")
+	_, _ = runstate.Create(legacyPath, runstate.Manifest{ID: "legacy", WorkflowID: w.ID, NodeID: "lead", Attempt: 1, Status: "running", PID: 4242})
+	activityDir := filepath.Join(state, "activities", tracked.ID)
+	if err := os.WriteFile(filepath.Join(activityDir, "events.jsonl"), []byte("not-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(activityDir, "state.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Snapshot(st); err == nil {
+		t.Fatal("corrupt Activity was hidden by legacy attempt fallback")
 	}
 }
 

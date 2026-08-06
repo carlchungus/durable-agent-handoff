@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"syscall"
 	"unsafe"
@@ -22,6 +23,16 @@ type processTreeReservation struct {
 	name   string
 	handle windows.Handle
 }
+
+type processTreeWatchdog struct{}
+
+func startProcessTreeWatchdog() (*processTreeWatchdog, error) {
+	return &processTreeWatchdog{}, nil
+}
+
+func (w *processTreeWatchdog) complete() error { return nil }
+
+func runProcessTreeWatchdog(_ io.Reader) {}
 
 func prepareProcessTree(command *exec.Cmd) (*processTreeReservation, error) {
 	random := make([]byte, 16)

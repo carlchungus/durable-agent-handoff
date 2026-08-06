@@ -5,12 +5,54 @@ package activity
 import (
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
-	"strconv"
 	"syscall"
 )
 
 type processTreeReservation struct{}
+
+type processTreeWatchdog struct {
+	command *exec.Cmd
+	gate    io.WriteCloser
+}
+
+func startProcessTreeWatchdog() (*processTreeWatchdog, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	command := exec.Command(executable)
+	command.Env = append(os.Environ(), watchdogEnvironment+"=1")
+	gate, err := command.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err = command.Start(); err != nil {
+		_ = gate.Close()
+		return nil, err
+	}
+	return &processTreeWatchdog{command: command, gate: gate}, nil
+}
+
+func (w *processTreeWatchdog) complete() error {
+	_, writeErr := w.gate.Write([]byte{1})
+	closeErr := w.gate.Close()
+	waitErr := w.command.Wait()
+	return errors.Join(writeErr, closeErr, waitErr)
+}
+
+func runProcessTreeWatchdog(input io.Reader) {
+	var signal [1]byte
+	if n, _ := input.Read(signal[:]); n == 1 && signal[0] == 1 {
+		return
+	}
+	// The watchdog remains a member of the original dedicated process group,
+	// so that group cannot be recycled while this kill is issued. EOF means
+	// the runner died before durably recording and acknowledging completion.
+	_ = syscall.Kill(-syscall.Getpgrp(), syscall.SIGKILL)
+}
 
 func prepareProcessTree(_ *exec.Cmd) (*processTreeReservation, error) {
 	return &processTreeReservation{}, nil
@@ -43,18 +85,9 @@ func killProcessGroup(identity AttemptIdentity) error {
 	return nil
 }
 
-func cleanupOrphanedProcessTree(identity AttemptIdentity) error {
-	if identity.ProcessTreeID == "" {
-		return nil
-	}
-	pgid, err := strconv.Atoi(identity.ProcessTreeID)
-	if err != nil || pgid != identity.PID {
-		return ErrFenced
-	}
-	// While any descendant remains, this dedicated PGID still names the exact
-	// original group and cannot be reused. ESRCH means the tree is already gone.
-	if err = syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return err
-	}
+func cleanupOrphanedProcessTree(_ AttemptIdentity) error {
+	// The in-group watchdog contains descendants before the runner's process
+	// group can be recycled. Recovery must never signal a dead runner's numeric
+	// PGID because it may now identify unrelated work.
 	return nil
 }

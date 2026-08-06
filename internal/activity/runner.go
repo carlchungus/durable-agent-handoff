@@ -11,7 +11,10 @@ import (
 	"sync"
 )
 
-const runnerEnvironment = "HANDOFF_INTERNAL_ACTIVITY_RUNNER"
+const (
+	runnerEnvironment   = "HANDOFF_INTERNAL_ACTIVITY_RUNNER"
+	watchdogEnvironment = "HANDOFF_INTERNAL_ACTIVITY_WATCHDOG"
+)
 
 type runnerRequest struct {
 	Argv       []string          `json:"argv"`
@@ -100,6 +103,10 @@ func (g *GatedCommand) Abort() {
 }
 
 func init() {
+	if os.Getenv(watchdogEnvironment) == "1" {
+		runProcessTreeWatchdog(os.Stdin)
+		os.Exit(0)
+	}
 	if os.Getenv(runnerEnvironment) != "1" {
 		return
 	}
@@ -123,12 +130,16 @@ func runGatedTarget(input io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(request.Argv) == 0 || strings.TrimSpace(request.Argv[0]) == "" {
 		return 0, errors.New("runner request has no command")
 	}
+	watchdog, err := startProcessTreeWatchdog()
+	if err != nil {
+		return 0, fmt.Errorf("start process-tree watchdog: %w", err)
+	}
 	command := exec.Command(request.Argv[0], request.Argv[1:]...)
 	command.Env = withoutRunnerEnvironment(os.Environ())
 	command.Stdin = strings.NewReader(string(request.Stdin))
 	command.Stdout = stdout
 	command.Stderr = stderr
-	err := command.Run()
+	err = command.Run()
 	code := 0
 	if command.ProcessState != nil {
 		code = command.ProcessState.ExitCode()
@@ -147,6 +158,9 @@ func runGatedTarget(input io.Reader, stdout, stderr io.Writer) (int, error) {
 		if finishErr := finishRunnerAttempt(store, request.Completion, ExitResult{State: state, ExitCode: &code, Error: errorText}); finishErr != nil {
 			return code, fmt.Errorf("persist completion: %w", finishErr)
 		}
+	}
+	if err := watchdog.complete(); err != nil {
+		return code, fmt.Errorf("complete process-tree watchdog: %w", err)
 	}
 	return code, nil
 }
@@ -177,10 +191,11 @@ func finishRunnerAttempt(store *Store, completion *runnerCompletion, result Exit
 }
 
 func withoutRunnerEnvironment(env []string) []string {
-	prefix := runnerEnvironment + "="
+	runnerPrefix := runnerEnvironment + "="
+	watchdogPrefix := watchdogEnvironment + "="
 	filtered := make([]string, 0, len(env))
 	for _, item := range env {
-		if !strings.HasPrefix(item, prefix) {
+		if !strings.HasPrefix(item, runnerPrefix) && !strings.HasPrefix(item, watchdogPrefix) {
 			filtered = append(filtered, item)
 		}
 	}

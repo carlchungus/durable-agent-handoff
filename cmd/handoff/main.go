@@ -119,7 +119,7 @@ func cmdActivity(args []string, out io.Writer) error {
 			return writeJSON(out, activities)
 		}
 		table := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(table, "ACTIVITY\tSTATE\tGEN\tREV\tATTEMPTS\tOWNER\tCOMMAND")
+		fmt.Fprintln(table, "ACTIVITY\tSTATE\tGEN\tREV\tATTEMPTS\tOWNER\tKIND")
 		for _, item := range activities {
 			fmt.Fprintf(table, "%s\t%s\t%d\t%d\t%d\t%s\t%s\n", item.ID, item.State, item.Generation, item.Revision, len(item.Attempts), item.OwnerSessionID, item.Work.Kind)
 		}

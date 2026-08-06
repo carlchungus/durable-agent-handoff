@@ -99,7 +99,7 @@ func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 	if node == nil {
 		return nil, errors.New("no runnable node")
 	}
-	if e.Preferences != nil {
+	if e.Preferences != nil && node.Kind == "agent" {
 		routed, index, routeErr := e.Preferences.Resolve(node.Role, node.Runtime)
 		if routeErr != nil {
 			return nil, routeErr

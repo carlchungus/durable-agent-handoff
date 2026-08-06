@@ -16,6 +16,7 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/activity"
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/finalize"
+	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
 	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 	agentsession "github.com/carlchungus/durable-agent-handoff/internal/session"
 )
@@ -35,6 +36,31 @@ func TestResultSchemaDefinesArrayItems(t *testing.T) {
 		if property.Type != "array" || len(property.Items) == 0 {
 			t.Fatalf("%s must define array items: %s", name, resultSchema)
 		}
+	}
+}
+
+func TestFinalizeDoesNotRequireAgentRuntimePreference(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("guarded merge", t.TempDir(), core.DefaultBudget())
+	finalizer := &core.Node{ID: "finalize", Title: "merge after gates", Kind: "finalize"}
+	_, err := st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{
+		{Op: "add_node", Node: finalizer},
+		{Op: "attest", Attestation: &core.Attestation{ID: "pass", NodeID: "finalize", Verifier: "independent", Verdict: "pass", Summary: "verified"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, runErr := (&Engine{Store: st, Preferences: preferences.Open(state)}).RunOne(context.Background(), w.ID)
+	if node == nil || node.ID != "finalize" {
+		t.Fatalf("finalizer was blocked by irrelevant runtime routing: node=%+v err=%v", node, runErr)
+	}
+	if runErr != nil && strings.Contains(runErr.Error(), "runtime or preference ladder") {
+		t.Fatalf("finalizer used agent runtime routing: %v", runErr)
+	}
+	got, _ := st.Load(w.ID)
+	if got.Nodes["finalize"].Attempt != 1 || len(got.Evidence) == 0 || strings.Contains(got.Evidence[len(got.Evidence)-1].Summary, "runtime or preference ladder") {
+		t.Fatalf("deterministic finalizer did not execute: %+v", got.Nodes["finalize"])
 	}
 }
 

@@ -64,6 +64,28 @@ func TestFinalizeDoesNotRequireAgentRuntimePreference(t *testing.T) {
 	}
 }
 
+func TestPendingFinalizeWaitDoesNotConsumeAttempt(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("wait for gates", t.TempDir(), core.DefaultBudget())
+	n := &core.Node{ID: "finalize", Title: "merge after gates", Kind: "finalize", MaxAttempts: 2}
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
+	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: n.ID, State: core.NodeRunning}}})
+	n = w.Nodes[n.ID]
+
+	eng := &Engine{Store: st, FinalizeRetryDelay: -1}
+	if err := eng.deferFinalize(context.Background(), w, n, finalize.Result{PRURL: "https://example.test/pr/1", Summary: "gate is still running"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Load(w.ID)
+	if got.Nodes[n.ID].State != core.NodeReady || got.Nodes[n.ID].Attempt != 0 {
+		t.Fatalf("pending finalizer consumed retry budget: %+v", got.Nodes[n.ID])
+	}
+	if len(got.Evidence) != 1 || got.Evidence[0].Summary != "gate is still running" {
+		t.Fatalf("pending gate evidence=%+v", got.Evidence)
+	}
+}
+
 func TestResultSchemaConstrainsVerifierVerdicts(t *testing.T) {
 	var schema struct {
 		Properties map[string]struct {

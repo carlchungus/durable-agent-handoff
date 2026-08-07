@@ -74,11 +74,14 @@ func (m *encodedMutation) UnmarshalJSON(data []byte) error {
 }
 
 type Engine struct {
-	Store       *core.Store
-	Preferences *preferences.Manager
-	Sessions    *agentsession.Store
-	Activities  *activity.Store
+	Store              *core.Store
+	Preferences        *preferences.Manager
+	Sessions           *agentsession.Store
+	Activities         *activity.Store
+	FinalizeRetryDelay time.Duration
 }
+
+const defaultFinalizeRetryDelay = 30 * time.Second
 
 func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 	w, err := e.Store.Load(id)
@@ -488,11 +491,7 @@ func (e *Engine) runFinalize(ctx context.Context, w *core.Workflow, n *core.Node
 	defer cancel()
 	result, err := finalize.Execute(ctx, finalize.ExecRunner{Dir: workdir(w, n)}, w, n)
 	if errors.Is(err, finalize.ErrGatesPending) {
-		_, applyErr := e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{
-			{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("pr-wait-%s-%d", n.ID, n.Attempt+1), NodeID: n.ID, Kind: "github", Summary: result.Summary, URI: result.PRURL}},
-			{Op: "set_state", NodeID: n.ID, State: core.NodeReady},
-		}})
-		return applyErr
+		return e.deferFinalize(ctx, w, n, result)
 	}
 	if err != nil {
 		return e.fail(w, n, err.Error())
@@ -500,6 +499,28 @@ func (e *Engine) runFinalize(ctx context.Context, w *core.Workflow, n *core.Node
 	_, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{
 		{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("merged-%s-%d", n.ID, n.Attempt+1), NodeID: n.ID, Kind: "github", Summary: result.Summary, URI: result.PRURL, Digest: result.HeadSHA}},
 		{Op: "set_state", NodeID: n.ID, State: core.NodeCompleted},
+	}})
+	return err
+}
+
+func (e *Engine) deferFinalize(ctx context.Context, w *core.Workflow, n *core.Node, result finalize.Result) error {
+	delay := e.FinalizeRetryDelay
+	if delay == 0 {
+		delay = defaultFinalizeRetryDelay
+	}
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	_, err := e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{
+		{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("pr-wait-%s-%d", n.ID, n.Attempt), NodeID: n.ID, Kind: "github", Summary: result.Summary, URI: result.PRURL}},
+		{Op: "refund_attempt", NodeID: n.ID},
+		{Op: "set_state", NodeID: n.ID, State: core.NodeReady},
 	}})
 	return err
 }

@@ -152,6 +152,11 @@ Codex, Claude, and Pi implement a deep Driver contract. Each Driver owns:
 - provider-specific stream decoding; and
 - typed adapter-start and process-exit milestones.
 
+Codex output schemas also constrain intermediate agent messages. Its Driver
+therefore buffers structured message candidates and emits one durable `result`
+only when the provider sends `turn.completed`; message text alone is never a
+lifecycle boundary.
+
 The normalized milestone vocabulary is:
 
 ```text

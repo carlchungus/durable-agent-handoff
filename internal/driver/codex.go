@@ -41,7 +41,11 @@ func (Codex) Build(request LaunchRequest) (Launch, error) {
 
 func (Codex) NewDecoder() Decoder { return &codexDecoder{} }
 
-type codexDecoder struct{ turn bool }
+type codexDecoder struct {
+	turn          bool
+	result        bool
+	pendingResult *supervisor.WorkerResult
+}
 
 func (d *codexDecoder) DecodeLine(raw []byte) ([]supervisor.Milestone, error) {
 	var envelope struct {
@@ -63,6 +67,9 @@ func (d *codexDecoder) DecodeLine(raw []byte) ([]supervisor.Milestone, error) {
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return nil, err
+	}
+	if d.result {
+		return nil, nil
 	}
 	switch envelope.Type {
 	case "thread.started":
@@ -96,9 +103,19 @@ func (d *codexDecoder) DecodeLine(raw []byte) ([]supervisor.Milestone, error) {
 			return nil, nil
 		}
 		if result, ok := decodeWorkerResultString(envelope.Item.Text); ok {
-			return []supervisor.Milestone{{Kind: supervisor.MilestoneResult, Result: result, SourceType: envelope.Type}}, nil
+			// Codex applies the output schema to intermediate agent messages as
+			// well as the final response. Keep the latest candidate, but only the
+			// provider's turn.completed event may make it a durable Result.
+			d.pendingResult = result
+			return nil, nil
 		}
 		return []supervisor.Milestone{{Kind: supervisor.MilestoneMeaningfulProgress, Progress: envelope.Item.Text, SourceType: envelope.Type}}, nil
+	case "turn.completed":
+		if d.pendingResult == nil {
+			return nil, errors.New("Codex turn.completed omitted the structured completion result")
+		}
+		d.result = true
+		return []supervisor.Milestone{{Kind: supervisor.MilestoneResult, Result: d.pendingResult, SourceType: envelope.Type}}, nil
 	case "error":
 		if providerUnavailable(envelope.Error.Code) {
 			return []supervisor.Milestone{{Kind: supervisor.MilestoneProviderUnavailable, Failure: envelope.Error.Message, SourceType: envelope.Type}}, nil

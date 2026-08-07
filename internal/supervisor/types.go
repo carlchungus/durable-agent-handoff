@@ -8,17 +8,16 @@ import "time"
 const SchemaVersion = 2
 
 type (
-	ExecutionID   string
-	WorkflowID    string
-	NodeID        string
-	SessionID     string
-	ActivityID    string
-	AttemptID     string
-	ResultID      string
-	AttestationID string
-	MessageID     string
-	ControlID     string
-	LeaseID       string
+	ExecutionID string
+	WorkflowID  string
+	NodeID      string
+	SessionID   string
+	ActivityID  string
+	AttemptID   string
+	ResultID    string
+	MessageID   string
+	ControlID   string
+	LeaseID     string
 )
 
 type Sandbox string
@@ -51,11 +50,9 @@ type AuthoritySpec struct {
 }
 
 type FinalizerSpec struct {
-	Enabled         bool     `json:"enabled"`
-	RequiredChecks  []string `json:"required_checks,omitempty"`
-	RequireHuman    bool     `json:"require_human,omitempty"`
-	RequireVerifier bool     `json:"require_verifier,omitempty"`
-	Verifiers       []string `json:"verifiers,omitempty"`
+	Enabled        bool     `json:"enabled"`
+	RequiredChecks []string `json:"required_checks,omitempty"`
+	RequireHuman   bool     `json:"require_human,omitempty"`
 }
 
 type Budget struct {
@@ -234,17 +231,6 @@ type Milestone struct {
 	SourceType string                 `json:"source_type,omitempty"`
 }
 
-type Attestation struct {
-	ID          AttestationID `json:"id"`
-	ResultID    ResultID      `json:"result_id"`
-	Verifier    string        `json:"verifier"`
-	Verdict     string        `json:"verdict"`
-	RawVerdict  string        `json:"raw_verdict,omitempty"`
-	Summary     string        `json:"summary"`
-	EvidenceIDs []string      `json:"evidence_ids,omitempty"`
-	At          time.Time     `json:"at"`
-}
-
 type Result struct {
 	ID         ResultID   `json:"id"`
 	WorkflowID WorkflowID `json:"workflow_id"`
@@ -338,23 +324,22 @@ type LegacyImport struct {
 // State is a rebuildable reducer projection. Its maps are indexes over one
 // journal, not independently writable stores.
 type State struct {
-	Version       int                            `json:"version"`
-	Sequence      uint64                         `json:"sequence"`
-	Executions    map[ExecutionID]*Execution     `json:"executions"`
-	Workflows     map[WorkflowID]*Workflow       `json:"workflows"`
-	Sessions      map[SessionID]*Session         `json:"sessions"`
-	Activities    map[ActivityID]*Activity       `json:"activities"`
-	Attempts      map[AttemptID]*Attempt         `json:"attempts"`
-	Results       map[ResultID]*Result           `json:"results"`
-	Attestations  map[AttestationID]*Attestation `json:"attestations"`
-	Messages      map[MessageID]*Message         `json:"messages"`
-	Leases        map[LeaseID]*Lease             `json:"leases"`
-	Controls      map[ControlID]*Control         `json:"controls"`
-	Pauses        map[WorkflowID]*Pause          `json:"pauses"`
-	Finalizations map[string]*Finalization       `json:"finalizations"`
-	RoleLadders   map[string][]RuntimeSpec       `json:"role_ladders"`
-	Idempotency   map[string]IdempotencyRecord   `json:"idempotency"`
-	LegacyImports map[string]LegacyImport        `json:"legacy_imports"`
+	Version       int                          `json:"version"`
+	Sequence      uint64                       `json:"sequence"`
+	Executions    map[ExecutionID]*Execution   `json:"executions"`
+	Workflows     map[WorkflowID]*Workflow     `json:"workflows"`
+	Sessions      map[SessionID]*Session       `json:"sessions"`
+	Activities    map[ActivityID]*Activity     `json:"activities"`
+	Attempts      map[AttemptID]*Attempt       `json:"attempts"`
+	Results       map[ResultID]*Result         `json:"results"`
+	Messages      map[MessageID]*Message       `json:"messages"`
+	Leases        map[LeaseID]*Lease           `json:"leases"`
+	Controls      map[ControlID]*Control       `json:"controls"`
+	Pauses        map[WorkflowID]*Pause        `json:"pauses"`
+	Finalizations map[string]*Finalization     `json:"finalizations"`
+	RoleLadders   map[string][]RuntimeSpec     `json:"role_ladders"`
+	Idempotency   map[string]IdempotencyRecord `json:"idempotency"`
+	LegacyImports map[string]LegacyImport      `json:"legacy_imports"`
 }
 
 func emptyState() *State {
@@ -362,7 +347,7 @@ func emptyState() *State {
 		Version:    SchemaVersion,
 		Executions: make(map[ExecutionID]*Execution), Workflows: make(map[WorkflowID]*Workflow),
 		Sessions: make(map[SessionID]*Session), Activities: make(map[ActivityID]*Activity),
-		Attempts: make(map[AttemptID]*Attempt), Results: make(map[ResultID]*Result), Attestations: make(map[AttestationID]*Attestation),
+		Attempts: make(map[AttemptID]*Attempt), Results: make(map[ResultID]*Result),
 		Messages: make(map[MessageID]*Message), Leases: make(map[LeaseID]*Lease),
 		Controls: make(map[ControlID]*Control), Pauses: make(map[WorkflowID]*Pause), Finalizations: make(map[string]*Finalization), RoleLadders: make(map[string][]RuntimeSpec), Idempotency: make(map[string]IdempotencyRecord),
 		LegacyImports: make(map[string]LegacyImport),

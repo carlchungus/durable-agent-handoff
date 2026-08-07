@@ -20,8 +20,7 @@ printf '%s' 'work' | handoff start --runtime codex --file - \
 # An autonomous merge-capable execution must configure its gates at start.
 printf '%s' 'ship it' | handoff start --runtime codex --file - \
   --root /repo --authorized-by human:id --idempotency-key request-02 \
-  --finalizer-enabled --required-check verify --require-human \
-  --require-verifier --verifier verifier:ci --json
+  --finalizer-enabled --required-check verify --require-human --json
 handoff status EXECUTION_ID --json
 handoff list --json
 handoff tui --snapshot
@@ -44,17 +43,18 @@ handoff execution start --file - --json <<'JSON'
   "role": "human:id",
   "finalizer_enabled": true,
   "finalizer_required_checks": ["verify"],
-  "finalizer_require_human": true,
-  "finalizer_require_verifier": true,
-  "finalizer_verifiers": ["verifier:ci"]
+  "finalizer_require_human": true
 }
 JSON
 ```
 
 The promotion response is exactly `{"workflow_id":"...","node_id":"..."}`.
 Finalizer fields are flat and immutable once the execution starts; an enabled
-finalizer requires nonempty named checks, human approval, and independent
-verifier identities. Reusing a key with different canonical input fails closed.
+finalizer requires a nonempty canonical exact set of external GitHub checks.
+Human approval is independently optional. Independently hosted CI and GitHub
+checks are the verification authority; handoff does not pretend that same-UID
+workers can authenticate their own Results. Reusing a key with different
+canonical input fails closed.
 
 Pause is synchronous and idempotent. It records exact stop controls, waits for
 the executor to apply them and record terminal exits, releases writer Leases
@@ -75,19 +75,10 @@ continue
 TEXT
 ```
 
-Independent verification is an authority-owned command. The verifier identity
-and Result ID are explicit flags, while the evidence summary is stdin-only; a
-worker cannot self-attest through its Result payload:
-
-```sh
-printf '%s' 'independent verifier pass' | handoff attest \
-  --result RESULT_ID --verifier verifier:ci --verdict pass \
-  --evidence evidence:verify --file - --idempotency-key attestation-01 --json
-```
-
-The configured verifier must be authorized by the immutable Workflow and must
-differ from its requester. Unknown Result IDs, unauthorized or duplicate
-attestations, and summary values supplied through argv fail closed.
+The immutable worker Result is not a publication authority. The finalizer
+rechecks the exact configured external GitHub checks on the prepared PR head;
+human approval, when configured, is a separate gate. Same-UID handoff workers
+cannot self-authenticate through their Result payload.
 
 ## Runtime and service boundary
 

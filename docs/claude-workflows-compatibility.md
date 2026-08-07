@@ -107,7 +107,7 @@ Claude-current cases retain Claude’s documented restore limitations. The durab
 
 This is not a checklist engine with hard-coded discovery, plan, execute and verify gates. The high-fidelity workflow surface runs sandboxed JavaScript with top-level `await`; the script may branch, loop, fan out, launch different agent roles, inspect results, revise its approach, or call several workflows sequentially. Only the orchestration API is available to the script; filesystem and shell work goes through policy-bounded agents.
 
-Planning is itself agent work. A planner can emit or revise a workflow script from current evidence. Independent verifier agents can decide semantic conditions that commands cannot establish. A workflow may self-mutate its future control flow, but it cannot rewrite completed ledger history, elevate permissions, change its oracle profile, erase costs, or weaken merge/recovery gates.
+Planning is itself agent work. A planner can emit or revise a workflow script from current evidence. Independent review/check agents can decide semantic conditions that commands cannot establish. A workflow may self-mutate its future control flow, but it cannot rewrite completed ledger history, elevate permissions, change its oracle profile, erase costs, or weaken merge/recovery gates.
 
 On pause or crash, completed `agent()` results replay only through the ordered prefix before the first unfinished invocation. That invocation and all later invocations run again. Stopped or unrecoverable agents retain pipeline shape with a `null` result, matching the documented workflow contract.
 
@@ -145,7 +145,7 @@ Implementation proceeds as a dynamic evidence loop, not mandatory product phases
 2. Capture the pinned Claude oracle, including failures, UI frames, process tree and files allowed by the fixture.
 3. Have the implementing agent change the smallest shared primitive or surface adapter that explains the diff.
 4. Run the candidate cases plus affected restart, denial and view cases.
-5. Use deterministic assertions where semantics are mechanical and independent verifier agents where correctness is semantic.
+5. Use deterministic assertions where semantics are mechanical and independent review/check agents where correctness is semantic.
 6. Keep, revise or replace the approach based on evidence; record any plan mutation as an event.
 7. Never relax an expectation as an implementation shortcut. Oracle changes require source review and an explicit compatibility decision.
 

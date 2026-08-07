@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 )
 
 type finalizerRunner struct {
@@ -32,7 +33,7 @@ func TestFinalizerUsesPurePublicationAndExactUnchangedHeadGate(t *testing.T) {
 		NativeSession: NativeSessionIdentity{Runtime: "claude", ID: "finalizer-session"}, Prompt: "finalize", Goal: "ship",
 		Runtime: RuntimeSpec{Name: "claude", Sandbox: SandboxWorkspaceWrite}, Root: worktree,
 		Authority: AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite},
-		Finalizer: FinalizerSpec{Enabled: true, RequiredChecks: []string{"verify"}, RequireHuman: true, RequireVerifier: true, Verifiers: []string{"independent"}},
+		Finalizer: FinalizerSpec{Enabled: true, RequiredChecks: []string{"verify"}, RequireHuman: true},
 		Budget:    DefaultBudget(), IdempotencyKey: "finalizer-start-01",
 	})
 	if err != nil {
@@ -40,10 +41,7 @@ func TestFinalizerUsesPurePublicationAndExactUnchangedHeadGate(t *testing.T) {
 	}
 	state, _ := store.Projection()
 	activity := state.Activities[execution.FirstActivity]
-	result := completeActivity(t, store, activity, "finalizer-result")
-	if _, _, err = store.RecordAttestation(context.Background(), RecordAttestationInput{ResultID: result.ID, Verifier: "independent", Verdict: "pass", Summary: "independent pass", IdempotencyKey: "finalizer-attestation-01"}); err != nil {
-		t.Fatal(err)
-	}
+	completeActivity(t, store, activity, "finalizer-result")
 	runner := &finalizerRunner{responses: [][]byte{
 		[]byte(`{"number":7,"url":"https://example/pr/7","headRefOid":"abc123","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"verify","status":"COMPLETED","conclusion":"SUCCESS"}]}`),
 		[]byte(`{"number":7,"url":"https://example/pr/7","headRefOid":"abc123","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"verify","status":"COMPLETED","conclusion":"SUCCESS"}]}`),
@@ -59,23 +57,58 @@ func TestFinalizerUsesPurePublicationAndExactUnchangedHeadGate(t *testing.T) {
 	}
 }
 
+func TestFinalizerAllowsOptionalHumanApprovalAfterResultAndExternalChecks(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	execution, _, err := store.StartExecution(context.Background(), StartExecutionInput{
+		NativeSession: NativeSessionIdentity{Runtime: "codex", ID: "optional-human-session"}, Prompt: "finalize", Goal: "ship",
+		Runtime: RuntimeSpec{Name: "codex", Sandbox: SandboxWorkspaceWrite}, Root: worktree,
+		Authority: AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite},
+		Finalizer: FinalizerSpec{Enabled: true, RequiredChecks: []string{"lint", "verify"}},
+		Budget:    DefaultBudget(), IdempotencyKey: "optional-human-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.View(execution.ID, time.Unix(100, 0).UTC())
+	if err != nil || view.Publication != PublicationAwaitingResult {
+		t.Fatalf("publication was not held until an immutable Result: view=%+v err=%v", view, err)
+	}
+	if _, _, err = store.PrepareFinalization(context.Background(), PrepareFinalizationInput{
+		ExecutionID: execution.ID, Repository: "o/r", PullRequest: "7", Gates: []string{"lint", "verify"}, Method: "squash", HeadSHA: "abc123", IdempotencyKey: "optional-human-before-result",
+	}); err == nil {
+		t.Fatal("publication was prepared before an immutable Result")
+	}
+	state, _ := store.Projection()
+	completeActivity(t, store, state.Activities[execution.FirstActivity], "optional-human-result")
+	view, err = store.View(execution.ID, time.Unix(101, 0).UTC())
+	if err != nil || view.Publication != PublicationEligible {
+		t.Fatalf("publication did not become eligible after the Result without human policy: view=%+v err=%v", view, err)
+	}
+	runner := &finalizerRunner{responses: [][]byte{
+		[]byte(`{"number":7,"url":"https://example/pr/7","headRefOid":"abc123","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"lint","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"verify","status":"COMPLETED","conclusion":"SUCCESS"}]}`),
+		[]byte(`{"number":7,"url":"https://example/pr/7","headRefOid":"abc123","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"lint","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"verify","status":"COMPLETED","conclusion":"SUCCESS"}]}`),
+		[]byte("ok"),
+	}}
+	finalized, err := store.Finalize(context.Background(), FinalizationRequest{ExecutionID: execution.ID, Repository: "o/r", PullRequest: "7", IdempotencyKey: "optional-human-publication"}, runner)
+	if err != nil || !finalized.Merged {
+		t.Fatalf("optional human finalization failed after independent checks: result=%+v err=%v", finalized, err)
+	}
+}
+
 func prepareEligibleFinalization(t *testing.T, store *Store, worktree, key string) (*Execution, *Finalization) {
 	t.Helper()
 	execution, _, err := store.StartExecution(context.Background(), StartExecutionInput{
 		NativeSession: NativeSessionIdentity{Runtime: "claude", ID: key + "-session"}, Prompt: "finalize", Goal: "ship",
 		Runtime: RuntimeSpec{Name: "claude", Sandbox: SandboxWorkspaceWrite}, Root: worktree,
 		Authority: AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite},
-		Finalizer: FinalizerSpec{Enabled: true, RequiredChecks: []string{"verify"}, RequireHuman: true, RequireVerifier: true, Verifiers: []string{"independent"}},
+		Finalizer: FinalizerSpec{Enabled: true, RequiredChecks: []string{"verify"}, RequireHuman: true},
 		Budget:    DefaultBudget(), IdempotencyKey: key + "-start",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	state, _ := store.Projection()
-	result := completeActivity(t, store, state.Activities[execution.FirstActivity], key+"-result")
-	if _, _, err = store.RecordAttestation(context.Background(), RecordAttestationInput{ResultID: result.ID, Verifier: "independent", Verdict: "pass", Summary: "independent pass", IdempotencyKey: key + "-attestation"}); err != nil {
-		t.Fatal(err)
-	}
+	completeActivity(t, store, state.Activities[execution.FirstActivity], key+"-result")
 	prepared, _, err := store.PrepareFinalization(context.Background(), PrepareFinalizationInput{ExecutionID: execution.ID, Repository: "o/r", PullRequest: "7", Gates: []string{"verify"}, Method: "squash", HumanApproved: true, HeadSHA: "abc123", PRURL: "https://example/pr/7", IdempotencyKey: key + "-publication"})
 	if err != nil {
 		t.Fatal(err)
@@ -90,17 +123,14 @@ func TestFinalizerRequiredChecksCannotBeOverridden(t *testing.T) {
 		NativeSession: NativeSessionIdentity{Runtime: "claude", ID: "finalizer-check-policy-session"}, Prompt: "finalize", Goal: "ship",
 		Runtime: RuntimeSpec{Name: "claude", Sandbox: SandboxWorkspaceWrite}, Root: worktree,
 		Authority: AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite},
-		Finalizer: FinalizerSpec{Enabled: true, RequiredChecks: checks, RequireHuman: true, RequireVerifier: true, Verifiers: []string{"independent"}},
+		Finalizer: FinalizerSpec{Enabled: true, RequiredChecks: checks, RequireHuman: true},
 		Budget:    DefaultBudget(), IdempotencyKey: "finalizer-check-policy-start",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	state, _ := store.Projection()
-	result := completeActivity(t, store, state.Activities[execution.FirstActivity], "finalizer-check-policy-result")
-	if _, _, err = store.RecordAttestation(context.Background(), RecordAttestationInput{ResultID: result.ID, Verifier: "independent", Verdict: "pass", Summary: "independent pass", IdempotencyKey: "finalizer-check-policy-attestation"}); err != nil {
-		t.Fatal(err)
-	}
+	completeActivity(t, store, state.Activities[execution.FirstActivity], "finalizer-check-policy-result")
 
 	cases := []struct {
 		name  string

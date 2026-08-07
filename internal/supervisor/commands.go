@@ -47,13 +47,9 @@ func (s *Store) StartExecution(ctx context.Context, input StartExecutionInput) (
 	}
 	input.Authority.AllowedRoots = append([]string(nil), input.Authority.AllowedRoots...)
 	input.Finalizer.RequiredChecks = append([]string(nil), input.Finalizer.RequiredChecks...)
-	input.Finalizer.Verifiers = append([]string(nil), input.Finalizer.Verifiers...)
 	input.Fallbacks = append([]RuntimeSpec(nil), input.Fallbacks...)
 	for index, check := range input.Finalizer.RequiredChecks {
 		input.Finalizer.RequiredChecks[index] = strings.TrimSpace(check)
-	}
-	for index, verifier := range input.Finalizer.Verifiers {
-		input.Finalizer.Verifiers[index] = strings.TrimSpace(verifier)
 	}
 	for index, root := range input.Authority.AllowedRoots {
 		input.Authority.AllowedRoots[index], err = canonicalDirectory(root)
@@ -65,8 +61,6 @@ func (s *Store) StartExecution(ctx context.Context, input StartExecutionInput) (
 	input.Authority.AllowedRoots = uniqueStrings(input.Authority.AllowedRoots)
 	sort.Strings(input.Finalizer.RequiredChecks)
 	input.Finalizer.RequiredChecks = uniqueStrings(input.Finalizer.RequiredChecks)
-	sort.Strings(input.Finalizer.Verifiers)
-	input.Finalizer.Verifiers = uniqueStrings(input.Finalizer.Verifiers)
 	if input.Budget.MaxTaskAttempts == 0 && input.Budget.MaxLaunches == 0 {
 		input.Budget = DefaultBudget()
 	}
@@ -148,21 +142,13 @@ func validateStartInput(in StartExecutionInput) error {
 	if in.Budget.MaxTaskAttempts < 1 || in.Budget.MaxLaunches < in.Budget.MaxTaskAttempts {
 		return errors.New("budget requires positive task attempts and at least as many OS launches")
 	}
-	if in.Finalizer.Enabled && (!in.Finalizer.RequireHuman || !in.Finalizer.RequireVerifier || len(in.Finalizer.Verifiers) == 0 || len(in.Finalizer.RequiredChecks) == 0) {
-		return errors.New("enabled finalizer requires human, independent verifier, and named check gates")
+	if in.Finalizer.Enabled && len(in.Finalizer.RequiredChecks) == 0 {
+		return errors.New("enabled finalizer requires a non-empty canonical set of external GitHub checks")
 	}
 	if in.Finalizer.Enabled {
 		for _, check := range in.Finalizer.RequiredChecks {
 			if strings.TrimSpace(check) == "" {
-				return errors.New("enabled finalizer requires non-empty named check gates")
-			}
-		}
-		for _, verifier := range in.Finalizer.Verifiers {
-			if strings.TrimSpace(verifier) == "" {
-				return errors.New("enabled finalizer requires non-empty verifier identities")
-			}
-			if verifier == in.Authority.RequestedBy {
-				return errors.New("enabled finalizer verifier must differ from workflow requester")
+				return errors.New("enabled finalizer requires non-empty external GitHub checks")
 			}
 		}
 	}
@@ -761,88 +747,6 @@ func validateMilestone(state *State, attempt *Attempt, activity *Activity, m Mil
 	return nil
 }
 
-type RecordAttestationInput struct {
-	ResultID       ResultID `json:"result_id"`
-	Verifier       string   `json:"verifier"`
-	Verdict        string   `json:"verdict"`
-	Summary        string   `json:"summary"`
-	EvidenceIDs    []string `json:"evidence_ids,omitempty"`
-	IdempotencyKey string   `json:"-"`
-}
-
-type recordAttestationCommand struct{ Input RecordAttestationInput }
-
-func (c recordAttestationCommand) commandType() string    { return "RecordAttestation" }
-func (c recordAttestationCommand) idempotencyKey() string { return c.Input.IdempotencyKey }
-func (c recordAttestationCommand) digest() (string, error) {
-	return digestValue(c.Input, "IdempotencyKey")
-}
-
-// RecordAttestation is deliberately separate from a worker Result. Only a
-// verifier identity explicitly configured by the human-authorized Workflow can
-// produce publication evidence, so a runtime cannot self-attest its own work.
-func (s *Store) RecordAttestation(ctx context.Context, input RecordAttestationInput) (*Attestation, Receipt, error) {
-	input.Verifier = strings.TrimSpace(input.Verifier)
-	input.Summary = strings.TrimSpace(input.Summary)
-	input.EvidenceIDs = append([]string(nil), input.EvidenceIDs...)
-	sort.Strings(input.EvidenceIDs)
-	input.EvidenceIDs = uniqueStrings(input.EvidenceIDs)
-	receipt, err := s.Execute(ctx, recordAttestationCommand{Input: input})
-	if err != nil {
-		return nil, receipt, err
-	}
-	state, err := s.Projection()
-	if err != nil {
-		return nil, receipt, err
-	}
-	attestation := state.Attestations[AttestationID(receipt.ResourceID)]
-	if attestation == nil {
-		return nil, receipt, errors.New("committed attestation is absent")
-	}
-	return cloneAttestation(attestation), receipt, nil
-}
-
-func (c recordAttestationCommand) decide(state *State, now time.Time) ([]DomainEvent, string, error) {
-	in := c.Input
-	result := state.Results[in.ResultID]
-	if result == nil {
-		return nil, "", errors.New("attestation targets an unknown immutable Result")
-	}
-	workflow := state.Workflows[result.WorkflowID]
-	if workflow == nil || !workflow.Finalizer.Enabled || !workflow.Finalizer.RequireVerifier {
-		return nil, "", errors.New("Workflow has no independent verifier gate")
-	}
-	allowed := false
-	for _, verifier := range workflow.Finalizer.Verifiers {
-		if verifier == in.Verifier {
-			allowed = true
-			break
-		}
-	}
-	if !allowed || in.Verifier == workflow.Authority.RequestedBy {
-		return nil, "", errors.New("attestation verifier is not an authorized independent identity")
-	}
-	for _, existing := range state.Attestations {
-		if existing.ResultID == result.ID && existing.Verifier == in.Verifier {
-			return nil, "", ErrDuplicateAttestation
-		}
-	}
-	attestation := Attestation{Verifier: in.Verifier, Verdict: in.Verdict, Summary: in.Summary, EvidenceIDs: append([]string(nil), in.EvidenceIDs...)}
-	if err := validateSourceAttestation(attestation); err != nil {
-		return nil, "", err
-	}
-	switch attestation.Verdict {
-	case "fail_blocking":
-		attestation.RawVerdict, attestation.Verdict = "fail_blocking", "blocked"
-	case "pass_with_limit", "pass_with_runtime_limit":
-		attestation.RawVerdict, attestation.Verdict = attestation.Verdict, "repair"
-	}
-	attestation.ID = AttestationID(stableID("attestation", in.IdempotencyKey))
-	attestation.ResultID = result.ID
-	attestation.At = now
-	return []DomainEvent{mustEvent(eventAttestationRecorded, attestationRecordedEvent{Attestation: &attestation})}, string(attestation.ID), nil
-}
-
 // PauseWorkflowInput is the durable control-plane request used by cloud
 // callers and the CLI. The command records exact stop controls in one journal
 // transaction. The executor applies those controls; only terminal exit
@@ -1184,17 +1088,6 @@ func orderedMessages(state *State) []*Message {
 		return messages[i].CreatedAt.Before(messages[j].CreatedAt) || messages[i].CreatedAt.Equal(messages[j].CreatedAt) && messages[i].ID < messages[j].ID
 	})
 	return messages
-}
-func validateSourceAttestation(attestation Attestation) error {
-	if strings.TrimSpace(attestation.Verifier) == "" || strings.TrimSpace(attestation.Summary) == "" {
-		return errors.New("attestation requires verifier and summary")
-	}
-	switch attestation.Verdict {
-	case "pass", "repair", "blocked", "fail_blocking", "pass_with_limit", "pass_with_runtime_limit":
-		return nil
-	default:
-		return fmt.Errorf("unknown attestation verdict %q", attestation.Verdict)
-	}
 }
 func canonicalDirectory(path string) (string, error) {
 	if strings.TrimSpace(path) == "" {

@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/carlchungus/durable-agent-handoff/supervisor"
 )
@@ -19,7 +18,7 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 	if err := os.Chmod(state, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	request := `{"idempotency_key":"arca-file-start-01","goal":"promote work","prompt":"secret stdin prompt","remote_root":"` + root + `","runtime":"codex","resume_id":"exact-thread","sandbox":"read-only","role":"arca-cloud","finalizer_enabled":true,"finalizer_required_checks":["verify"],"finalizer_require_human":true,"finalizer_require_verifier":true,"finalizer_verifiers":["verifier:ci"]}`
+	request := `{"idempotency_key":"arca-file-start-01","goal":"promote work","prompt":"secret stdin prompt","remote_root":"` + root + `","runtime":"codex","resume_id":"exact-thread","sandbox":"read-only","role":"arca-cloud","finalizer_enabled":true,"finalizer_required_checks":["verify"],"finalizer_require_human":true}`
 	read, write, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +59,7 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if finalizer := projection.Workflows[response.WorkflowID].Finalizer; !finalizer.Enabled || !finalizer.RequireHuman || !finalizer.RequireVerifier || len(finalizer.RequiredChecks) != 1 || finalizer.RequiredChecks[0] != "verify" || len(finalizer.Verifiers) != 1 || finalizer.Verifiers[0] != "verifier:ci" {
+	if finalizer := projection.Workflows[response.WorkflowID].Finalizer; !finalizer.Enabled || !finalizer.RequireHuman || len(finalizer.RequiredChecks) != 1 || finalizer.RequiredChecks[0] != "verify" {
 		t.Fatalf("promotion finalizer was not persisted immutably: %+v", finalizer)
 	}
 	divergent := strings.Replace(request, `"promote work"`, `"different work"`, 1)
@@ -79,7 +78,7 @@ func TestOrdinaryStartPersistsAdvertisedFinalizerAndRejectsIncompleteConfig(t *t
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
-	if err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--runtime", "codex", "--file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "cli-finalizer-start", "--finalizer-enabled", "--required-check", "verify", "--require-human", "--require-verifier", "--verifier", "verifier:ci", "--json"}, "ship", &out, &errOut); err != nil {
+	if err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--runtime", "codex", "--file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "cli-finalizer-start", "--finalizer-enabled", "--required-check", "verify", "--require-human", "--json"}, "ship", &out, &errOut); err != nil {
 		t.Fatalf("ordinary finalizer start: %v stderr=%s", err, errOut.String())
 	}
 	var response ordinaryStartResponse
@@ -107,111 +106,6 @@ func TestOrdinaryStartPersistsAdvertisedFinalizerAndRejectsIncompleteConfig(t *t
 	after, _ := store.Events(0)
 	if len(after) != len(before) {
 		t.Fatal("rejected incomplete finalizer mutated the journal")
-	}
-}
-
-func TestAttestCLIReachesVerifierGateWithExactResultAndFailsClosed(t *testing.T) {
-	stateRoot, worktree := t.TempDir(), t.TempDir()
-	if err := os.Chmod(stateRoot, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	var out, errOut bytes.Buffer
-	if err := runWithPrompt(t, []string{"start", "--state", stateRoot, "--root", worktree, "--runtime", "codex", "--session", "attest-exact-session", "--file", "-", "--sandbox", "read-only", "--authorized-by", "human:requester", "--idempotency-key", "attest-cli-start", "--finalizer-enabled", "--required-check", "verify", "--require-human", "--require-verifier", "--verifier", "verifier:ci", "--json"}, "work", &out, &errOut); err != nil {
-		t.Fatalf("start: %v stderr=%s", err, errOut.String())
-	}
-	var started ordinaryStartResponse
-	if err := json.Unmarshal(out.Bytes(), &started); err != nil {
-		t.Fatal(err)
-	}
-	store, err := supervisor.Open(stateRoot, supervisor.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	state, err := store.Projection()
-	if err != nil {
-		t.Fatal(err)
-	}
-	activity := state.Activities[started.Execution.FirstActivity]
-	attempt, _, err := store.PrepareAttempt(context.Background(), supervisor.PrepareAttemptInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, Runtime: supervisor.RuntimeSpec{Name: "codex", Sandbox: supervisor.SandboxReadOnly}, CommandDigest: "attest-cli-command", Outputs: supervisor.OutputIdentity{Stdout: "attest-cli-stdout", Stderr: "attest-cli-stderr"}, IdempotencyKey: "attest-cli-attempt"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, milestone := range []supervisor.Milestone{
-		{Kind: supervisor.MilestoneProcessSpawned, Process: &supervisor.ProcessIdentity{PID: 91, StartToken: "attest-cli-process"}},
-		{Kind: supervisor.MilestoneTurnStarted},
-		{Kind: supervisor.MilestoneResult, Result: &supervisor.WorkerResult{Status: "completed", Summary: "worker completed exact task"}},
-		{Kind: supervisor.MilestoneExit, Exit: &supervisor.Exit{Code: 0}},
-	} {
-		if _, err := store.RecordMilestone(context.Background(), supervisor.RecordMilestoneInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, AttemptID: attempt.ID, LeaseID: attempt.LeaseID, Milestone: milestone, IdempotencyKey: "attest-cli-" + string(milestone.Kind)}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	state, err = store.Projection()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var result *supervisor.Result
-	for _, candidate := range state.Results {
-		result = candidate
-	}
-	if result == nil || result.ActivityID != activity.ID || result.AttemptID != attempt.ID {
-		t.Fatalf("missing exact immutable result: %+v", result)
-	}
-
-	before, err := store.Events(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, verifier := range []string{"attacker", "human:requester"} {
-		out.Reset()
-		if err := runWithPrompt(t, []string{"attest", "--state", stateRoot, "--result", string(result.ID), "--verifier", verifier, "--verdict", "pass", "--file", "-", "--idempotency-key", "attest-cli-unauthorized" + verifier, "--json"}, "not authorized", &out, &errOut); err == nil {
-			t.Fatalf("unauthorized verifier %q was accepted", verifier)
-		}
-	}
-	out.Reset()
-	if err := runWithPrompt(t, []string{"attest", "--state", stateRoot, "--result", "stale-result", "--verifier", "verifier:ci", "--verdict", "pass", "--file", "-", "--idempotency-key", "attest-cli-stale", "--json"}, "stale result", &out, &errOut); err == nil {
-		t.Fatal("stale Result ID was accepted")
-	}
-	if after, _ := store.Events(0); len(after) != len(before) {
-		t.Fatal("rejected verifier requests mutated the journal")
-	}
-
-	out.Reset()
-	if err := run([]string{"attest", "--state", stateRoot, "--result", string(result.ID), "--verifier", "verifier:ci", "--verdict", "pass", "--summary", "argv-secret", "--idempotency-key", "attest-cli-argv-secret"}, &out, &errOut); err == nil || strings.Contains(out.String(), "argv-secret") || strings.Contains(errOut.String(), "argv-secret") {
-		t.Fatalf("argv summary was accepted or exposed: out=%s err=%s", out.String(), errOut.String())
-	}
-
-	out.Reset()
-	if err := runWithPrompt(t, []string{"attest", "--state", stateRoot, "--result", string(result.ID), "--verifier", "verifier:ci", "--verdict", "pass", "--evidence", "evidence:verify", "--file", "-", "--idempotency-key", "attest-cli-valid", "--json"}, "independent verifier pass", &out, &errOut); err != nil {
-		t.Fatalf("authorized attestation: %v stderr=%s", err, errOut.String())
-	}
-	var response attestationResponse
-	if err := json.Unmarshal(out.Bytes(), &response); err != nil || response.Attestation == nil || response.Attestation.ResultID != result.ID || response.Attestation.Verifier != "verifier:ci" || response.Receipt.Existing {
-		t.Fatalf("unexpected attestation response=%s err=%v", out.String(), err)
-	}
-	state, _ = store.Projection()
-	if len(state.Attestations) != 1 || state.Attestations[response.Attestation.ID].ResultID != result.ID {
-		t.Fatalf("attestation did not bind exact Result: %+v", state.Attestations)
-	}
-	view, err := store.View(started.Execution.ID, time.Now().UTC())
-	if err != nil || view.Publication != supervisor.PublicationAwaitingHuman {
-		t.Fatalf("verifier gate did not advance publication: publication=%s err=%v", view.Publication, err)
-	}
-
-	before, _ = store.Events(0)
-	out.Reset()
-	if err := runWithPrompt(t, []string{"attest", "--state", stateRoot, "--result", string(result.ID), "--verifier", "verifier:ci", "--verdict", "blocked", "--file", "-", "--idempotency-key", "attest-cli-duplicate", "--json"}, "contradictory duplicate", &out, &errOut); !errors.Is(err, supervisor.ErrDuplicateAttestation) {
-		t.Fatalf("duplicate verifier attestation was not rejected: %v", err)
-	}
-	if after, _ := store.Events(0); len(after) != len(before) {
-		t.Fatal("duplicate verifier attestation mutated the journal")
-	}
-	out.Reset()
-	if err := runWithPrompt(t, []string{"attest", "--state", stateRoot, "--result", string(result.ID), "--verifier", "verifier:ci", "--verdict", "pass", "--evidence", "evidence:verify", "--file", "-", "--idempotency-key", "attest-cli-valid", "--json"}, "independent verifier pass", &out, &errOut); err != nil {
-		t.Fatalf("same-key attestation retry: %v", err)
-	}
-	if !strings.Contains(out.String(), `"existing":true`) {
-		t.Fatalf("same-key retry did not return existing receipt: %s", out.String())
 	}
 }
 

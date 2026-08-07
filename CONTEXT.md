@@ -19,7 +19,7 @@ authority. A conversation can exist while no process is alive.
 ## Activity
 
 An Activity is independently controllable work: an agent turn, background
-command, verifier, or monitor. It owns:
+command, release-check, or monitor. It owns:
 
 - a stable harness ID and immutable logical work specification;
 - its owner Session, selected runtime/model, and lifecycle event ledger;

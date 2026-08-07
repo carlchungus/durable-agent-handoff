@@ -46,7 +46,6 @@ type (
 	Milestone                  = internal.Milestone
 	WorkerResult               = internal.WorkerResult
 	Exit                       = internal.Exit
-	Attestation                = internal.Attestation
 	Message                    = internal.Message
 	Lease                      = internal.Lease
 	Control                    = internal.Control
@@ -65,7 +64,6 @@ type (
 	PauseWorkflowInput         = internal.PauseWorkflowInput
 	SettlePauseInput           = internal.SettlePauseInput
 	ApplyControlInput          = internal.ApplyControlInput
-	RecordAttestationInput     = internal.RecordAttestationInput
 	ImportV1Input              = internal.ImportV1Input
 	ExecutionView              = internal.ExecutionView
 	NodeView                   = internal.NodeView
@@ -73,7 +71,6 @@ type (
 	AttemptView                = internal.AttemptView
 	ActivityStatus             = internal.ActivityStatus
 	ProcessHealth              = internal.ProcessHealth
-	VerificationState          = internal.VerificationState
 	PublicationState           = internal.PublicationState
 	FinalizationRequest        = internal.FinalizationRequest
 	FinalizationResult         = internal.FinalizationResult
@@ -108,11 +105,10 @@ const (
 	HealthRunning     = internal.HealthRunning
 	HealthExited      = internal.HealthExited
 
-	PublicationDisabled         = internal.PublicationDisabled
-	PublicationAwaitingResult   = internal.PublicationAwaitingResult
-	PublicationAwaitingVerifier = internal.PublicationAwaitingVerifier
-	PublicationAwaitingHuman    = internal.PublicationAwaitingHuman
-	PublicationEligible         = internal.PublicationEligible
+	PublicationDisabled       = internal.PublicationDisabled
+	PublicationAwaitingResult = internal.PublicationAwaitingResult
+	PublicationAwaitingHuman  = internal.PublicationAwaitingHuman
+	PublicationEligible       = internal.PublicationEligible
 
 	PauseRequested       = internal.PauseRequested
 	PauseDraining        = internal.PauseDraining
@@ -123,14 +119,13 @@ const (
 )
 
 var (
-	Open                    = internal.Open
-	DefaultBudget           = internal.DefaultBudget
-	ProjectExecution        = internal.ProjectExecution
-	RenderText              = internal.RenderText
-	ErrIdempotencyConflict  = internal.ErrIdempotencyConflict
-	ErrFenced               = internal.ErrFenced
-	ErrDuplicateAttestation = internal.ErrDuplicateAttestation
-	ErrLeaseHeld            = internal.ErrLeaseHeld
-	ErrPausePending         = internal.ErrPausePending
-	ErrLiveOrphan           = internal.ErrLiveOrphan
+	Open                   = internal.Open
+	DefaultBudget          = internal.DefaultBudget
+	ProjectExecution       = internal.ProjectExecution
+	RenderText             = internal.RenderText
+	ErrIdempotencyConflict = internal.ErrIdempotencyConflict
+	ErrFenced              = internal.ErrFenced
+	ErrLeaseHeld           = internal.ErrLeaseHeld
+	ErrPausePending        = internal.ErrPausePending
+	ErrLiveOrphan          = internal.ErrLiveOrphan
 )

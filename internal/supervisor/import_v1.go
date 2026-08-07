@@ -272,6 +272,8 @@ func migrateRuntime(runtime legacyimport.RuntimeSpec) RuntimeSpec {
 }
 
 func migrateBudget(budget legacyimport.Budget) Budget {
+	// Legacy attestation fields are decoded only to replay the source ledger;
+	// v2 publication uses external GitHub checks and never imports that gate.
 	maxAttempts := budget.MaxAttempts
 	if maxAttempts < 1 {
 		maxAttempts = DefaultBudget().MaxTaskAttempts

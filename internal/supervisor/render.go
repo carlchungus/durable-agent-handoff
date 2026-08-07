@@ -25,7 +25,7 @@ func RenderText(view *ExecutionView) string {
 		fmt.Fprintf(&output, "Node %s %s\n", node.ID, node.Status)
 	}
 	for _, activity := range view.Activities {
-		fmt.Fprintf(&output, "Activity %s generation=%d status=%s verification=%s", activity.ID, activity.Generation, activity.Status, activity.Verification)
+		fmt.Fprintf(&output, "Activity %s generation=%d status=%s", activity.ID, activity.Generation, activity.Status)
 		if activity.ParentActivityID != "" {
 			fmt.Fprintf(&output, " continuation_of=%s", activity.ParentActivityID)
 		}

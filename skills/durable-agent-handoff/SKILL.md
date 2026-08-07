@@ -16,11 +16,10 @@ do not infer lifecycle state from a transcript or a legacy store.
   stdin, never with `--prompt`, `--prompt-file`, `--message`, private prompt
   paths, or any other argv content.
 - Configure an autonomous merge-capable execution at its start boundary with
-  `--finalizer-enabled`, one or more `--required-check NAME`,
-  `--require-human`, `--require-verifier`, and one or more `--verifier ID`.
-  Promotion uses the equivalent flat `finalizer_*` JSON fields. The immutable
-  workflow configuration, not a later caller override, owns the required gate
-  set.
+  `--finalizer-enabled`, one or more externally hosted `--required-check NAME`,
+  and optional `--require-human`. Promotion uses the equivalent flat
+  `finalizer_*` JSON fields. The immutable workflow configuration, not a later
+  caller override, owns the canonical exact external check set.
 - Use the arca-cloud promotion envelope with
   `handoff execution start --file - --json`. It accepts one strict flat JSON
   object and returns only `workflow_id` and `node_id`.
@@ -39,11 +38,10 @@ do not infer lifecycle state from a transcript or a legacy store.
   records exact generation/Attempt fences, then the executor applies controls;
   leases are released only after terminal exit evidence and a durable settle.
 - Continue a bound exact Session with `handoff reply`.
-- Record independent verification with `handoff attest`. Pass the exact Result,
-  configured verifier identity, verdict, and idempotency key as flags; provide
-  the evidence summary only through `--file -` stdin. Worker Result payloads do
-  not self-attest. The verifier must differ from the requester, and stale,
-  unauthorized, or duplicate verifier/Result pairs fail without mutation.
+- Treat independently hosted CI and GitHub checks as the verification
+  authority. Worker Result payloads are evidence of immutable work only;
+  handoff does not pretend that same-UID workers can authenticate their own
+  Results.
 - Use `handoff github merge` only for authority-owned finalization. It journals
   the prepared exact PR head, named gates, approval, and idempotency key before
   an argv-only `gh` effect, then journals merged or blocked outcome.

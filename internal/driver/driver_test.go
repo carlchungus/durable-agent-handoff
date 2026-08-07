@@ -151,9 +151,9 @@ func TestClaudeAndPiContractResultCompletesOrdinaryWork(t *testing.T) {
 	}
 }
 
-func TestWorkerResultDecoderRejectsUntrustedAttestationFields(t *testing.T) {
-	if result, ok := decodeWorkerResult([]byte(`{"status":"completed","summary":"done","attestations":[{"verdict":"pass"}]}`)); ok || result != nil {
-		t.Fatalf("worker attestation payload was accepted as a Result: result=%+v ok=%v", result, ok)
+func TestWorkerResultDecoderRejectsUnknownFields(t *testing.T) {
+	if result, ok := decodeWorkerResult([]byte(`{"status":"completed","summary":"done","unexpected":"authority"}`)); ok || result != nil {
+		t.Fatalf("worker payload with an unknown authority field was accepted as a Result: result=%+v ok=%v", result, ok)
 	}
 	if result, ok := decodeWorkerResult([]byte(`{"status":"completed","summary":"done"}`)); !ok || result == nil || result.Status != "completed" {
 		t.Fatalf("strict ordinary Result was rejected: result=%+v ok=%v", result, ok)

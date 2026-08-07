@@ -31,7 +31,6 @@ execution, receipt, err := store.StartExecution(ctx, supervisor.StartExecutionIn
     Finalizer: supervisor.FinalizerSpec{
         Enabled:         true,
         RequireHuman:    true,
-        RequireVerifier: true,
         RequiredChecks:  []string{"test"},
     },
     Budget:         supervisor.DefaultBudget(),
@@ -58,7 +57,6 @@ interface:
 | `ContinueSession` | human Message + exact-Session continuation Activity generation |
 | `PrepareAttempt` | immutable Attempt + canonical-worktree writer Lease + inbox dispatch |
 | `RecordMilestone` | typed milestone plus any Result, inbox settlement, or terminal-exit Lease release |
-| `RecordAttestation` | exact immutable Result + authorized independent verifier evidence |
 | `RequestControl` | accepted/rejected exact Activity-generation and Attempt fence |
 | `PauseWorkflow` | records exact controls and enters requested/draining; executor-applied terminal exits release Leases |
 | `SettlePause` | idempotently marks a draining pause completed after every fenced Attempt has exited |
@@ -77,11 +75,12 @@ predecessor Activity. Once the child exists, the parent remains visible only as
 lineage and is excluded from Queue and fenced from Attempt preparation.
 
 Publication is an authority-owned durable effect. `PrepareFinalization` records
-the exact PR, head SHA, named gates, approval, and idempotency key. Only after
-that append may the finalizer invoke argv-only `gh`; `SettleFinalization`
-records merged or blocked outcome. A retry first reads the prepared record,
-rejects divergent reuse, fences a changed head, and never guesses whether a
-post-merge crash succeeded.
+the exact PR, head SHA, canonical external check set, approval, and idempotency
+key. Only after that append may the finalizer invoke argv-only `gh`, and it
+rechecks those independently hosted checks on the unchanged head;
+`SettleFinalization` records merged or blocked outcome. A retry first reads the
+prepared record, rejects divergent reuse, fences a changed head, and never
+guesses whether a post-merge crash succeeded.
 
 ## Runtime milestone protocol
 
@@ -94,7 +93,7 @@ Drivers may emit only:
 | `turn_started` | none | provider accepted useful turn; consumes task-attempt budget |
 | `effect_started` | typed effect summary | tool/command/file effect began |
 | `meaningful_progress` | semantic summary | explicit progress; output bytes do not qualify |
-| `result` | status, summary | creates immutable Result; verification is a separate authority command |
+| `result` | status, summary | creates an immutable Result; external GitHub checks are the verification authority |
 | `provider_unavailable` | classified reason | routing evidence; not inferred from arbitrary text |
 | `adapter_start_failed` | reason | terminal pre-turn startup failure |
 | `exit` | exit code and optional error | terminal OS process fact |
@@ -106,17 +105,9 @@ times, and stale Lease/Attempt fences are rejected.
 Result status is `completed`, `needs_human`, or `blocked`. A reply to any Result
 creates a continuation Activity; it never changes the Result or predecessor.
 
-Attestation source verdicts use the exact allowlist:
-
-- `pass`, `repair`, `blocked` remain canonical;
-- `fail_blocking` normalizes to `blocked` while retaining `raw_verdict`;
-- `pass_with_limit` and `pass_with_runtime_limit` normalize to `repair`; and
-- unknown verdicts fail closed.
-
-`RecordAttestation` accepts only an exact existing Result and a verifier named
-by the Workflow's immutable finalizer configuration. The verifier must differ
-from the Workflow requester, and each verifier may attest a given Result only
-once. Worker Result payloads do not carry attestation authority.
+Worker Result payloads do not carry publication authority. Independently hosted
+CI and GitHub checks provide verification; handoff does not pretend that
+same-UID workers can authenticate their own Results.
 
 ## Projection protocol
 
@@ -124,8 +115,8 @@ once. Worker Result payloads do not carry attestation authority.
 reconcile, adopt, deliver inbox messages, change health, or append an event.
 
 The typed `ActivityView` is intentionally minimal: clients read lifecycle from
-`Status`, identity/generation, immutable dependency bindings, result identity,
-and verification. Attempt and Control projections live at the execution level;
+`Status`, identity/generation, immutable dependency bindings, and result
+identity. Attempt and Control projections live at the execution level;
 legacy aliases and compatibility envelopes are not part of v2.
 
 `ReconcileStartup` is the explicit restart boundary. It runs once before
@@ -136,7 +127,7 @@ retry. An exact live PID/start-token match returns `ErrLiveOrphan` and the
 service refuses to schedule until an explicit adoption protocol is available.
 
 `Store.View(executionID, asOf)` returns one `ExecutionView` containing the Node,
-Activity, Attempt, queue, verification, publication, and overhead projections.
+Activity, Attempt, queue, publication, and overhead projections.
 Human, JSON, JSONL, and TUI consumers must render this same structure.
 
 Process health is:
@@ -187,12 +178,12 @@ reply `--message` argv content are rejected.
 `handoff execution start --file - --json` accepts exactly one flat JSON object
 with `idempotency_key`, `goal`, `prompt`, `remote_root`, `runtime`, `resume_id`,
 `sandbox`, and `role`, plus optional `model`, `effort`, and flat
-`finalizer_enabled`, `finalizer_required_checks`, `finalizer_require_human`,
-`finalizer_require_verifier`, and `finalizer_verifiers` fields. Unknown fields
-and a second JSON value are rejected. Finalizer configuration is persisted in
-the immutable `StartExecutionInput`; an enabled finalizer requires nonempty
-named checks, human approval, and independent verifier identities. Its only
-JSON response shape is:
+`finalizer_enabled`, `finalizer_required_checks`, and
+`finalizer_require_human` fields. Unknown fields and a second JSON value are
+rejected. Finalizer configuration is persisted in the immutable
+`StartExecutionInput`; an enabled finalizer requires a nonempty canonical exact
+set of external GitHub checks, while human approval is independently optional.
+Its only JSON response shape is:
 
 ```json
 {"workflow_id":"...","node_id":"..."}
@@ -203,13 +194,6 @@ idempotency key when one is not supplied. The command commits pause controls,
 then waits on pure projection reads until the executor records exact terminal
 exit evidence and the later idempotent settle command marks the pause complete.
 An Attempt holding an old fence cannot append a later non-terminal milestone.
-
-`handoff attest --result RESULT_ID --verifier ID --verdict pass|repair|blocked
---file - --idempotency-key KEY [--evidence ID ...]` reads the evidence summary
-from stdin and records one strict verifier command. `--summary` and other
-argv-bearing summary forms are rejected. The command is idempotent with the
-same canonical input; a stale Result, unauthorized verifier, or duplicate
-verifier/Result pair is rejected without journal mutation.
 
 `serve` accepts `--environment-json FILE` only when `FILE` is a regular
 mode-0600 file containing one JSON object, and `--trust-mode workspace|full`.

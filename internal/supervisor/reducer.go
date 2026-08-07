@@ -18,7 +18,6 @@ const (
 	eventAttemptPrepared      = "attempt.prepared"
 	eventMilestone            = "attempt.milestone"
 	eventResultCreated        = "result.created"
-	eventAttestationRecorded  = "attestation.recorded"
 	eventMessageQueued        = "message.queued"
 	eventMessageDispatched    = "message.dispatched"
 	eventMessageSettled       = "message.settled"
@@ -90,10 +89,6 @@ type milestoneEvent struct {
 
 type resultCreatedEvent struct {
 	Result *Result `json:"result"`
-}
-
-type attestationRecordedEvent struct {
-	Attestation *Attestation `json:"attestation"`
 }
 
 type messageEvent struct {
@@ -334,15 +329,9 @@ func applyDomainEvent(state *State, domain DomainEvent) error {
 			return errors.New("result event is incomplete or duplicate")
 		}
 		state.Results[data.Result.ID] = cloneResult(data.Result)
-	case eventAttestationRecorded:
-		var data attestationRecordedEvent
-		if err := json.Unmarshal(domain.Data, &data); err != nil {
-			return err
-		}
-		if data.Attestation == nil || state.Attestations[data.Attestation.ID] != nil {
-			return errors.New("attestation event is incomplete or duplicate")
-		}
-		state.Attestations[data.Attestation.ID] = cloneAttestation(data.Attestation)
+	case "attestation.recorded":
+		// Retired v2 publication events remain readable as historical facts, but
+		// they no longer create state or publication authority.
 	case eventMessageQueued:
 		var data messageEvent
 		if err := json.Unmarshal(domain.Data, &data); err != nil {
@@ -573,11 +562,6 @@ func validateState(state *State) error {
 			seenNames[candidate.Name] = true
 		}
 	}
-	for id, attestation := range state.Attestations {
-		if state.Results[attestation.ResultID] == nil {
-			return fmt.Errorf("attestation %s targets an unknown immutable result", id)
-		}
-	}
 	for id, workflow := range state.Workflows {
 		if err := validateDAG(workflow); err != nil {
 			return fmt.Errorf("workflow %s: %w", id, err)
@@ -650,7 +634,6 @@ func cloneWorkflow(v *Workflow) *Workflow {
 	c := *v
 	c.Authority.AllowedRoots = append([]string(nil), v.Authority.AllowedRoots...)
 	c.Finalizer.RequiredChecks = append([]string(nil), v.Finalizer.RequiredChecks...)
-	c.Finalizer.Verifiers = append([]string(nil), v.Finalizer.Verifiers...)
 	c.Nodes = make(map[NodeID]*Node, len(v.Nodes))
 	for id, node := range v.Nodes {
 		c.Nodes[id] = cloneNode(node)
@@ -701,11 +684,6 @@ func cloneResult(v *Result) *Result {
 func cloneFinalization(v *Finalization) *Finalization {
 	c := *v
 	c.Gates = append([]string(nil), v.Gates...)
-	return &c
-}
-func cloneAttestation(v *Attestation) *Attestation {
-	c := *v
-	c.EvidenceIDs = append([]string(nil), v.EvidenceIDs...)
 	return &c
 }
 func cloneMessage(v *Message) *Message { c := *v; return &c }

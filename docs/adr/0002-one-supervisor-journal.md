@@ -73,7 +73,7 @@ authority-owned effect gated by the Supervisor projection.
 
 ### Query boundary
 
-Status, list, queue, health, meaningful progress, verification, publication,
+Status, list, queue, health, meaningful progress, external-check publication,
 and orchestration overhead are pure functions of the same projection. Queries
 accept an explicit `asOf` time where needed and append no observations merely
 because a client polled.

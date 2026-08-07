@@ -818,6 +818,25 @@ func TestProjectionReplaysWhenSnapshotIsDeleted(t *testing.T) {
 	}
 }
 
+func TestRetiredPublicationEventRemainsReplayReadable(t *testing.T) {
+	state := emptyState()
+	entry := JournalEntry{
+		SchemaVersion: SchemaVersion,
+		Sequence:      1,
+		At:            time.Unix(100, 0).UTC(),
+		Events: []DomainEvent{{
+			Type: "attestation.recorded",
+			Data: json.RawMessage(`{"attestation":{"id":"legacy","result_id":"missing"}}`),
+		}},
+	}
+	if err := applyEntry(state, entry); err != nil {
+		t.Fatalf("retired publication event broke journal replay: %v", err)
+	}
+	if state.Sequence != entry.Sequence || len(state.Results) != 0 {
+		t.Fatalf("retired publication event changed active state: sequence=%d results=%d", state.Sequence, len(state.Results))
+	}
+}
+
 func TestStartExecutionRejectsRootOutsideAuthorityWithoutMutation(t *testing.T) {
 	store, _, worktree := openTestStore(t, Options{})
 	authorized := safeDir(t)
@@ -846,7 +865,7 @@ func TestStartExecutionRejectsRootOutsideAuthorityWithoutMutation(t *testing.T) 
 
 func TestLegacyLedgerImportIsDeterministicOneWayAndPreservesContinuationHistory(t *testing.T) {
 	sourceRoot, worktree := safeDir(t), safeDir(t)
-	workflow := &legacyimport.Workflow{ID: "wf_legacy_import", Goal: "legacy goal", Root: worktree, Status: legacyimport.WorkflowActive, Budget: legacyimport.Budget{MaxNodes: 8, MaxConcurrent: 1, MaxAttempts: 3, MaxChangedFiles: 10, MaxDiffLines: 100}, Nodes: map[string]*legacyimport.Node{}, CreatedAt: time.Unix(100, 0).UTC(), UpdatedAt: time.Unix(100, 0).UTC()}
+	workflow := &legacyimport.Workflow{ID: "wf_legacy_import", Goal: "legacy goal", Root: worktree, Status: legacyimport.WorkflowActive, Budget: legacyimport.Budget{MaxNodes: 8, MaxConcurrent: 1, MaxAttempts: 3, MaxChangedFiles: 10, MaxDiffLines: 100, RequireAttestation: true}, Nodes: map[string]*legacyimport.Node{}, CreatedAt: time.Unix(100, 0).UTC(), UpdatedAt: time.Unix(100, 0).UTC()}
 	created := *workflow
 	created.Nodes = map[string]*legacyimport.Node{}
 	legacyEvents := []legacyimport.Event{{Sequence: 1, ID: "created", WorkflowID: workflow.ID, Type: "workflow.created", Actor: "human", At: workflow.CreatedAt, Data: &created}}
@@ -861,7 +880,8 @@ func TestLegacyLedgerImportIsDeterministicOneWayAndPreservesContinuationHistory(
 	appendProposal(2, legacyimport.Proposal{WorkflowID: workflow.ID, Actor: "human", Mutations: []legacyimport.Mutation{{Op: "add_node", Node: node}}}, time.Unix(101, 0).UTC())
 	appendProposal(3, legacyimport.Proposal{WorkflowID: workflow.ID, Actor: "supervisor", Mutations: []legacyimport.Mutation{{Op: "set_state", NodeID: node.ID, State: legacyimport.NodeRunning}}}, time.Unix(102, 0).UTC())
 	appendProposal(4, legacyimport.Proposal{WorkflowID: workflow.ID, Actor: node.ID, Mutations: []legacyimport.Mutation{{Op: "set_state", NodeID: node.ID, State: legacyimport.NodeCompleted}}}, time.Unix(103, 0).UTC())
-	appendProposal(5, legacyimport.Proposal{WorkflowID: workflow.ID, Actor: "human", Mutations: []legacyimport.Mutation{{Op: "reopen_agent", NodeID: node.ID}}}, time.Unix(104, 0).UTC())
+	appendProposal(5, legacyimport.Proposal{WorkflowID: workflow.ID, Actor: "human", Mutations: []legacyimport.Mutation{{Op: "attest", Attestation: &legacyimport.Attestation{ID: "legacy-attestation", NodeID: node.ID, Verifier: "legacy-ci", Verdict: "pass", Summary: "historical release gate"}}}}, time.Unix(104, 0).UTC())
+	appendProposal(6, legacyimport.Proposal{WorkflowID: workflow.ID, Actor: "human", Mutations: []legacyimport.Mutation{{Op: "reopen_agent", NodeID: node.ID}}}, time.Unix(105, 0).UTC())
 	legacyPath := filepath.Join(sourceRoot, "workflows", workflow.ID, "events.jsonl")
 	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
 		t.Fatal(err)
@@ -902,6 +922,10 @@ func TestLegacyLedgerImportIsDeterministicOneWayAndPreservesContinuationHistory(
 	}
 	if len(state.Workflows) != 1 || len(state.Results) != 1 || len(state.Activities) != 2 || len(state.LegacyImports) != 1 {
 		t.Fatalf("unexpected imported projection: workflows=%d results=%d activities=%d imports=%d", len(state.Workflows), len(state.Results), len(state.Activities), len(state.LegacyImports))
+	}
+	serializedState, err := json.Marshal(state)
+	if err != nil || strings.Contains(string(serializedState), "attestation") {
+		t.Fatalf("legacy attestation leaked into Supervisor v2 state: err=%v state=%s", err, serializedState)
 	}
 	for _, session := range state.Sessions {
 		if !session.ImportedUnresolved || session.Native.ID != "" {
@@ -956,5 +980,64 @@ func TestLegacyLedgerImportIsDeterministicOneWayAndPreservesContinuationHistory(
 	after, err := os.ReadFile(legacyPath)
 	if err != nil || string(after) != string(before) {
 		t.Fatalf("one-way importer modified legacy ledger: err=%v", err)
+	}
+}
+
+func TestLegacyAttestationImportDoesNotCreateV2PublicationAuthority(t *testing.T) {
+	sourceRoot, worktree := safeDir(t), safeDir(t)
+	createdAt := time.Unix(200, 0).UTC()
+	node := &legacyimport.Node{ID: "legacy-node", Title: "legacy node", Kind: "agent", State: legacyimport.NodeCompleted, Worktree: worktree, Runtime: legacyimport.RuntimeSpec{Name: "claude", Sandbox: "workspace-write"}, SessionID: "legacy-session", MaxAttempts: 2, CreatedAt: createdAt, UpdatedAt: createdAt}
+	workflow := &legacyimport.Workflow{ID: "wf_legacy_attestation", Goal: "legacy release gate", Root: worktree, Status: legacyimport.WorkflowWaiting, Budget: legacyimport.Budget{MaxNodes: 2, MaxConcurrent: 1, MaxAttempts: 2, RequireAttestation: true}, Nodes: map[string]*legacyimport.Node{node.ID: node}, Order: []string{node.ID}, CreatedAt: createdAt, UpdatedAt: createdAt}
+	created := *workflow
+	proposal := legacyimport.Proposal{WorkflowID: workflow.ID, Actor: "human", Mutations: []legacyimport.Mutation{{Op: "attest", Attestation: &legacyimport.Attestation{ID: "legacy-attestation", NodeID: node.ID, Verifier: "legacy-ci", Verdict: "pass", Summary: "historical release gate"}}}}
+	if err := legacyimport.ApplyProposal(workflow, proposal, createdAt.Add(time.Second)); err != nil {
+		t.Fatalf("legacy attestation proposal was not replayable: %v", err)
+	}
+	legacyEvents := []legacyimport.Event{
+		{Sequence: 1, ID: "created", WorkflowID: workflow.ID, Type: "workflow.created", Actor: "human", At: createdAt, Data: &created},
+		{Sequence: 2, ID: "proposal-2", WorkflowID: workflow.ID, Type: "proposal.applied", Actor: proposal.Actor, At: createdAt.Add(time.Second), Data: proposal},
+	}
+	legacyPath := filepath.Join(sourceRoot, "workflows", workflow.ID, "events.jsonl")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var encoded []byte
+	for _, event := range legacyEvents {
+		raw, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded = append(encoded, raw...)
+		encoded = append(encoded, '\n')
+	}
+	if err := os.WriteFile(legacyPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	target, _, _ := openTestStore(t, Options{})
+	if _, err := target.ImportV1(context.Background(), ImportV1Input{SourceRoot: sourceRoot, IdempotencyKey: "legacy-import-authority-01"}); err != nil {
+		t.Fatalf("historical attestation ledger did not import: %v", err)
+	}
+	state, err := target.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Workflows) != 1 || len(state.Results) != 1 {
+		t.Fatalf("historical attestation import did not produce the expected v2 projection: workflows=%d results=%d", len(state.Workflows), len(state.Results))
+	}
+	var imported *Workflow
+	for _, candidate := range state.Workflows {
+		imported = candidate
+	}
+	if imported == nil || imported.Finalizer.Enabled || len(imported.Finalizer.RequiredChecks) != 0 || imported.Finalizer.RequireHuman {
+		t.Fatalf("legacy attestation created v2 publication authority: workflow=%+v", imported)
+	}
+	serializedState, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serialized := string(serializedState)
+	if strings.Contains(serialized, `"attestation"`) || strings.Contains(serialized, `"attestations"`) || strings.Contains(serialized, `"verifier"`) || strings.Contains(serialized, `"verifiers"`) {
+		t.Fatalf("legacy attestation or verifier data leaked into Supervisor v2 state: %s", serializedState)
 	}
 }

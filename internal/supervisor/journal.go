@@ -282,7 +282,6 @@ var (
 	ErrIdempotencyConflict    = errors.New("idempotency conflict")
 	ErrFenced                 = errors.New("command fenced by newer supervisor state")
 	ErrControlAlreadyAccepted = errors.New("an accepted control already exists for this exact Attempt")
-	ErrDuplicateAttestation   = errors.New("verifier already attested this exact Result")
 	ErrLeaseHeld              = errors.New("canonical worktree writer lease is held")
 	ErrPausePending           = errors.New("pause is still draining")
 )

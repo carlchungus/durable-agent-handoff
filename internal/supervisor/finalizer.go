@@ -13,7 +13,7 @@ import (
 
 // FinalizationRequest is the authority-owned publication effect. Runtime
 // Drivers never receive this capability; callers provide the exact repository,
-// PR, named gates, idempotency key, and human approval required by policy.
+// PR, external GitHub check set, idempotency key, and optional human approval.
 type FinalizationRequest struct {
 	ExecutionID    ExecutionID
 	Repository     string

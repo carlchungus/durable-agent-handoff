@@ -30,23 +30,13 @@ const (
 	HealthExited      ProcessHealth = "exited"
 )
 
-type VerificationState string
-
-const (
-	VerificationPending VerificationState = "pending"
-	VerificationPass    VerificationState = "pass"
-	VerificationRepair  VerificationState = "repair"
-	VerificationBlocked VerificationState = "blocked"
-)
-
 type PublicationState string
 
 const (
-	PublicationDisabled         PublicationState = "disabled"
-	PublicationAwaitingResult   PublicationState = "awaiting_result"
-	PublicationAwaitingVerifier PublicationState = "awaiting_verifier"
-	PublicationAwaitingHuman    PublicationState = "awaiting_human"
-	PublicationEligible         PublicationState = "eligible"
+	PublicationDisabled       PublicationState = "disabled"
+	PublicationAwaitingResult PublicationState = "awaiting_result"
+	PublicationAwaitingHuman  PublicationState = "awaiting_human"
+	PublicationEligible       PublicationState = "eligible"
 )
 
 type Overhead struct {
@@ -70,15 +60,14 @@ type AttemptView struct {
 }
 
 type ActivityView struct {
-	ID                 ActivityID        `json:"id"`
-	NodeID             NodeID            `json:"node_id"`
-	SessionID          SessionID         `json:"session_id"`
-	Generation         uint64            `json:"generation"`
-	ParentActivityID   ActivityID        `json:"parent_activity_id,omitempty"`
-	Status             ActivityStatus    `json:"status"`
-	DependencyBindings []ResultBinding   `json:"dependency_bindings,omitempty"`
-	ResultID           ResultID          `json:"result_id,omitempty"`
-	Verification       VerificationState `json:"verification"`
+	ID                 ActivityID      `json:"id"`
+	NodeID             NodeID          `json:"node_id"`
+	SessionID          SessionID       `json:"session_id"`
+	Generation         uint64          `json:"generation"`
+	ParentActivityID   ActivityID      `json:"parent_activity_id,omitempty"`
+	Status             ActivityStatus  `json:"status"`
+	DependencyBindings []ResultBinding `json:"dependency_bindings,omitempty"`
+	ResultID           ResultID        `json:"result_id,omitempty"`
 }
 
 type NodeStatus string
@@ -190,20 +179,18 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 }
 
 func projectActivity(state *State, activity *Activity) ActivityView {
-	view := ActivityView{ID: activity.ID, NodeID: activity.NodeID, SessionID: activity.SessionID, Generation: activity.Generation, ParentActivityID: activity.ParentActivityID, Status: ActivityQueued, DependencyBindings: append([]ResultBinding(nil), activity.DependencyBindings...), Verification: VerificationPending}
+	view := ActivityView{ID: activity.ID, NodeID: activity.NodeID, SessionID: activity.SessionID, Generation: activity.Generation, ParentActivityID: activity.ParentActivityID, Status: ActivityQueued, DependencyBindings: append([]ResultBinding(nil), activity.DependencyBindings...)}
 	// A provider-unavailable parent is superseded by its durable child Session.
 	// Keep the parent visible for lineage, but never return it to the scheduler.
 	if child := fallbackChildForActivity(state, activity.ID); child != nil {
 		childView := projectActivity(state, child)
 		view.Status = childView.Status
 		view.ResultID = childView.ResultID
-		view.Verification = childView.Verification
 		return view
 	}
 	result := resultForActivity(state, activity.ID)
 	if result != nil {
 		view.ResultID = result.ID
-		view.Verification = verificationFor(state, result.ID)
 		switch result.Status {
 		case "needs_human":
 			view.Status = ActivityNeedsHuman
@@ -309,26 +296,6 @@ func fallbackChildForActivity(state *State, parentID ActivityID) *Activity {
 	return child
 }
 
-func verificationFor(state *State, resultID ResultID) VerificationState {
-	verification := VerificationPending
-	for _, attestation := range state.Attestations {
-		if attestation.ResultID != resultID {
-			continue
-		}
-		switch attestation.Verdict {
-		case "blocked":
-			return VerificationBlocked
-		case "repair":
-			verification = VerificationRepair
-		case "pass":
-			if verification == VerificationPending {
-				verification = VerificationPass
-			}
-		}
-	}
-	return verification
-}
-
 func projectPublication(workflow *Workflow, state *State) PublicationState {
 	if !workflow.Finalizer.Enabled {
 		return PublicationDisabled
@@ -349,18 +316,6 @@ func projectPublication(workflow *Workflow, state *State) PublicationState {
 	}
 	if latest == nil {
 		return PublicationAwaitingResult
-	}
-	if workflow.Finalizer.RequireVerifier {
-		for nodeID := range workflow.Nodes {
-			node := workflow.Nodes[nodeID]
-			if node != nil && !node.SupersededAt.IsZero() {
-				continue
-			}
-			result := latestResultForNode(state, workflow.ID, nodeID)
-			if result == nil || verificationFor(state, result.ID) != VerificationPass {
-				return PublicationAwaitingVerifier
-			}
-		}
 	}
 	if workflow.Finalizer.RequireHuman {
 		return PublicationAwaitingHuman

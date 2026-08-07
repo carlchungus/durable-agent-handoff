@@ -35,21 +35,19 @@ func (f *runtimeCandidateFlags) Set(value string) error {
 }
 
 type executionStartRequest struct {
-	IdempotencyKey           string             `json:"idempotency_key"`
-	Goal                     string             `json:"goal"`
-	Prompt                   string             `json:"prompt"`
-	RemoteRoot               string             `json:"remote_root"`
-	Runtime                  string             `json:"runtime"`
-	ResumeID                 string             `json:"resume_id"`
-	Model                    string             `json:"model,omitempty"`
-	Effort                   string             `json:"effort,omitempty"`
-	Sandbox                  supervisor.Sandbox `json:"sandbox"`
-	Role                     string             `json:"role"`
-	FinalizerEnabled         bool               `json:"finalizer_enabled,omitempty"`
-	FinalizerRequiredChecks  []string           `json:"finalizer_required_checks,omitempty"`
-	FinalizerRequireHuman    bool               `json:"finalizer_require_human,omitempty"`
-	FinalizerRequireVerifier bool               `json:"finalizer_require_verifier,omitempty"`
-	FinalizerVerifiers       []string           `json:"finalizer_verifiers,omitempty"`
+	IdempotencyKey          string             `json:"idempotency_key"`
+	Goal                    string             `json:"goal"`
+	Prompt                  string             `json:"prompt"`
+	RemoteRoot              string             `json:"remote_root"`
+	Runtime                 string             `json:"runtime"`
+	ResumeID                string             `json:"resume_id"`
+	Model                   string             `json:"model,omitempty"`
+	Effort                  string             `json:"effort,omitempty"`
+	Sandbox                 supervisor.Sandbox `json:"sandbox"`
+	Role                    string             `json:"role"`
+	FinalizerEnabled        bool               `json:"finalizer_enabled,omitempty"`
+	FinalizerRequiredChecks []string           `json:"finalizer_required_checks,omitempty"`
+	FinalizerRequireHuman   bool               `json:"finalizer_require_human,omitempty"`
 }
 
 type executionStartResponse struct {
@@ -70,11 +68,6 @@ type pauseResponse struct {
 type replyResponse struct {
 	ActivityID ActivityIDResponse `json:"activity"`
 	Receipt    supervisor.Receipt `json:"receipt"`
-}
-
-type attestationResponse struct {
-	Attestation *supervisor.Attestation `json:"attestation"`
-	Receipt     supervisor.Receipt      `json:"receipt"`
 }
 
 type ActivityIDResponse struct {
@@ -110,7 +103,7 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 	goal := fs.String("goal", "", "desired work title")
 	runtimeName := fs.String("runtime", "", "codex, claude, or pi")
 	nativeSession := fs.String("session", "", "exact native runtime Session identity")
-	role := fs.String("role", "", "role ladder name, such as planner or verifier")
+	role := fs.String("role", "", "role ladder name, such as planner or release-check")
 	model := fs.String("model", "", "runtime model")
 	effort := fs.String("effort", "", "runtime reasoning effort")
 	sandbox := fs.String("sandbox", "workspace-write", "read-only or workspace-write")
@@ -118,13 +111,10 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 	key := fs.String("idempotency-key", "", "stable request identity")
 	finalizerEnabled := fs.Bool("finalizer-enabled", false, "enable the immutable github merge finalizer")
 	var requiredChecks runtimeCandidateFlags
-	fs.Var(&requiredChecks, "required-check", "required named finalizer check; repeat for each check")
+	fs.Var(&requiredChecks, "required-check", "required external GitHub check; repeat for each check")
 	requireHuman := fs.Bool("require-human", false, "require human approval before finalization")
-	requireVerifier := fs.Bool("require-verifier", false, "require an independent verifier before finalization")
-	var verifiers runtimeCandidateFlags
-	fs.Var(&verifiers, "verifier", "authorized independent verifier identity; repeat for each verifier")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--finalizer-enabled": false, "--required-check": true, "--require-human": false, "--require-verifier": false, "--verifier": true, "--json": false}
+	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--finalizer-enabled": false, "--required-check": true, "--require-human": false, "--json": false}
 	if err := rejectUnknownFlags(args, known); err != nil {
 		return err
 	}
@@ -159,7 +149,7 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 			Runtime:   supervisor.RuntimeSpec{Name: request.Runtime, Model: request.Model, Effort: request.Effort, Sandbox: request.Sandbox},
 			Root:      request.RemoteRoot,
 			Authority: supervisor.AuthoritySpec{RequestedBy: request.Role, HumanAuthorized: true, Sandbox: request.Sandbox},
-			Finalizer: supervisor.FinalizerSpec{Enabled: request.FinalizerEnabled, RequiredChecks: append([]string(nil), request.FinalizerRequiredChecks...), RequireHuman: request.FinalizerRequireHuman, RequireVerifier: request.FinalizerRequireVerifier, Verifiers: append([]string(nil), request.FinalizerVerifiers...)},
+			Finalizer: supervisor.FinalizerSpec{Enabled: request.FinalizerEnabled, RequiredChecks: append([]string(nil), request.FinalizerRequiredChecks...), RequireHuman: request.FinalizerRequireHuman},
 			Budget:    supervisor.DefaultBudget(), IdempotencyKey: request.IdempotencyKey,
 		}
 	} else {
@@ -223,7 +213,7 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 			Runtime:   supervisor.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort, Sandbox: supervisor.Sandbox(*sandbox)},
 			Root:      *root,
 			Authority: supervisor.AuthoritySpec{RequestedBy: *authorizedBy, HumanAuthorized: *authorizedBy != "", Sandbox: supervisor.Sandbox(*sandbox)},
-			Finalizer: supervisor.FinalizerSpec{Enabled: *finalizerEnabled, RequiredChecks: append([]string(nil), requiredChecks...), RequireHuman: *requireHuman, RequireVerifier: *requireVerifier, Verifiers: append([]string(nil), verifiers...)},
+			Finalizer: supervisor.FinalizerSpec{Enabled: *finalizerEnabled, RequiredChecks: append([]string(nil), requiredChecks...), RequireHuman: *requireHuman},
 			Budget:    supervisor.DefaultBudget(), IdempotencyKey: *key,
 		}
 	}
@@ -657,7 +647,7 @@ func cmdV2GitHub(args []string, out io.Writer) error {
 	key := fs.String("idempotency-key", "", "stable publication effect identity")
 	jsonOut := fs.Bool("json", false, "emit JSON")
 	var gates runtimeCandidateFlags
-	fs.Var(&gates, "gate", "exact required check name, repeat for each gate")
+	fs.Var(&gates, "gate", "exact required external GitHub check, repeat for each check")
 	if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true, "--execution": true, "--repo": true, "--pr": true, "--method": true, "--approved": false, "--idempotency-key": true, "--json": false, "--gate": true})); err != nil {
 		return err
 	}
@@ -676,49 +666,6 @@ func cmdV2GitHub(args []string, out io.Writer) error {
 		return writeJSON(out, result)
 	}
 	fmt.Fprintf(out, "finalization=%s state=%s merged=%t head=%s\n", result.FinalizationID, result.State, result.Merged, result.HeadSHA)
-	return nil
-}
-
-func cmdV2Attest(args []string, out io.Writer) error {
-	fs := flag.NewFlagSet("attest", flag.ContinueOnError)
-	state := common(fs)
-	resultID := fs.String("result", "", "exact immutable Result ID")
-	verifier := fs.String("verifier", "", "authorized independent verifier identity")
-	verdict := fs.String("verdict", "", "pass, repair, or blocked")
-	file := fs.String("file", "", "read the attestation summary from stdin; must be -")
-	key := fs.String("idempotency-key", "", "stable attestation identity")
-	jsonOut := fs.Bool("json", false, "emit JSON")
-	var evidenceIDs runtimeCandidateFlags
-	fs.Var(&evidenceIDs, "evidence", "exact evidence ID; repeat for each evidence item")
-	known := map[string]bool{"--state": true, "--result": true, "--verifier": true, "--verdict": true, "--file": true, "--idempotency-key": true, "--json": false, "--evidence": true}
-	if err := rejectUnknownFlags(args, known); err != nil {
-		return err
-	}
-	if err := fs.Parse(reorderFlags(args, known)); err != nil {
-		return err
-	}
-	if *file != "-" || fs.NArg() != 0 {
-		return errors.New("attest requires --file - and no positional arguments; summary input is stdin-only")
-	}
-	summary, err := readRequiredStdin("attestation summary")
-	if err != nil {
-		return err
-	}
-	store, err := openV2(*state)
-	if err != nil {
-		return err
-	}
-	attestation, receipt, err := store.RecordAttestation(context.Background(), supervisor.RecordAttestationInput{
-		ResultID: supervisor.ResultID(*resultID), Verifier: *verifier, Verdict: *verdict, Summary: summary,
-		EvidenceIDs: append([]string(nil), evidenceIDs...), IdempotencyKey: *key,
-	})
-	if err != nil {
-		return err
-	}
-	if *jsonOut {
-		return writeJSON(out, attestationResponse{Attestation: attestation, Receipt: receipt})
-	}
-	fmt.Fprintf(out, "attestation=%s result=%s verifier=%s sequence=%d existing=%t\n", attestation.ID, attestation.ResultID, attestation.Verifier, receipt.Sequence, receipt.Existing)
 	return nil
 }
 

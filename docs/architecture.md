@@ -187,7 +187,7 @@ queued continuation waits instead of overlapping an already-running successor.
 ## Pure projections
 
 The reducer is the only lifecycle interpretation. `status`, list, queue, TUI,
-health, meaningful progress, verifier/repair state, publication eligibility,
+health, meaningful progress, publication eligibility,
 and orchestration overhead all use the same State.
 
 Queries are read-only. Time-sensitive views accept an explicit `asOf` value;
@@ -199,18 +199,23 @@ overhead is derived from persisted milestone timestamps:
 - `turn_started` to first `meaningful_progress`.
 
 Publication is an authority-owned durable effect. The projection derives
-whether a finalizer is disabled, awaiting a Result, awaiting an independent
-passing verifier, awaiting human authorization, or eligible. `PrepareFinalization`
-records the exact PR/head/named-gate decision before an argv-only GitHub merge;
-`SettleFinalization` records merged or blocked outcome so retries after a crash
-remain idempotent and changed heads fail closed.
+whether a finalizer is disabled, awaiting a Result, awaiting configured human
+authorization, or eligible for its external-check gate. `PrepareFinalization`
+records the exact PR/head/named-check decision before an argv-only GitHub merge;
+the finalizer then rechecks the independently hosted GitHub checks on that
+unchanged head. `SettleFinalization` records merged or blocked outcome so
+retries after a crash remain idempotent and changed heads fail closed.
 
 ## Policy and trust boundaries
 
 - The Supervisor root is private and outside worker-writable sandboxes.
 - Paths are canonicalized before authority checks or Lease keys are created.
 - An authority envelope may narrow but never widen a runtime sandbox.
-- Enabled finalization requires explicit human and independent-verifier gates.
+- Enabled finalization requires a nonempty canonical exact set of external
+  GitHub checks; human approval is independently optional.
+- Independently hosted CI and GitHub checks are the verification authority.
+  Handoff does not pretend that same-UID workers can authenticate their own
+  Results.
 - Privileged Git/GitHub execution uses argv, never a shell.
 - Proposals and imported State are validated against a clone before journal
   mutation.

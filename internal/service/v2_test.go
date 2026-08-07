@@ -31,8 +31,23 @@ func TestInstallV2UnitContainsNoPromptOrEnvironmentValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(raw)
-	if filepath.Base(path) != "handoff.service" || !strings.Contains(text, "Supervisor v2") || !strings.Contains(text, "--trust-mode full") || !strings.Contains(text, "--environment-json /private/env.json") || strings.Contains(text, "prompt") {
+	if filepath.Base(path) != "handoff.service" || !strings.Contains(text, "Supervisor v2") || !strings.Contains(text, "--trust-mode full") || !strings.Contains(text, "--environment-json /private/env.json") || !strings.Contains(text, filepath.Join(home, ".local", "bin")) || strings.Contains(text, "prompt") {
 		t.Fatalf("unit=%s", text)
+	}
+}
+
+func TestInstallV2LaunchAgentContainsUserWorkerPath(t *testing.T) {
+	home := t.TempDir()
+	path, err := installV2For("darwin", home, "/opt/handoff", "/state", "", driver.TrustWorkspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := string(raw); !strings.Contains(text, "<key>EnvironmentVariables</key>") || !strings.Contains(text, filepath.Join(home, ".local", "bin")) {
+		t.Fatalf("launch agent omitted user worker path: %s", text)
 	}
 }
 

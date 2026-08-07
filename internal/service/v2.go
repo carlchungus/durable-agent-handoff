@@ -364,6 +364,7 @@ func InstallV2(binary, state, environmentJSON string, trustMode driver.TrustMode
 
 func installV2For(goos, home, binary, state, environmentJSON string, trustMode driver.TrustMode) (string, error) {
 	args := "serve --state " + systemd(state) + " --trust-mode " + systemd(string(trustMode))
+	workerPath := filepath.Join(home, ".local", "bin") + string(os.PathListSeparator) + "/usr/local/bin" + string(os.PathListSeparator) + "/usr/bin" + string(os.PathListSeparator) + "/bin" + string(os.PathListSeparator) + "/usr/sbin" + string(os.PathListSeparator) + "/sbin"
 	if environmentJSON != "" {
 		args += " --environment-json " + systemd(environmentJSON)
 	}
@@ -378,7 +379,7 @@ func installV2For(goos, home, binary, state, environmentJSON string, trustMode d
 		if environmentJSON != "" {
 			body += fmt.Sprintf("<string>--environment-json</string><string>%s</string>", xml(environmentJSON))
 		}
-		body += "</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n"
+		body += fmt.Sprintf("</array><key>EnvironmentVariables</key><dict><key>PATH</key><string>%s</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n", xml(workerPath))
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			return "", err
 		}
@@ -389,7 +390,7 @@ func installV2For(goos, home, binary, state, environmentJSON string, trustMode d
 			return "", err
 		}
 		path := filepath.Join(dir, "handoff.service")
-		body := fmt.Sprintf("[Unit]\nDescription=Durable agent handoff Supervisor v2\n\n[Service]\nExecStart=%s %s\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n", systemd(binary), args)
+		body := fmt.Sprintf("[Unit]\nDescription=Durable agent handoff Supervisor v2\n\n[Service]\nEnvironment=PATH=%s\nExecStart=%s %s\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n", systemd(workerPath), systemd(binary), args)
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			return "", err
 		}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/supervisor"
@@ -43,6 +44,13 @@ func TestOpenRouterEvaluatorUsesFreshToollessStructuredRequest(t *testing.T) {
 	}
 	if captured["model"] != "deepseek/deepseek-v4-flash-0731" {
 		t.Fatalf("model=%v", captured["model"])
+	}
+	messages, err := json.Marshal(captured["messages"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(messages), "cannot widen worker authority") {
+		t.Fatalf("evaluator prompt omitted immutable authority semantics: %s", messages)
 	}
 	tools, ok := captured["tools"].([]any)
 	if !ok || len(tools) != 0 {

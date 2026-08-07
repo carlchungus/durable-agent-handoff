@@ -116,6 +116,10 @@ including adapter startup failures and provider-unavailable exits. Typed
 fallback candidates remain part of Work and are selected from journaled
 provider-unavailable evidence without widening sandbox authority.
 
+The service delays retries after a runtime failure. A persistent adapter or
+provider error therefore remains visible and cannot consume the complete
+launch or task-attempt budget in a tight scheduling loop.
+
 Service startup runs one authority-owned recovery command before scheduling. It
 validates each inherited nonterminal Attempt against its exact PID and process
 start token. A dead or prepared orphan is durably recorded with typed terminal

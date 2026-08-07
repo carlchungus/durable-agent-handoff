@@ -208,6 +208,8 @@ values are never serialized into a service unit. Drivers apply trust flags
 themselves and execute provider argv directly, without shell wrappers.
 Service cancellation waits for all active executor goroutines to record their
 terminal milestones and release their exact Leases before returning.
+Failed runtime launches are retried only after the service retry delay; the
+same queued Activity remains durable during that delay.
 
 ## One-way migration
 

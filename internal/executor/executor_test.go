@@ -16,6 +16,25 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/supervisor"
 )
 
+func TestResultSchemaRequiresEveryDeclaredProperty(t *testing.T) {
+	var schema struct {
+		Required   []string                   `json:"required"`
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(resultSchema), &schema); err != nil {
+		t.Fatal(err)
+	}
+	required := make(map[string]bool, len(schema.Required))
+	for _, name := range schema.Required {
+		required[name] = true
+	}
+	for name := range schema.Properties {
+		if !required[name] {
+			t.Fatalf("strict response schema property %q is not required", name)
+		}
+	}
+}
+
 type testDriver struct{}
 
 func (testDriver) Name() string { return "test" }

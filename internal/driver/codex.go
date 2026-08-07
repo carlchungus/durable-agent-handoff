@@ -103,6 +103,22 @@ func (d *codexDecoder) DecodeLine(raw []byte) ([]supervisor.Milestone, error) {
 		if providerUnavailable(envelope.Error.Code) {
 			return []supervisor.Milestone{{Kind: supervisor.MilestoneProviderUnavailable, Failure: envelope.Error.Message, SourceType: envelope.Type}}, nil
 		}
+		message := strings.TrimSpace(envelope.Error.Message)
+		if message == "" {
+			message = strings.TrimSpace(envelope.Message)
+		}
+		if message != "" {
+			return nil, fmt.Errorf("Codex runtime error: %s", message)
+		}
+	case "turn.failed":
+		message := strings.TrimSpace(envelope.Error.Message)
+		if message == "" {
+			message = strings.TrimSpace(envelope.Message)
+		}
+		if message == "" {
+			message = "turn failed without an error message"
+		}
+		return nil, fmt.Errorf("Codex turn failed: %s", message)
 	}
 	return nil, nil
 }

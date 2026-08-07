@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -340,7 +341,17 @@ func TestExecutorHonorsExternallyAppliedControlWithoutSecondStartupControl(t *te
 		t.Fatal(err)
 	}
 	if _, _, err = store.ApplyControl(context.Background(), supervisor.ApplyControlInput{ControlID: control.ID, ActivityID: execution.FirstActivity, ExpectedGeneration: 1, AttemptID: attempt.ID, IdempotencyKey: "external-stop-applied"}); err != nil {
-		t.Fatal(err)
+		if !errors.Is(err, supervisor.ErrFenced) {
+			t.Fatal(err)
+		}
+		state, projectionErr := store.Projection()
+		var applied *supervisor.Control
+		if state != nil {
+			applied = state.Controls[control.ID]
+		}
+		if projectionErr != nil || applied == nil || applied.AppliedAt.IsZero() {
+			t.Fatalf("external control was fenced before the exact control was applied: err=%v projection=%v control=%+v", err, projectionErr, applied)
+		}
 	}
 	if err = <-done; err == nil {
 		t.Fatal("externally stopped process unexpectedly completed")

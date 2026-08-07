@@ -155,6 +155,64 @@ func TestStatusListReplyAndPauseUseSupervisorProjection(t *testing.T) {
 	}
 }
 
+func TestReplyWorkflowNodeCompatibilityRoute(t *testing.T) {
+	stateRoot, worktree := t.TempDir(), t.TempDir()
+	if err := os.Chmod(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if err := runWithPrompt(t, []string{"start", "--state", stateRoot, "--root", worktree, "--runtime", "codex", "--session", "exact-reply-session", "--file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "reply-workflow-node-start", "--json"}, "work", &out, &errOut); err != nil {
+		t.Fatalf("start: %v stderr=%s", err, errOut.String())
+	}
+	var response struct {
+		Execution supervisor.Execution `json:"execution"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	store, err := supervisor.Open(stateRoot, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	activity := state.Activities[response.Execution.FirstActivity]
+	if activity == nil {
+		t.Fatal("missing predecessor activity")
+	}
+	attempt, _, err := store.PrepareAttempt(context.Background(), supervisor.PrepareAttemptInput{
+		ActivityID: activity.ID, ExpectedGeneration: activity.Generation, Runtime: supervisor.RuntimeSpec{Name: "codex", Sandbox: supervisor.SandboxReadOnly}, CommandDigest: "reply-workflow-node-command", Outputs: supervisor.OutputIdentity{Stdout: "reply-workflow-node-stdout", Stderr: "reply-workflow-node-stderr"}, IdempotencyKey: "reply-workflow-node-attempt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, milestone := range []supervisor.Milestone{
+		{Kind: supervisor.MilestoneProcessSpawned, Process: &supervisor.ProcessIdentity{PID: 55, StartToken: "reply-workflow-node-process"}},
+		{Kind: supervisor.MilestoneTurnStarted},
+		{Kind: supervisor.MilestoneResult, Result: &supervisor.WorkerResult{Status: "completed", Summary: "workflow node predecessor"}},
+		{Kind: supervisor.MilestoneExit, Exit: &supervisor.Exit{Code: 0}},
+	} {
+		if _, err := store.RecordMilestone(context.Background(), supervisor.RecordMilestoneInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, AttemptID: attempt.ID, LeaseID: attempt.LeaseID, Milestone: milestone, IdempotencyKey: "reply-workflow-node-" + string(milestone.Kind)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out.Reset()
+	if err := runWithPrompt(t, []string{"reply", "--state", stateRoot, "--workflow", string(response.Execution.WorkflowID), "--activity", string(response.Execution.RootNodeID), "--file", "-", "--json"}, "workflow node continuation", &out, &errOut); err != nil {
+		t.Fatalf("workflow/node reply route: %v stderr=%s", err, errOut.String())
+	}
+	var continuation struct {
+		Activity struct {
+			ID supervisor.ActivityID `json:"id"`
+		} `json:"activity"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &continuation); err != nil || continuation.Activity.ID == "" || strings.Contains(out.String(), "workflow node continuation") {
+		t.Fatalf("workflow/node reply response=%s err=%v", out.String(), err)
+	}
+}
+
 func TestPreferenceLadderIsJournaledAndOrdinaryStartUsesChildFallbacks(t *testing.T) {
 	state, root := t.TempDir(), t.TempDir()
 	if err := os.Chmod(state, 0o700); err != nil {

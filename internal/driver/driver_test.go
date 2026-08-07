@@ -1,7 +1,10 @@
 package driver
 
 import (
+	"bufio"
 	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -117,8 +120,11 @@ func TestClaudeAndPiContractResultCompletesOrdinaryWork(t *testing.T) {
 			`{"type":"assistant","message":{"content":[{"type":"text","text":` + encodedResult + `}]}}`,
 		}},
 		{name: "pi", decoder: Pi{}.NewDecoder(), lines: []string{
+			`{"type":"session","version":3,"id":"pi-contract-session"}`,
+			`{"type":"agent_start"}`,
 			`{"type":"turn_start"}`,
-			`{"type":"message_update","text":` + encodedResult + `}`,
+			`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"working"}}`,
+			`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":` + encodedResult + `}]}}`,
 		}},
 	}
 	for _, test := range tests {
@@ -247,9 +253,116 @@ func TestClaudeDecoderEmitsTypedTurnEffectProgressAndOneResult(t *testing.T) {
 
 func TestPiDecoderClassifiesPreTurnStartupFailure(t *testing.T) {
 	decoder := Pi{}.NewDecoder()
-	milestones, err := decoder.DecodeLine([]byte(`{"type":"error","code":"auth","error":"adapter config died"}`))
+	milestones, err := decoder.DecodeLine([]byte(`{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"adapter config died"}}`))
 	if err != nil || len(milestones) != 1 || milestones[0].Kind != supervisor.MilestoneAdapterStartFailed {
 		t.Fatalf("milestones=%+v err=%v", milestones, err)
+	}
+}
+
+func TestPiProviderFixturesCompleteNewAndExactResumeThroughStdinContract(t *testing.T) {
+	tests := []struct {
+		name       string
+		fixture    string
+		sessionID  string
+		wantNative string
+		wantResult string
+	}{
+		{name: "new", fixture: "pi-new-session.jsonl", wantNative: "pi-new-session", wantResult: "new Pi work finished"},
+		{name: "exact resume", fixture: "pi-exact-resume.jsonl", sessionID: "pi-exact-resume", wantNative: "pi-exact-resume", wantResult: "exact Pi resume finished"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := launchRequest("pi")
+			request.Prompt = "provider-realistic prompt stays on stdin"
+			request.Session.ID = test.sessionID
+			launch, err := (Pi{}).Build(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !launch.PromptOnStdin || strings.Contains(strings.Join(launch.Args, "\x00"), request.Prompt) || !strings.Contains(launch.Prompt, completionContract) {
+				t.Fatalf("Pi prompt contract escaped stdin: launch=%+v", launch)
+			}
+			if test.sessionID == "" && strings.Contains(strings.Join(launch.Args, " "), "--session") {
+				t.Fatalf("new Pi launch selected a resume identity: %v", launch.Args)
+			}
+			if test.sessionID != "" && !strings.Contains(strings.Join(launch.Args, " "), "--session "+test.sessionID) {
+				t.Fatalf("Pi launch did not resume exact identity: %v", launch.Args)
+			}
+
+			file, err := os.Open(filepath.Join("testdata", test.fixture))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			decoder := Pi{}.NewDecoder()
+			var bound string
+			var progress, effects, results int
+			var summary string
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				milestones, decodeErr := decoder.DecodeLine(scanner.Bytes())
+				if decodeErr != nil {
+					t.Fatalf("decode %q: %v", scanner.Text(), decodeErr)
+				}
+				for _, milestone := range milestones {
+					switch milestone.Kind {
+					case supervisor.MilestoneSessionBound:
+						bound = milestone.Session.ID
+					case supervisor.MilestoneMeaningfulProgress:
+						progress++
+					case supervisor.MilestoneEffectStarted:
+						effects++
+					case supervisor.MilestoneResult:
+						results++
+						summary = milestone.Result.Summary
+					}
+				}
+			}
+			if err := scanner.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if bound != test.wantNative || progress == 0 || (test.sessionID == "" && effects != 1) || results != 1 || summary != test.wantResult {
+				t.Fatalf("Pi fixture milestones bound=%q progress=%d effects=%d results=%d summary=%q", bound, progress, effects, results, summary)
+			}
+		})
+	}
+}
+
+func TestPiDecoderUsesOnlyDocumentedNestedResultAndSessionFields(t *testing.T) {
+	decoder := Pi{}.NewDecoder()
+	if milestones, err := decoder.DecodeLine([]byte(`{"type":"session","session_id":"invented"}`)); err == nil || len(milestones) != 0 {
+		t.Fatalf("invented Pi session field was accepted: milestones=%+v err=%v", milestones, err)
+	}
+	if milestones, err := decoder.DecodeLine([]byte(`{"type":"message_update","text":"{\"status\":\"completed\",\"summary\":\"fake\"}"}`)); err != nil || len(milestones) != 0 {
+		t.Fatalf("invented top-level Pi result field was decoded: milestones=%+v err=%v", milestones, err)
+	}
+	if milestones, err := decoder.DecodeLine([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"nested progress"}}`)); err != nil || len(milestones) != 0 {
+		t.Fatalf("progress before a turn was accepted: milestones=%+v err=%v", milestones, err)
+	}
+	if milestones, err := decoder.DecodeLine([]byte(`{"type":"turn_start"}`)); err != nil || len(milestones) != 1 || milestones[0].Kind != supervisor.MilestoneTurnStarted {
+		t.Fatalf("turn=%+v err=%v", milestones, err)
+	}
+	if milestones, err := decoder.DecodeLine([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"nested progress"}}`)); err != nil || len(milestones) != 1 || milestones[0].Kind != supervisor.MilestoneMeaningfulProgress {
+		t.Fatalf("nested progress=%+v err=%v", milestones, err)
+	}
+	if milestones, err := decoder.DecodeLine([]byte(`{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"fake\"}"}]}}`)); err != nil || len(milestones) != 0 {
+		t.Fatalf("non-assistant authoritative message was decoded: milestones=%+v err=%v", milestones, err)
+	}
+}
+
+func TestPiDecoderUsesAgentEndMessagesAsAuthoritativeResult(t *testing.T) {
+	decoder := Pi{}.NewDecoder()
+	for _, line := range []string{
+		`{"type":"session","version":3,"id":"pi-agent-end"}`,
+		`{"type":"turn_start"}`,
+	} {
+		if _, err := decoder.DecodeLine([]byte(line)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	milestones, err := decoder.DecodeLine([]byte(`{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"prompt"}]},{"role":"assistant","content":[{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"agent end finished\"}"}],"stopReason":"stop"}],"willRetry":false}`))
+	if err != nil || len(milestones) != 1 || milestones[0].Kind != supervisor.MilestoneResult || milestones[0].Result.Summary != "agent end finished" {
+		t.Fatalf("agent_end milestones=%+v err=%v", milestones, err)
 	}
 }
 

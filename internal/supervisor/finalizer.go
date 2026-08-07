@@ -86,6 +86,10 @@ func (c prepareFinalizationCommand) decide(state *State, now time.Time) ([]Domai
 	if workflow == nil || !workflow.Finalizer.Enabled {
 		return nil, "", errors.New("finalizer is disabled")
 	}
+	gates, err := exactFinalizerChecks(in.Gates, workflow.Finalizer.RequiredChecks)
+	if err != nil {
+		return nil, "", err
+	}
 	if workflow.Finalizer.RequireHuman && !in.HumanApproved {
 		return nil, "", errors.New("finalizer requires explicit human approval")
 	}
@@ -100,7 +104,6 @@ func (c prepareFinalizationCommand) decide(state *State, now time.Time) ([]Domai
 	if view.Publication != PublicationEligible && !(view.Publication == PublicationAwaitingHuman && in.HumanApproved) {
 		return nil, "", fmt.Errorf("publication is not eligible: %s", view.Publication)
 	}
-	gates := append([]string(nil), in.Gates...)
 	finalizationID := stableID("finalization", in.IdempotencyKey)
 	finalization := &Finalization{ID: finalizationID, ExecutionID: in.ExecutionID, WorkflowID: execution.WorkflowID, IdempotencyKey: in.IdempotencyKey, Repository: in.Repository, PullRequest: in.PullRequest, Gates: gates, Method: method, HumanApproved: in.HumanApproved, HeadSHA: in.HeadSHA, PRURL: in.PRURL, State: FinalizationPrepared, PreparedAt: now}
 	return []DomainEvent{mustEvent(eventFinalizationPrepared, finalizationPreparedEvent{Finalization: finalization})}, finalizationID, nil
@@ -181,12 +184,14 @@ func (s *Store) Finalize(ctx context.Context, request FinalizationRequest, runne
 	}
 	finalizationID := stableID("finalization", request.IdempotencyKey)
 	finalization := state.Finalizations[finalizationID]
-	gates := append([]string(nil), request.Gates...)
-	if len(gates) == 0 {
-		gates = append(gates, workflow.Finalizer.RequiredChecks...)
+	requestedGates := append([]string(nil), request.Gates...)
+	if len(requestedGates) == 0 {
+		requestedGates = append(requestedGates, workflow.Finalizer.RequiredChecks...)
 	}
-	sort.Strings(gates)
-	gates = uniqueStrings(gates)
+	gates, err := exactFinalizerChecks(requestedGates, workflow.Finalizer.RequiredChecks)
+	if err != nil {
+		return FinalizationResult{}, err
+	}
 	if finalization != nil && (finalization.ExecutionID != request.ExecutionID || finalization.Repository != request.Repository || finalization.PullRequest != request.PullRequest || finalization.Method != fallbackMethod(request.Method) || finalization.HumanApproved != request.HumanApproved || !sameStrings(finalization.Gates, gates)) {
 		return FinalizationResult{}, fmt.Errorf("%w: divergent finalization request", ErrIdempotencyConflict)
 	}
@@ -236,6 +241,32 @@ func sameStrings(left, right []string) bool {
 	sort.Strings(copyLeft)
 	sort.Strings(copyRight)
 	return fmt.Sprint(copyLeft) == fmt.Sprint(copyRight)
+}
+
+func exactFinalizerChecks(requested, configured []string) ([]string, error) {
+	if len(configured) == 0 {
+		return nil, errors.New("finalizer requires configured named checks")
+	}
+	if len(requested) == 0 {
+		return nil, errors.New("finalization requires the configured named checks")
+	}
+	seen := make(map[string]struct{}, len(requested))
+	for _, gate := range requested {
+		if strings.TrimSpace(gate) == "" {
+			return nil, errors.New("finalization gates must be non-empty")
+		}
+		if _, ok := seen[gate]; ok {
+			return nil, errors.New("finalization gates must not contain duplicates")
+		}
+		seen[gate] = struct{}{}
+	}
+	canonical := append([]string(nil), configured...)
+	sort.Strings(canonical)
+	canonical = uniqueStrings(canonical)
+	if !sameStrings(requested, canonical) {
+		return nil, fmt.Errorf("finalization gates must exactly match configured checks: want %v", canonical)
+	}
+	return canonical, nil
 }
 
 func (s *Store) settleFinalizationResult(ctx context.Context, finalization *Finalization, status FinalizationState, summary, url string, effectErr error) (FinalizationResult, error) {

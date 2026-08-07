@@ -83,6 +83,58 @@ func prepareEligibleFinalization(t *testing.T, store *Store, worktree, key strin
 	return execution, prepared
 }
 
+func TestFinalizerRequiredChecksCannotBeOverridden(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	checks := []string{"lint", "verify"}
+	execution, _, err := store.StartExecution(context.Background(), StartExecutionInput{
+		NativeSession: NativeSessionIdentity{Runtime: "claude", ID: "finalizer-check-policy-session"}, Prompt: "finalize", Goal: "ship",
+		Runtime: RuntimeSpec{Name: "claude", Sandbox: SandboxWorkspaceWrite}, Root: worktree,
+		Authority: AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite},
+		Finalizer: FinalizerSpec{Enabled: true, RequiredChecks: checks, RequireHuman: true, RequireVerifier: true, Verifiers: []string{"independent"}},
+		Budget:    DefaultBudget(), IdempotencyKey: "finalizer-check-policy-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := store.Projection()
+	result := completeActivity(t, store, state.Activities[execution.FirstActivity], "finalizer-check-policy-result")
+	if _, _, err = store.RecordAttestation(context.Background(), RecordAttestationInput{ResultID: result.ID, Verifier: "independent", Verdict: "pass", Summary: "independent pass", IdempotencyKey: "finalizer-check-policy-attestation"}); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name  string
+		gates []string
+	}{
+		{name: "omitted", gates: nil},
+		{name: "substituted", gates: []string{"lint", "other"}},
+		{name: "duplicate", gates: []string{"lint", "verify", "lint"}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, err := store.PrepareFinalization(context.Background(), PrepareFinalizationInput{
+				ExecutionID: execution.ID, Repository: "o/r", PullRequest: "7", Gates: test.gates, Method: "squash", HumanApproved: true, HeadSHA: "abc123", PRURL: "https://example/pr/7", IdempotencyKey: "finalizer-check-policy-" + test.name,
+			})
+			if err == nil {
+				t.Fatalf("weaker check set was accepted: %v", test.gates)
+			}
+		})
+	}
+
+	prepared, _, err := store.PrepareFinalization(context.Background(), PrepareFinalizationInput{
+		ExecutionID: execution.ID, Repository: "o/r", PullRequest: "7", Gates: []string{"verify", "lint"}, Method: "squash", HumanApproved: true, HeadSHA: "abc123", PRURL: "https://example/pr/7", IdempotencyKey: "finalizer-check-policy-exact",
+	})
+	if err != nil || !reflect.DeepEqual(prepared.Gates, checks) {
+		t.Fatalf("canonical configured checks were not retained: prepared=%+v err=%v", prepared, err)
+	}
+
+	runner := &finalizerRunner{}
+	_, err = store.Finalize(context.Background(), FinalizationRequest{ExecutionID: execution.ID, Repository: "o/r", PullRequest: "7", Gates: []string{"verify"}, HumanApproved: true, IdempotencyKey: "finalizer-check-policy-weaker"}, runner)
+	if err == nil || len(runner.calls) != 0 {
+		t.Fatalf("Finalize accepted or inspected with weaker caller gates: err=%v calls=%v", err, runner.calls)
+	}
+}
+
 func TestFinalizerCrashAfterPreparedSettlementIsIdempotent(t *testing.T) {
 	store, stateRoot, worktree := openTestStore(t, Options{})
 	execution, prepared := prepareEligibleFinalization(t, store, worktree, "finalizer-crash")

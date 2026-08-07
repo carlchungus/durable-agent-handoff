@@ -142,8 +142,8 @@ func validateStartInput(in StartExecutionInput) error {
 	if in.Budget.MaxTaskAttempts < 1 || in.Budget.MaxLaunches < in.Budget.MaxTaskAttempts {
 		return errors.New("budget requires positive task attempts and at least as many OS launches")
 	}
-	if in.Finalizer.Enabled && (!in.Finalizer.RequireHuman || !in.Finalizer.RequireVerifier || len(in.Finalizer.Verifiers) == 0) {
-		return errors.New("enabled finalizer requires human and independent verifier gates")
+	if in.Finalizer.Enabled && (!in.Finalizer.RequireHuman || !in.Finalizer.RequireVerifier || len(in.Finalizer.Verifiers) == 0 || len(in.Finalizer.RequiredChecks) == 0) {
+		return errors.New("enabled finalizer requires human, independent verifier, and named check gates")
 	}
 	allowed := false
 	for _, root := range in.Authority.AllowedRoots {

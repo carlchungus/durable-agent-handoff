@@ -821,7 +821,7 @@ func cmdV2Reply(args []string, out io.Writer) error {
 	from := fs.String("from", "human", "requesting identity")
 	key := fs.String("idempotency-key", "", "stable request identity")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	known := map[string]bool{"--state": true, "--execution": true, "--session": true, "--activity": true, "--file": true, "--from": true, "--idempotency-key": true, "--json": false}
+	known := map[string]bool{"--state": true, "--execution": true, "--workflow": true, "--session": true, "--activity": true, "--file": true, "--from": true, "--idempotency-key": true, "--json": false}
 	if err := rejectUnknownFlags(args, known); err != nil {
 		return err
 	}

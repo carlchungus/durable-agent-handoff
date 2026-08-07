@@ -8,18 +8,16 @@ import "time"
 const SchemaVersion = 2
 
 type (
-	ExecutionID  string
-	WorkflowID   string
-	NodeID       string
-	SessionID    string
-	ActivityID   string
-	AttemptID    string
-	ResultID     string
-	ClaimID      string
-	EvaluationID string
-	MessageID    string
-	ControlID    string
-	LeaseID      string
+	ExecutionID string
+	WorkflowID  string
+	NodeID      string
+	SessionID   string
+	ActivityID  string
+	AttemptID   string
+	ResultID    string
+	MessageID   string
+	ControlID   string
+	LeaseID     string
 )
 
 type Sandbox string
@@ -65,15 +63,6 @@ type Budget struct {
 	MaxLaunches int `json:"max_launches"`
 }
 
-// AutonomySpec turns a one-shot Activity into an evaluator-controlled goal.
-// Worker terminal claims are not Results until a fresh, tool-less evaluator
-// accepts them or creates an exact-session continuation.
-type AutonomySpec struct {
-	Enabled        bool   `json:"enabled,omitempty"`
-	EvaluatorModel string `json:"evaluator_model,omitempty"`
-	MaxTurns       int    `json:"max_turns,omitempty"`
-}
-
 func DefaultBudget() Budget { return Budget{MaxTaskAttempts: 3, MaxLaunches: 12} }
 
 type WorkSpec struct {
@@ -96,16 +85,20 @@ type Execution struct {
 }
 
 type Workflow struct {
-	ID        WorkflowID       `json:"id"`
-	Root      string           `json:"root"`
-	Role      string           `json:"role,omitempty"`
-	Authority AuthoritySpec    `json:"authority"`
-	Finalizer FinalizerSpec    `json:"finalizer"`
-	Budget    Budget           `json:"budget"`
-	Autonomy  AutonomySpec     `json:"autonomy,omitempty"`
-	Nodes     map[NodeID]*Node `json:"nodes"`
-	Order     []NodeID         `json:"order"`
-	CreatedAt time.Time        `json:"created_at"`
+	ID        WorkflowID    `json:"id"`
+	Root      string        `json:"root"`
+	Role      string        `json:"role,omitempty"`
+	Authority AuthoritySpec `json:"authority"`
+	Finalizer FinalizerSpec `json:"finalizer"`
+	Budget    Budget        `json:"budget"`
+	// EvaluatorModel and MaxTurns make this a goal that keeps running until a
+	// decision says it is done. Empty values preserve one-shot behavior.
+	EvaluatorModel string           `json:"evaluator_model,omitempty"`
+	MaxTurns       int              `json:"max_turns,omitempty"`
+	OldGoal        *oldGoalSettings `json:"autonomy,omitempty"`
+	Nodes          map[NodeID]*Node `json:"nodes"`
+	Order          []NodeID         `json:"order"`
+	CreatedAt      time.Time        `json:"created_at"`
 }
 
 // Node is desired work. It intentionally has no attempt, session, process,
@@ -256,24 +249,13 @@ type Result struct {
 	Summary     string     `json:"summary"`
 	BlockerKind string     `json:"blocker_kind,omitempty"`
 	Question    string     `json:"question,omitempty"`
+	Decision    string     `json:"decision,omitempty"`
+	DecidedBy   string     `json:"decided_by,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
 }
 
-// Claim is a worker's untrusted terminal assertion. Autonomous workflows keep
-// it separate from Result so downstream work and publication cannot treat the
-// worker as its own verifier.
-type Claim struct {
-	ID         ClaimID      `json:"id"`
-	WorkflowID WorkflowID   `json:"workflow_id"`
-	NodeID     NodeID       `json:"node_id"`
-	ActivityID ActivityID   `json:"activity_id"`
-	AttemptID  AttemptID    `json:"attempt_id"`
-	Generation uint64       `json:"generation"`
-	Result     WorkerResult `json:"result"`
-	CreatedAt  time.Time    `json:"created_at"`
-}
-
-type EvaluationDecision struct {
+// TurnDecision is the small model's decision after one worker turn.
+type TurnDecision struct {
 	Outcome     string `json:"outcome"`
 	Reason      string `json:"reason"`
 	Model       string `json:"model"`
@@ -281,11 +263,12 @@ type EvaluationDecision struct {
 	Question    string `json:"question,omitempty"`
 }
 
-type Evaluation struct {
-	ID        EvaluationID       `json:"id"`
-	ClaimID   ClaimID            `json:"claim_id"`
-	Decision  EvaluationDecision `json:"decision"`
-	CreatedAt time.Time          `json:"created_at"`
+// oldGoalSettings reads journals written before goal settings were flattened.
+// New events never write this field.
+type oldGoalSettings struct {
+	Enabled        bool   `json:"enabled,omitempty"`
+	EvaluatorModel string `json:"evaluator_model,omitempty"`
+	MaxTurns       int    `json:"max_turns,omitempty"`
 }
 
 type Pause struct {
@@ -377,8 +360,6 @@ type State struct {
 	Activities    map[ActivityID]*Activity     `json:"activities"`
 	Attempts      map[AttemptID]*Attempt       `json:"attempts"`
 	Results       map[ResultID]*Result         `json:"results"`
-	Claims        map[ClaimID]*Claim           `json:"claims"`
-	Evaluations   map[EvaluationID]*Evaluation `json:"evaluations"`
 	Messages      map[MessageID]*Message       `json:"messages"`
 	Leases        map[LeaseID]*Lease           `json:"leases"`
 	Controls      map[ControlID]*Control       `json:"controls"`
@@ -395,7 +376,6 @@ func emptyState() *State {
 		Executions: make(map[ExecutionID]*Execution), Workflows: make(map[WorkflowID]*Workflow),
 		Sessions: make(map[SessionID]*Session), Activities: make(map[ActivityID]*Activity),
 		Attempts: make(map[AttemptID]*Attempt), Results: make(map[ResultID]*Result),
-		Claims: make(map[ClaimID]*Claim), Evaluations: make(map[EvaluationID]*Evaluation),
 		Messages: make(map[MessageID]*Message), Leases: make(map[LeaseID]*Lease),
 		Controls: make(map[ControlID]*Control), Pauses: make(map[WorkflowID]*Pause), Finalizations: make(map[string]*Finalization), RoleLadders: make(map[string][]RuntimeSpec), Idempotency: make(map[string]IdempotencyRecord),
 		LegacyImports: make(map[string]LegacyImport),

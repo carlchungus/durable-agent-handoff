@@ -18,8 +18,6 @@ const (
 	eventAttemptPrepared      = "attempt.prepared"
 	eventMilestone            = "attempt.milestone"
 	eventResultCreated        = "result.created"
-	eventClaimCreated         = "claim.created"
-	eventEvaluationRecorded   = "evaluation.recorded"
 	eventMessageQueued        = "message.queued"
 	eventMessageDispatched    = "message.dispatched"
 	eventMessageSettled       = "message.settled"
@@ -91,14 +89,6 @@ type milestoneEvent struct {
 
 type resultCreatedEvent struct {
 	Result *Result `json:"result"`
-}
-
-type claimCreatedEvent struct {
-	Claim *Claim `json:"claim"`
-}
-
-type evaluationRecordedEvent struct {
-	Evaluation *Evaluation `json:"evaluation"`
 }
 
 type messageEvent struct {
@@ -195,6 +185,11 @@ func applyDomainEvent(state *State, domain DomainEvent) error {
 			return errors.New("execution start event reuses a durable identity")
 		}
 		workflow := cloneWorkflow(data.Workflow)
+		if workflow.EvaluatorModel == "" && workflow.OldGoal != nil && workflow.OldGoal.Enabled {
+			workflow.EvaluatorModel = workflow.OldGoal.EvaluatorModel
+			workflow.MaxTurns = workflow.OldGoal.MaxTurns
+		}
+		workflow.OldGoal = nil
 		workflow.Nodes[data.Node.ID] = cloneNode(data.Node)
 		workflow.Order = append(workflow.Order, data.Node.ID)
 		state.Executions[data.Execution.ID] = cloneExecution(data.Execution)
@@ -339,24 +334,9 @@ func applyDomainEvent(state *State, domain DomainEvent) error {
 			return errors.New("result event is incomplete or duplicate")
 		}
 		state.Results[data.Result.ID] = cloneResult(data.Result)
-	case eventClaimCreated:
-		var data claimCreatedEvent
-		if err := json.Unmarshal(domain.Data, &data); err != nil {
-			return err
-		}
-		if data.Claim == nil || state.Claims[data.Claim.ID] != nil {
-			return errors.New("claim event is incomplete or duplicate")
-		}
-		state.Claims[data.Claim.ID] = cloneClaim(data.Claim)
-	case eventEvaluationRecorded:
-		var data evaluationRecordedEvent
-		if err := json.Unmarshal(domain.Data, &data); err != nil {
-			return err
-		}
-		if data.Evaluation == nil || state.Claims[data.Evaluation.ClaimID] == nil || state.Evaluations[data.Evaluation.ID] != nil || evaluationForClaim(state, data.Evaluation.ClaimID) != nil {
-			return errors.New("evaluation event is incomplete, duplicate, or targets an unknown claim")
-		}
-		state.Evaluations[data.Evaluation.ID] = cloneEvaluation(data.Evaluation)
+	case "claim.created", "evaluation.recorded":
+		// Releases before v1.2 duplicated turn data into two extra records. The
+		// attempt milestone and result events remain sufficient to rebuild them.
 	case "attestation.recorded":
 		// Retired v2 publication events remain readable as historical facts, but
 		// they no longer create state or publication authority.
@@ -563,34 +543,6 @@ func validateState(state *State) error {
 			return fmt.Errorf("result %s has broken immutable provenance", id)
 		}
 	}
-	for id, claim := range state.Claims {
-		if claim == nil {
-			return fmt.Errorf("claim %s is nil", id)
-		}
-		activity := state.Activities[claim.ActivityID]
-		attempt := state.Attempts[claim.AttemptID]
-		if claim.ID != id || activity == nil || attempt == nil || claim.WorkflowID != activity.WorkflowID || claim.NodeID != activity.NodeID || attempt.ActivityID != activity.ID || claim.Generation != activity.Generation {
-			return fmt.Errorf("claim %s has broken immutable provenance", id)
-		}
-		if err := validateRecordedWorkerResult(claim.Result); err != nil {
-			return fmt.Errorf("claim %s: %w", id, err)
-		}
-	}
-	for id, evaluation := range state.Evaluations {
-		if evaluation == nil || evaluation.ID != id || state.Claims[evaluation.ClaimID] == nil || strings.TrimSpace(evaluation.Decision.Model) == "" || strings.TrimSpace(evaluation.Decision.Reason) == "" {
-			return fmt.Errorf("evaluation %s has broken claim provenance", id)
-		}
-		decision := evaluation.Decision
-		if decision.Outcome != "accept" && decision.Outcome != "continue" && decision.Outcome != "escalate" {
-			return fmt.Errorf("evaluation %s has unsupported outcome %q", id, decision.Outcome)
-		}
-		if decision.Outcome == "escalate" && (strings.TrimSpace(decision.BlockerKind) == "" || strings.TrimSpace(decision.Question) == "") {
-			return fmt.Errorf("evaluation %s has an untyped escalation", id)
-		}
-		if decision.Outcome != "escalate" && (decision.BlockerKind != "" || decision.Question != "") {
-			return fmt.Errorf("evaluation %s carries irrelevant blocker fields", id)
-		}
-	}
 	for id, finalization := range state.Finalizations {
 		execution := (*Execution)(nil)
 		if finalization != nil {
@@ -752,9 +704,6 @@ func cloneResult(v *Result) *Result {
 	c := *v
 	return &c
 }
-
-func cloneClaim(v *Claim) *Claim                { c := *v; return &c }
-func cloneEvaluation(v *Evaluation) *Evaluation { c := *v; return &c }
 
 func cloneFinalization(v *Finalization) *Finalization {
 	c := *v

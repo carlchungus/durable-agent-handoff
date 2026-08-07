@@ -31,6 +31,8 @@ func run(args []string, out, _ io.Writer) error {
 		return cmdV2Init(args[1:], out)
 	case "start", "create":
 		return cmdV2Start(args[1:], out)
+	case "goal":
+		return cmdV2Goal(args[1:], out)
 	case "execution":
 		return cmdExecution(args[1:], out)
 	case "status":
@@ -154,8 +156,9 @@ func jsonEncoder(out io.Writer) *json.Encoder {
 const usage = `handoff — Supervisor v2 durable execution
 
 Usage:
+  handoff goal start --goal GOAL --runtime codex --file - --idempotency-key KEY --authorized-by HUMAN
   handoff start [--session EXACT_ID] --runtime codex --file - --idempotency-key KEY --authorized-by HUMAN [--finalizer-enabled --required-check NAME --require-human]
-  handoff execution start --file - --json [flat finalizer_* fields]
+  handoff execution start --file - --json [runs as a goal by default; set one_shot=true to opt out]
   handoff execution pause --workflow ID --timeout 30s --json
   handoff status [EXECUTION_ID] [--json]
   handoff list [--json]

@@ -123,7 +123,7 @@ func TestPublicCLICompletesOneActivityThroughRuntimeProcess(t *testing.T) {
 	}
 }
 
-func TestPublicCLIAutonomousGoalRejectsPlanAndContinuesExactSession(t *testing.T) {
+func TestPublicCLIGoalRejectsPlanAndContinuesExactSession(t *testing.T) {
 	state := privateDir(t)
 	worktree := t.TempDir()
 	fakeBin := t.TempDir()
@@ -141,7 +141,7 @@ func TestPublicCLIAutonomousGoalRejectsPlanAndContinuesExactSession(t *testing.T
 	if err := os.WriteFile(resultsPath, results, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var evaluations atomic.Int32
+	var decisions atomic.Int32
 	evaluatorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		var body map[string]any
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
@@ -150,14 +150,14 @@ func TestPublicCLIAutonomousGoalRejectsPlanAndContinuesExactSession(t *testing.T
 			return
 		}
 		if body["tool_choice"] == nil || body["response_format"] != nil {
-			t.Errorf("service did not use forced evaluator tool: %#v", body)
+			t.Errorf("service did not use forced decision tool: %#v", body)
 		}
 		outcome, reason := "continue", "The worker returned a plan, not completed work."
-		if evaluations.Add(1) > 1 {
+		if decisions.Add(1) > 1 {
 			outcome, reason = "accept", "The implementation and focused verification are complete."
 		}
 		arguments, _ := json.Marshal(map[string]string{"outcome": outcome, "reason": reason, "blocker_kind": "", "question": ""})
-		response := map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": "submit_terminal_evaluation", "arguments": string(arguments)}}}}}}}
+		response := map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": "submit_turn_decision", "arguments": string(arguments)}}}}}}}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(response)
 	}))
@@ -182,7 +182,7 @@ func TestPublicCLIAutonomousGoalRejectsPlanAndContinuesExactSession(t *testing.T
 			WorkflowID string `json:"workflow_id"`
 		} `json:"execution"`
 	}
-	decodeJSON(t, runCLI(t, environment, "complete the implementation", "start", "--state", state, "--root", worktree, "--goal", "complete the implementation", "--runtime", "codex", "--file", "-", "--sandbox", "workspace-write", "--authorized-by", "human:e2e", "--idempotency-key", "black-box-autonomous", "--autonomous", "--evaluator-model", "fake/evaluator", "--max-turns", "3", "--json"), &started)
+	decodeJSON(t, runCLI(t, environment, "complete the implementation", "goal", "start", "--state", state, "--root", worktree, "--goal", "complete the implementation", "--runtime", "codex", "--file", "-", "--sandbox", "workspace-write", "--authorized-by", "human:e2e", "--idempotency-key", "black-box-goal", "--evaluator-model", "fake/evaluator", "--max-turns", "3", "--json"), &started)
 	serviceCommand := exec.Command(handoffPath, "serve", "--state", state, "--interval", "100ms", "--workers", "1", "--environment-json", environmentFile, "--startup-timeout", "5s")
 	serviceCommand.Env = environment
 	var serviceOutput strings.Builder
@@ -204,17 +204,17 @@ func TestPublicCLIAutonomousGoalRejectsPlanAndContinuesExactSession(t *testing.T
 				Generation uint64 `json:"generation"`
 				Status     string `json:"status"`
 			} `json:"activities"`
-			EvaluationQueue []string `json:"evaluation_queue"`
+			PendingTurns []string `json:"pending_turns"`
 		}
 		decodeJSON(t, runCLI(t, environment, "", "status", started.Execution.ID, "--state", state, "--json"), &status)
-		if len(status.Activities) == 2 && status.Activities[1].Status == "completed" && len(status.EvaluationQueue) == 0 {
-			if status.Activities[0].Generation != 1 || status.Activities[1].Generation != 2 || status.Activities[0].SessionID != status.Activities[1].SessionID || evaluations.Load() != 2 {
-				t.Fatalf("autonomous exact-session lifecycle=%+v evaluations=%d", status.Activities, evaluations.Load())
+		if len(status.Activities) == 2 && status.Activities[1].Status == "completed" && len(status.PendingTurns) == 0 {
+			if status.Activities[0].Generation != 1 || status.Activities[1].Generation != 2 || status.Activities[0].SessionID != status.Activities[1].SessionID || decisions.Load() != 2 {
+				t.Fatalf("goal exact-session lifecycle=%+v decisions=%d", status.Activities, decisions.Load())
 			}
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("autonomous service did not finish two evaluated turns: status=%+v output=%s", status, serviceOutput.String())
+			t.Fatalf("goal service did not finish two decided turns: status=%+v output=%s", status, serviceOutput.String())
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

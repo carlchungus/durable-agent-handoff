@@ -13,7 +13,7 @@ const (
 	ActivityQueued     ActivityStatus = "queued"
 	ActivityStarting   ActivityStatus = "starting"
 	ActivityRunning    ActivityStatus = "running"
-	ActivityEvaluating ActivityStatus = "evaluating"
+	ActivityDeciding   ActivityStatus = "deciding"
 	ActivityRetryable  ActivityStatus = "retryable"
 	ActivityCompleted  ActivityStatus = "completed"
 	ActivityNeedsHuman ActivityStatus = "needs_human"
@@ -82,7 +82,7 @@ const (
 	NodeQueued              NodeStatus = "queued"
 	NodeStarting            NodeStatus = "starting"
 	NodeRunning             NodeStatus = "running"
-	NodeEvaluating          NodeStatus = "evaluating"
+	NodeDeciding            NodeStatus = "deciding"
 	NodeCompleted           NodeStatus = "completed"
 	NodeSuperseded          NodeStatus = "superseded"
 )
@@ -95,15 +95,15 @@ type NodeView struct {
 }
 
 type ExecutionView struct {
-	ID              ExecutionID      `json:"id"`
-	WorkflowID      WorkflowID       `json:"workflow_id"`
-	Nodes           []NodeView       `json:"nodes"`
-	Activities      []ActivityView   `json:"activities"`
-	Attempts        []AttemptView    `json:"attempts"`
-	Queue           []ActivityID     `json:"queue"`
-	EvaluationQueue []ClaimID        `json:"evaluation_queue,omitempty"`
-	Publication     PublicationState `json:"publication"`
-	AsOf            time.Time        `json:"as_of"`
+	ID           ExecutionID      `json:"id"`
+	WorkflowID   WorkflowID       `json:"workflow_id"`
+	Nodes        []NodeView       `json:"nodes"`
+	Activities   []ActivityView   `json:"activities"`
+	Attempts     []AttemptView    `json:"attempts"`
+	Queue        []ActivityID     `json:"queue"`
+	PendingTurns []ActivityID     `json:"pending_turns,omitempty"`
+	Publication  PublicationState `json:"publication"`
+	AsOf         time.Time        `json:"as_of"`
 }
 
 // View is a pure read. asOf is explicit so polling cannot manufacture events
@@ -129,12 +129,8 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 		if (item.Status == ActivityQueued || item.Status == ActivityRetryable) && fallbackChildForActivity(state, activity.ID) == nil {
 			view.Queue = append(view.Queue, item.ID)
 		}
-		if item.Status == ActivityEvaluating {
-			if claim := claimForActivity(state, activity.ID); claim != nil && evaluationForClaim(state, claim.ID) == nil {
-				if attempt := state.Attempts[claim.AttemptID]; attempt != nil && attemptHasExit(attempt) {
-					view.EvaluationQueue = append(view.EvaluationQueue, claim.ID)
-				}
-			}
+		if item.Status == ActivityDeciding {
+			view.PendingTurns = append(view.PendingTurns, activity.ID)
 		}
 	}
 	taskOrdinals := map[NodeID]int{}
@@ -171,9 +167,9 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 			switch activity.Status {
 			case ActivityRunning:
 				item.Status = NodeRunning
-			case ActivityEvaluating:
+			case ActivityDeciding:
 				if item.Status != NodeRunning {
-					item.Status = NodeEvaluating
+					item.Status = NodeDeciding
 				}
 			case ActivityStarting:
 				if item.Status != NodeRunning {
@@ -221,9 +217,15 @@ func projectActivity(state *State, activity *Activity) ActivityView {
 		}
 		return view
 	}
-	if claim := claimForActivity(state, activity.ID); claim != nil && evaluationForClaim(state, claim.ID) == nil {
-		view.Status = ActivityEvaluating
-		return view
+	if runsAsGoal(state.Workflows[activity.WorkflowID]) {
+		if attempt := workerResultAttemptForActivity(state, activity.ID); attempt != nil {
+			if attemptHasExit(attempt) {
+				view.Status = ActivityDeciding
+			} else {
+				view.Status = ActivityRunning
+			}
+			return view
+		}
 	}
 	if session := state.Sessions[activity.SessionID]; session != nil && session.ImportedUnresolved {
 		// Workflow history can be normalized, but an exact native Session or
@@ -257,6 +259,15 @@ func projectActivity(state *State, activity *Activity) ActivityView {
 		view.Status = ActivityFailed
 	}
 	return view
+}
+
+func workerResultAttemptForActivity(state *State, activityID ActivityID) *Attempt {
+	for _, attempt := range orderedAttemptsForActivity(state, activityID) {
+		if workerResultForAttempt(attempt) != nil {
+			return attempt
+		}
+	}
+	return nil
 }
 
 func projectAttempt(state *State, attempt *Attempt) AttemptView {

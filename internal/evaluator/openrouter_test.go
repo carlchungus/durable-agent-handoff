@@ -30,7 +30,7 @@ func TestOpenRouterEvaluatorUsesFreshToollessStructuredRequest(t *testing.T) {
 		Model:  "deepseek/deepseek-v4-flash-0731",
 		Goal:   "Ship 100 safe type-hardening pull requests; skip unsuitable candidates",
 		Prompt: "Find and ship the next safe type-hardening change",
-		Claim: supervisor.WorkerResult{
+		Turn: supervisor.WorkerResult{
 			Status:  "needs_human",
 			Summary: "This candidate cannot be changed safely",
 		},
@@ -49,7 +49,7 @@ func TestOpenRouterEvaluatorUsesFreshToollessStructuredRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(messages), "cannot widen worker authority") {
+	if !strings.Contains(string(messages), "does not grant new authority") {
 		t.Fatalf("evaluator prompt omitted immutable authority semantics: %s", messages)
 	}
 	tools, ok := captured["tools"].([]any)
@@ -80,11 +80,11 @@ func TestOpenRouterEvaluatorAcceptsOnlyForcedDecisionTool(t *testing.T) {
 			t.Fatalf("forced tool choice missing: %#v", captured["tool_choice"])
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"submit_terminal_evaluation","arguments":"{\"outcome\":\"continue\",\"reason\":\"Work is only starting.\",\"blocker_kind\":\"none\",\"question\":\"none\"}"}}]}}]}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"submit_turn_decision","arguments":"{\"outcome\":\"continue\",\"reason\":\"Work is only starting.\",\"blocker_kind\":\"none\",\"question\":\"none\"}"}}]}}]}`))
 	}))
 	defer server.Close()
 	client := OpenRouter{APIKey: "private-key", Endpoint: server.URL, HTTPClient: server.Client(), Mode: ModeToolCall}
-	decision, err := client.Evaluate(context.Background(), Request{Model: DefaultModel, Goal: "finish the work", Prompt: "do the work", Claim: supervisor.WorkerResult{Status: "completed", Summary: "I will begin"}})
+	decision, err := client.Evaluate(context.Background(), Request{Model: DefaultModel, Goal: "finish the work", Prompt: "do the work", Turn: supervisor.WorkerResult{Status: "completed", Summary: "I will begin"}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -13,6 +13,7 @@ const (
 	ActivityQueued     ActivityStatus = "queued"
 	ActivityStarting   ActivityStatus = "starting"
 	ActivityRunning    ActivityStatus = "running"
+	ActivityEvaluating ActivityStatus = "evaluating"
 	ActivityRetryable  ActivityStatus = "retryable"
 	ActivityCompleted  ActivityStatus = "completed"
 	ActivityNeedsHuman ActivityStatus = "needs_human"
@@ -68,6 +69,9 @@ type ActivityView struct {
 	Status             ActivityStatus  `json:"status"`
 	DependencyBindings []ResultBinding `json:"dependency_bindings,omitempty"`
 	ResultID           ResultID        `json:"result_id,omitempty"`
+	ResultSummary      string          `json:"result_summary,omitempty"`
+	BlockerKind        string          `json:"blocker_kind,omitempty"`
+	Question           string          `json:"question,omitempty"`
 }
 
 type NodeStatus string
@@ -78,6 +82,7 @@ const (
 	NodeQueued              NodeStatus = "queued"
 	NodeStarting            NodeStatus = "starting"
 	NodeRunning             NodeStatus = "running"
+	NodeEvaluating          NodeStatus = "evaluating"
 	NodeCompleted           NodeStatus = "completed"
 	NodeSuperseded          NodeStatus = "superseded"
 )
@@ -90,14 +95,15 @@ type NodeView struct {
 }
 
 type ExecutionView struct {
-	ID          ExecutionID      `json:"id"`
-	WorkflowID  WorkflowID       `json:"workflow_id"`
-	Nodes       []NodeView       `json:"nodes"`
-	Activities  []ActivityView   `json:"activities"`
-	Attempts    []AttemptView    `json:"attempts"`
-	Queue       []ActivityID     `json:"queue"`
-	Publication PublicationState `json:"publication"`
-	AsOf        time.Time        `json:"as_of"`
+	ID              ExecutionID      `json:"id"`
+	WorkflowID      WorkflowID       `json:"workflow_id"`
+	Nodes           []NodeView       `json:"nodes"`
+	Activities      []ActivityView   `json:"activities"`
+	Attempts        []AttemptView    `json:"attempts"`
+	Queue           []ActivityID     `json:"queue"`
+	EvaluationQueue []ClaimID        `json:"evaluation_queue,omitempty"`
+	Publication     PublicationState `json:"publication"`
+	AsOf            time.Time        `json:"as_of"`
 }
 
 // View is a pure read. asOf is explicit so polling cannot manufacture events
@@ -122,6 +128,13 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 		view.Activities = append(view.Activities, item)
 		if (item.Status == ActivityQueued || item.Status == ActivityRetryable) && fallbackChildForActivity(state, activity.ID) == nil {
 			view.Queue = append(view.Queue, item.ID)
+		}
+		if item.Status == ActivityEvaluating {
+			if claim := claimForActivity(state, activity.ID); claim != nil && evaluationForClaim(state, claim.ID) == nil {
+				if attempt := state.Attempts[claim.AttemptID]; attempt != nil && attemptHasExit(attempt) {
+					view.EvaluationQueue = append(view.EvaluationQueue, claim.ID)
+				}
+			}
 		}
 	}
 	taskOrdinals := map[NodeID]int{}
@@ -158,6 +171,10 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 			switch activity.Status {
 			case ActivityRunning:
 				item.Status = NodeRunning
+			case ActivityEvaluating:
+				if item.Status != NodeRunning {
+					item.Status = NodeEvaluating
+				}
 			case ActivityStarting:
 				if item.Status != NodeRunning {
 					item.Status = NodeStarting
@@ -191,6 +208,9 @@ func projectActivity(state *State, activity *Activity) ActivityView {
 	result := resultForActivity(state, activity.ID)
 	if result != nil {
 		view.ResultID = result.ID
+		view.ResultSummary = result.Summary
+		view.BlockerKind = result.BlockerKind
+		view.Question = result.Question
 		switch result.Status {
 		case "needs_human":
 			view.Status = ActivityNeedsHuman
@@ -199,6 +219,10 @@ func projectActivity(state *State, activity *Activity) ActivityView {
 		default:
 			view.Status = ActivityCompleted
 		}
+		return view
+	}
+	if claim := claimForActivity(state, activity.ID); claim != nil && evaluationForClaim(state, claim.ID) == nil {
+		view.Status = ActivityEvaluating
 		return view
 	}
 	if session := state.Sessions[activity.SessionID]; session != nil && session.ImportedUnresolved {
@@ -223,7 +247,7 @@ func projectActivity(state *State, activity *Activity) ActivityView {
 		}
 	}
 	workflow := state.Workflows[activity.WorkflowID]
-	launches, turns := attemptCounts(state, activity.WorkflowID, activity.NodeID)
+	launches, turns := attemptCountsForActivity(state, activity.ID)
 	switch {
 	case launches == 0:
 		view.Status = ActivityQueued

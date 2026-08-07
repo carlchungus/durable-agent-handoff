@@ -99,15 +99,10 @@ func fallback(value, defaultValue string) string {
 const completionContract = `
 
 Supervisor completion contract: after performing the requested work, emit exactly one JSON object with this shape and no Markdown or surrounding prose:
-{"status":"completed|needs_human|blocked","summary":" concise outcome "}
-The status must be one of completed, needs_human, or blocked, and summary must be a non-empty string. Do not emit this object until the work is finished.`
+{"status":"completed|continue|needs_human|blocked","summary":"concise outcome","blocker_kind":"","question":""}
+Use continue when this turn or candidate is finished but the objective remains actionable. Use needs_human only for a workflow-wide blocker and fill blocker_kind plus one concrete question. A plan, progress update, or promise is not a terminal result. Continue using tools until the work is actually complete, should continue in another turn, or has a concrete blocker.`
 
-func promptForRuntime(runtime, prompt string) string {
-	if runtime == "codex" {
-		// Codex receives the same contract as a native output schema through the
-		// schema file, so its user prompt remains unchanged.
-		return prompt
-	}
+func promptForRuntime(_ string, prompt string) string {
 	return strings.TrimRight(prompt, "\n") + completionContract
 }
 
@@ -152,7 +147,7 @@ func decodeWorkerResult(raw []byte) (*supervisor.WorkerResult, bool) {
 		return nil, false
 	}
 	switch result.Status {
-	case "completed", "needs_human", "blocked":
+	case "completed", "continue", "needs_human", "blocked":
 		return &result, true
 	default:
 		return nil, false

@@ -21,6 +21,13 @@ func RenderText(view *ExecutionView) string {
 		}
 		output.WriteByte('\n')
 	}
+	if len(view.EvaluationQueue) > 0 {
+		output.WriteString("EvaluationQueue")
+		for index, claimID := range view.EvaluationQueue {
+			fmt.Fprintf(&output, " %d:%s", index+1, claimID)
+		}
+		output.WriteByte('\n')
+	}
 	for _, node := range view.Nodes {
 		fmt.Fprintf(&output, "Node %s %s\n", node.ID, node.Status)
 	}
@@ -28,6 +35,9 @@ func RenderText(view *ExecutionView) string {
 		fmt.Fprintf(&output, "Activity %s generation=%d status=%s", activity.ID, activity.Generation, activity.Status)
 		if activity.ParentActivityID != "" {
 			fmt.Fprintf(&output, " continuation_of=%s", activity.ParentActivityID)
+		}
+		if activity.BlockerKind != "" {
+			fmt.Fprintf(&output, " blocker=%s question=%s", singleLine(activity.BlockerKind), singleLine(activity.Question))
 		}
 		output.WriteByte('\n')
 	}

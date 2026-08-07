@@ -18,6 +18,8 @@ const (
 	eventAttemptPrepared      = "attempt.prepared"
 	eventMilestone            = "attempt.milestone"
 	eventResultCreated        = "result.created"
+	eventClaimCreated         = "claim.created"
+	eventEvaluationRecorded   = "evaluation.recorded"
 	eventMessageQueued        = "message.queued"
 	eventMessageDispatched    = "message.dispatched"
 	eventMessageSettled       = "message.settled"
@@ -89,6 +91,14 @@ type milestoneEvent struct {
 
 type resultCreatedEvent struct {
 	Result *Result `json:"result"`
+}
+
+type claimCreatedEvent struct {
+	Claim *Claim `json:"claim"`
+}
+
+type evaluationRecordedEvent struct {
+	Evaluation *Evaluation `json:"evaluation"`
 }
 
 type messageEvent struct {
@@ -329,6 +339,24 @@ func applyDomainEvent(state *State, domain DomainEvent) error {
 			return errors.New("result event is incomplete or duplicate")
 		}
 		state.Results[data.Result.ID] = cloneResult(data.Result)
+	case eventClaimCreated:
+		var data claimCreatedEvent
+		if err := json.Unmarshal(domain.Data, &data); err != nil {
+			return err
+		}
+		if data.Claim == nil || state.Claims[data.Claim.ID] != nil {
+			return errors.New("claim event is incomplete or duplicate")
+		}
+		state.Claims[data.Claim.ID] = cloneClaim(data.Claim)
+	case eventEvaluationRecorded:
+		var data evaluationRecordedEvent
+		if err := json.Unmarshal(domain.Data, &data); err != nil {
+			return err
+		}
+		if data.Evaluation == nil || state.Claims[data.Evaluation.ClaimID] == nil || state.Evaluations[data.Evaluation.ID] != nil || evaluationForClaim(state, data.Evaluation.ClaimID) != nil {
+			return errors.New("evaluation event is incomplete, duplicate, or targets an unknown claim")
+		}
+		state.Evaluations[data.Evaluation.ID] = cloneEvaluation(data.Evaluation)
 	case "attestation.recorded":
 		// Retired v2 publication events remain readable as historical facts, but
 		// they no longer create state or publication authority.
@@ -535,6 +563,34 @@ func validateState(state *State) error {
 			return fmt.Errorf("result %s has broken immutable provenance", id)
 		}
 	}
+	for id, claim := range state.Claims {
+		if claim == nil {
+			return fmt.Errorf("claim %s is nil", id)
+		}
+		activity := state.Activities[claim.ActivityID]
+		attempt := state.Attempts[claim.AttemptID]
+		if claim.ID != id || activity == nil || attempt == nil || claim.WorkflowID != activity.WorkflowID || claim.NodeID != activity.NodeID || attempt.ActivityID != activity.ID || claim.Generation != activity.Generation {
+			return fmt.Errorf("claim %s has broken immutable provenance", id)
+		}
+		if err := validateRecordedWorkerResult(claim.Result); err != nil {
+			return fmt.Errorf("claim %s: %w", id, err)
+		}
+	}
+	for id, evaluation := range state.Evaluations {
+		if evaluation == nil || evaluation.ID != id || state.Claims[evaluation.ClaimID] == nil || strings.TrimSpace(evaluation.Decision.Model) == "" || strings.TrimSpace(evaluation.Decision.Reason) == "" {
+			return fmt.Errorf("evaluation %s has broken claim provenance", id)
+		}
+		decision := evaluation.Decision
+		if decision.Outcome != "accept" && decision.Outcome != "continue" && decision.Outcome != "escalate" {
+			return fmt.Errorf("evaluation %s has unsupported outcome %q", id, decision.Outcome)
+		}
+		if decision.Outcome == "escalate" && (strings.TrimSpace(decision.BlockerKind) == "" || strings.TrimSpace(decision.Question) == "") {
+			return fmt.Errorf("evaluation %s has an untyped escalation", id)
+		}
+		if decision.Outcome != "escalate" && (decision.BlockerKind != "" || decision.Question != "") {
+			return fmt.Errorf("evaluation %s carries irrelevant blocker fields", id)
+		}
+	}
 	for id, finalization := range state.Finalizations {
 		execution := (*Execution)(nil)
 		if finalization != nil {
@@ -571,6 +627,22 @@ func validateState(state *State) error {
 				return fmt.Errorf("node %s root is outside its canonical workflow root", node.ID)
 			}
 		}
+	}
+	return nil
+}
+
+func validateRecordedWorkerResult(result WorkerResult) error {
+	if result.Status != "completed" && result.Status != "continue" && result.Status != "needs_human" && result.Status != "blocked" {
+		return fmt.Errorf("unsupported worker result %q", result.Status)
+	}
+	if strings.TrimSpace(result.Summary) == "" {
+		return errors.New("worker result summary is empty")
+	}
+	if (result.BlockerKind == "") != (result.Question == "") {
+		return errors.New("worker result blocker kind and question must be paired")
+	}
+	if result.Status != "needs_human" && (result.BlockerKind != "" || result.Question != "") {
+		return errors.New("only needs_human may carry blocker fields")
 	}
 	return nil
 }
@@ -680,6 +752,9 @@ func cloneResult(v *Result) *Result {
 	c := *v
 	return &c
 }
+
+func cloneClaim(v *Claim) *Claim                { c := *v; return &c }
+func cloneEvaluation(v *Evaluation) *Evaluation { c := *v; return &c }
 
 func cloneFinalization(v *Finalization) *Finalization {
 	c := *v

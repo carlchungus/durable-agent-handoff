@@ -19,7 +19,9 @@ printf '%s' 'work' | handoff start --runtime codex --file - \
   --root /repo --authorized-by human:id --idempotency-key request-01 --json
 # An autonomous merge-capable execution must configure its gates at start.
 printf '%s' 'ship it' | handoff start --runtime codex --file - \
-  --root /repo --authorized-by human:id --idempotency-key request-02 \
+  --root /repo --goal 'ship the verified change' \
+  --authorized-by human:id --idempotency-key request-02 \
+  --autonomous --max-turns 100 \
   --finalizer-enabled --required-check verify --require-human --json
 handoff status EXECUTION_ID --json
 handoff list --json
@@ -43,7 +45,10 @@ handoff execution start --file - --json <<'JSON'
   "role": "human:id",
   "finalizer_enabled": true,
   "finalizer_required_checks": ["verify"],
-  "finalizer_require_human": true
+  "finalizer_require_human": true,
+  "autonomous": true,
+  "evaluator_model": "deepseek/deepseek-v4-flash-0731",
+  "max_turns": 100
 }
 JSON
 ```
@@ -55,6 +60,17 @@ Human approval is independently optional. Independently hosted CI and GitHub
 checks are the verification authority; handoff does not pretend that same-UID
 workers can authenticate their own Results. Reusing a key with different
 canonical input fails closed.
+
+Autonomous executions persist worker terminal output as an untrusted Claim,
+not a Result. A fresh tool-less OpenRouter evaluator receives only the desired
+goal, Activity prompt, bounded typed milestones, worker Claim, and explicit
+Supervisor-owned downstream capabilities. `accept` creates the immutable
+completed Result even when the worker mislabeled Supervisor-owned publication
+as a human blocker. `continue` atomically creates the next Activity generation
+on the exact Session, and `escalate` requires a typed workflow-wide blocker plus
+one concrete question. DeepSeek's forced evaluation tool is the default extraction mode;
+strict `response_format` remains available for compatibility probes because it
+was unreliable against the checked-in real-transcript corpus.
 
 Pause is synchronous and idempotent. It records exact stop controls, waits for
 the executor to apply them and record terminal exits, releases writer Leases

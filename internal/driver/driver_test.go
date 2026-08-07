@@ -84,8 +84,8 @@ func TestDriversNeverPlacePromptInArgvOrServiceData(t *testing.T) {
 	}
 }
 
-func TestClaudeAndPiUseRuntimeOwnedCompletionContract(t *testing.T) {
-	for _, runtimeName := range []string{"claude", "pi"} {
+func TestDriversUseRuntimeOwnedCompletionContract(t *testing.T) {
+	for _, runtimeName := range []string{"codex", "claude", "pi"} {
 		t.Run(runtimeName, func(t *testing.T) {
 			request := launchRequest(runtimeName)
 			request.Prompt = "ordinary work that must produce a durable result"
@@ -157,6 +157,9 @@ func TestWorkerResultDecoderRejectsUnknownFields(t *testing.T) {
 	}
 	if result, ok := decodeWorkerResult([]byte(`{"status":"completed","summary":"done"}`)); !ok || result == nil || result.Status != "completed" {
 		t.Fatalf("strict ordinary Result was rejected: result=%+v ok=%v", result, ok)
+	}
+	if result, ok := decodeWorkerResult([]byte(`{"status":"continue","summary":"candidate was unsuitable"}`)); !ok || result == nil || result.Status != "continue" {
+		t.Fatalf("first-class continuation was rejected: result=%+v ok=%v", result, ok)
 	}
 }
 

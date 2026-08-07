@@ -5,12 +5,16 @@ package e2e_test
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 var (
@@ -109,13 +113,110 @@ func TestPublicCLICompletesOneActivityThroughRuntimeProcess(t *testing.T) {
 		Stdin string   `json:"stdin"`
 	}
 	decodeJSON(t, string(data), &capture)
-	if capture.Stdin != prompt {
-		t.Fatalf("runtime stdin=%q want exact prompt", capture.Stdin)
+	if !strings.HasPrefix(capture.Stdin, prompt) || !strings.Contains(capture.Stdin, "Supervisor completion contract") || !strings.Contains(capture.Stdin, "completed|continue") {
+		t.Fatalf("runtime stdin omitted prompt or completion semantics: %q", capture.Stdin)
 	}
 	for _, argument := range capture.Args {
 		if strings.Contains(argument, prompt) {
 			t.Fatalf("prompt leaked into runtime argv: %q", capture.Args)
 		}
+	}
+}
+
+func TestPublicCLIAutonomousGoalRejectsPlanAndContinuesExactSession(t *testing.T) {
+	state := privateDir(t)
+	worktree := t.TempDir()
+	fakeBin := t.TempDir()
+	if err := os.Symlink(fakeCodexPath, filepath.Join(fakeBin, executableName("codex"))); err != nil {
+		t.Fatal(err)
+	}
+	fixtureRoot := privateDir(t)
+	resultsPath := filepath.Join(fixtureRoot, "results.json")
+	counterPath := filepath.Join(fixtureRoot, "counter")
+	capturePath := filepath.Join(fixtureRoot, "capture.json")
+	results, _ := json.Marshal([]string{
+		`{"status":"completed","summary":"I will inspect the repository and begin the requested work."}`,
+		`{"status":"completed","summary":"Implemented the requested change and all focused tests passed."}`,
+	})
+	if err := os.WriteFile(resultsPath, results, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var evaluations atomic.Int32
+	evaluatorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if body["tool_choice"] == nil || body["response_format"] != nil {
+			t.Errorf("service did not use forced evaluator tool: %#v", body)
+		}
+		outcome, reason := "continue", "The worker returned a plan, not completed work."
+		if evaluations.Add(1) > 1 {
+			outcome, reason = "accept", "The implementation and focused verification are complete."
+		}
+		arguments, _ := json.Marshal(map[string]string{"outcome": outcome, "reason": reason, "blocker_kind": "", "question": ""})
+		response := map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": "submit_terminal_evaluation", "arguments": string(arguments)}}}}}}}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer evaluatorServer.Close()
+	environmentFile := filepath.Join(fixtureRoot, "environment.json")
+	environmentValues := map[string]string{
+		"PATH":                       fakeBin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"HANDOFF_E2E_CODEX_CAPTURE":  capturePath,
+		"HANDOFF_E2E_CODEX_RESULTS":  resultsPath,
+		"HANDOFF_E2E_CODEX_COUNTER":  counterPath,
+		"OPENROUTER_API_KEY":         "test-key",
+		"HANDOFF_EVALUATOR_ENDPOINT": evaluatorServer.URL,
+	}
+	environmentRaw, _ := json.Marshal(environmentValues)
+	if err := os.WriteFile(environmentFile, environmentRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	environment := cleanEnvironment(map[string]string{"PATH": fakeBin + string(os.PathListSeparator) + os.Getenv("PATH")})
+	var started struct {
+		Execution struct {
+			ID         string `json:"id"`
+			WorkflowID string `json:"workflow_id"`
+		} `json:"execution"`
+	}
+	decodeJSON(t, runCLI(t, environment, "complete the implementation", "start", "--state", state, "--root", worktree, "--goal", "complete the implementation", "--runtime", "codex", "--file", "-", "--sandbox", "workspace-write", "--authorized-by", "human:e2e", "--idempotency-key", "black-box-autonomous", "--autonomous", "--evaluator-model", "fake/evaluator", "--max-turns", "3", "--json"), &started)
+	serviceCommand := exec.Command(handoffPath, "serve", "--state", state, "--interval", "100ms", "--workers", "1", "--environment-json", environmentFile, "--startup-timeout", "5s")
+	serviceCommand.Env = environment
+	var serviceOutput strings.Builder
+	serviceCommand.Stdout, serviceCommand.Stderr = &serviceOutput, &serviceOutput
+	if err := serviceCommand.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if serviceCommand.Process != nil {
+			_ = serviceCommand.Process.Kill()
+		}
+		_ = serviceCommand.Wait()
+	}()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var status struct {
+			Activities []struct {
+				SessionID  string `json:"session_id"`
+				Generation uint64 `json:"generation"`
+				Status     string `json:"status"`
+			} `json:"activities"`
+			EvaluationQueue []string `json:"evaluation_queue"`
+		}
+		decodeJSON(t, runCLI(t, environment, "", "status", started.Execution.ID, "--state", state, "--json"), &status)
+		if len(status.Activities) == 2 && status.Activities[1].Status == "completed" && len(status.EvaluationQueue) == 0 {
+			if status.Activities[0].Generation != 1 || status.Activities[1].Generation != 2 || status.Activities[0].SessionID != status.Activities[1].SessionID || evaluations.Load() != 2 {
+				t.Fatalf("autonomous exact-session lifecycle=%+v evaluations=%d", status.Activities, evaluations.Load())
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("autonomous service did not finish two evaluated turns: status=%+v output=%s", status, serviceOutput.String())
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 

@@ -161,6 +161,9 @@ func validateStartInput(in StartExecutionInput) error {
 			if strings.TrimSpace(verifier) == "" {
 				return errors.New("enabled finalizer requires non-empty verifier identities")
 			}
+			if verifier == in.Authority.RequestedBy {
+				return errors.New("enabled finalizer verifier must differ from workflow requester")
+			}
 		}
 	}
 	allowed := false
@@ -818,6 +821,11 @@ func (c recordAttestationCommand) decide(state *State, now time.Time) ([]DomainE
 	}
 	if !allowed || in.Verifier == workflow.Authority.RequestedBy {
 		return nil, "", errors.New("attestation verifier is not an authorized independent identity")
+	}
+	for _, existing := range state.Attestations {
+		if existing.ResultID == result.ID && existing.Verifier == in.Verifier {
+			return nil, "", ErrDuplicateAttestation
+		}
 	}
 	attestation := Attestation{Verifier: in.Verifier, Verdict: in.Verdict, Summary: in.Summary, EvidenceIDs: append([]string(nil), in.EvidenceIDs...)}
 	if err := validateSourceAttestation(attestation); err != nil {

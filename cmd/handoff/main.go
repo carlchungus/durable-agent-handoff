@@ -55,6 +55,8 @@ func run(args []string, out, _ io.Writer) error {
 		return cmdV2Activity(args[1:], out)
 	case "reply":
 		return cmdV2Reply(args[1:], out)
+	case "attest":
+		return cmdV2Attest(args[1:], out)
 	case "pause":
 		return cmdV2Pause(args[1:], out)
 	case "agent":
@@ -164,6 +166,7 @@ Usage:
   handoff preference set ROLE --candidate runtime:model[:effort]
   handoff github merge --execution ID --repo OWNER/REPO --pr NUMBER --gate NAME --idempotency-key KEY --approved --json
   handoff reply --execution ID --activity ID --file -
+  handoff attest --result RESULT_ID --verifier ID --verdict pass --file - --idempotency-key KEY [--json]
   handoff activity list|read [--json]
   handoff tui [--snapshot]
   handoff execution import-v1 --source LEGACY_HOME --idempotency-key KEY

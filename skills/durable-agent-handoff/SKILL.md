@@ -39,6 +39,11 @@ do not infer lifecycle state from a transcript or a legacy store.
   records exact generation/Attempt fences, then the executor applies controls;
   leases are released only after terminal exit evidence and a durable settle.
 - Continue a bound exact Session with `handoff reply`.
+- Record independent verification with `handoff attest`. Pass the exact Result,
+  configured verifier identity, verdict, and idempotency key as flags; provide
+  the evidence summary only through `--file -` stdin. Worker Result payloads do
+  not self-attest. The verifier must differ from the requester, and stale,
+  unauthorized, or duplicate verifier/Result pairs fail without mutation.
 - Use `handoff github merge` only for authority-owned finalization. It journals
   the prepared exact PR head, named gates, approval, and idempotency key before
   an argv-only `gh` effect, then journals merged or blocked outcome.

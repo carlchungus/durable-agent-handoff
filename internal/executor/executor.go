@@ -537,4 +537,4 @@ func activityHasProviderUnavailable(state *supervisor.State, activityID supervis
 	return false
 }
 
-const resultSchema = `{"type":"object","required":["status","summary"],"properties":{"status":{"enum":["completed","needs_human","blocked"]},"summary":{"type":"string"},"attestations":{"type":"array"}},"additionalProperties":true}`
+const resultSchema = `{"type":"object","required":["status","summary"],"properties":{"status":{"enum":["completed","needs_human","blocked"]},"summary":{"type":"string"}},"additionalProperties":false}`

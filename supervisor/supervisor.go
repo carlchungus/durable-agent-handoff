@@ -108,6 +108,12 @@ const (
 	HealthRunning     = internal.HealthRunning
 	HealthExited      = internal.HealthExited
 
+	PublicationDisabled         = internal.PublicationDisabled
+	PublicationAwaitingResult   = internal.PublicationAwaitingResult
+	PublicationAwaitingVerifier = internal.PublicationAwaitingVerifier
+	PublicationAwaitingHuman    = internal.PublicationAwaitingHuman
+	PublicationEligible         = internal.PublicationEligible
+
 	PauseRequested       = internal.PauseRequested
 	PauseDraining        = internal.PauseDraining
 	PauseCompleted       = internal.PauseCompleted
@@ -117,13 +123,14 @@ const (
 )
 
 var (
-	Open                   = internal.Open
-	DefaultBudget          = internal.DefaultBudget
-	ProjectExecution       = internal.ProjectExecution
-	RenderText             = internal.RenderText
-	ErrIdempotencyConflict = internal.ErrIdempotencyConflict
-	ErrFenced              = internal.ErrFenced
-	ErrLeaseHeld           = internal.ErrLeaseHeld
-	ErrPausePending        = internal.ErrPausePending
-	ErrLiveOrphan          = internal.ErrLiveOrphan
+	Open                    = internal.Open
+	DefaultBudget           = internal.DefaultBudget
+	ProjectExecution        = internal.ProjectExecution
+	RenderText              = internal.RenderText
+	ErrIdempotencyConflict  = internal.ErrIdempotencyConflict
+	ErrFenced               = internal.ErrFenced
+	ErrDuplicateAttestation = internal.ErrDuplicateAttestation
+	ErrLeaseHeld            = internal.ErrLeaseHeld
+	ErrPausePending         = internal.ErrPausePending
+	ErrLiveOrphan           = internal.ErrLiveOrphan
 )

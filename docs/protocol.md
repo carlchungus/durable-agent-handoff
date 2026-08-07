@@ -58,6 +58,7 @@ interface:
 | `ContinueSession` | human Message + exact-Session continuation Activity generation |
 | `PrepareAttempt` | immutable Attempt + canonical-worktree writer Lease + inbox dispatch |
 | `RecordMilestone` | typed milestone plus any Result, inbox settlement, or terminal-exit Lease release |
+| `RecordAttestation` | exact immutable Result + authorized independent verifier evidence |
 | `RequestControl` | accepted/rejected exact Activity-generation and Attempt fence |
 | `PauseWorkflow` | records exact controls and enters requested/draining; executor-applied terminal exits release Leases |
 | `SettlePause` | idempotently marks a draining pause completed after every fenced Attempt has exited |
@@ -93,7 +94,7 @@ Drivers may emit only:
 | `turn_started` | none | provider accepted useful turn; consumes task-attempt budget |
 | `effect_started` | typed effect summary | tool/command/file effect began |
 | `meaningful_progress` | semantic summary | explicit progress; output bytes do not qualify |
-| `result` | status, summary, attestations | creates immutable Result |
+| `result` | status, summary | creates immutable Result; verification is a separate authority command |
 | `provider_unavailable` | classified reason | routing evidence; not inferred from arbitrary text |
 | `adapter_start_failed` | reason | terminal pre-turn startup failure |
 | `exit` | exit code and optional error | terminal OS process fact |
@@ -111,6 +112,11 @@ Attestation source verdicts use the exact allowlist:
 - `fail_blocking` normalizes to `blocked` while retaining `raw_verdict`;
 - `pass_with_limit` and `pass_with_runtime_limit` normalize to `repair`; and
 - unknown verdicts fail closed.
+
+`RecordAttestation` accepts only an exact existing Result and a verifier named
+by the Workflow's immutable finalizer configuration. The verifier must differ
+from the Workflow requester, and each verifier may attest a given Result only
+once. Worker Result payloads do not carry attestation authority.
 
 ## Projection protocol
 
@@ -197,6 +203,13 @@ idempotency key when one is not supplied. The command commits pause controls,
 then waits on pure projection reads until the executor records exact terminal
 exit evidence and the later idempotent settle command marks the pause complete.
 An Attempt holding an old fence cannot append a later non-terminal milestone.
+
+`handoff attest --result RESULT_ID --verifier ID --verdict pass|repair|blocked
+--file - --idempotency-key KEY [--evidence ID ...]` reads the evidence summary
+from stdin and records one strict verifier command. `--summary` and other
+argv-bearing summary forms are rejected. The command is idempotent with the
+same canonical input; a stale Result, unauthorized verifier, or duplicate
+verifier/Result pair is rejected without journal mutation.
 
 `serve` accepts `--environment-json FILE` only when `FILE` is a regular
 mode-0600 file containing one JSON object, and `--trust-mode workspace|full`.

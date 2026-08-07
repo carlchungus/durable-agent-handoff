@@ -75,6 +75,20 @@ continue
 TEXT
 ```
 
+Independent verification is an authority-owned command. The verifier identity
+and Result ID are explicit flags, while the evidence summary is stdin-only; a
+worker cannot self-attest through its Result payload:
+
+```sh
+printf '%s' 'independent verifier pass' | handoff attest \
+  --result RESULT_ID --verifier verifier:ci --verdict pass \
+  --evidence evidence:verify --file - --idempotency-key attestation-01 --json
+```
+
+The configured verifier must be authorized by the immutable Workflow and must
+differ from its requester. Unknown Result IDs, unauthorized or duplicate
+attestations, and summary values supplied through argv fail closed.
+
 ## Runtime and service boundary
 
 Codex, Claude, and Pi drivers construct argv, resume only the supplied exact

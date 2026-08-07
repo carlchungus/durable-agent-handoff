@@ -72,6 +72,11 @@ type replyResponse struct {
 	Receipt    supervisor.Receipt `json:"receipt"`
 }
 
+type attestationResponse struct {
+	Attestation *supervisor.Attestation `json:"attestation"`
+	Receipt     supervisor.Receipt      `json:"receipt"`
+}
+
 type ActivityIDResponse struct {
 	ID         supervisor.ActivityID `json:"id"`
 	SessionID  supervisor.SessionID  `json:"session_id"`
@@ -674,6 +679,49 @@ func cmdV2GitHub(args []string, out io.Writer) error {
 	return nil
 }
 
+func cmdV2Attest(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("attest", flag.ContinueOnError)
+	state := common(fs)
+	resultID := fs.String("result", "", "exact immutable Result ID")
+	verifier := fs.String("verifier", "", "authorized independent verifier identity")
+	verdict := fs.String("verdict", "", "pass, repair, or blocked")
+	file := fs.String("file", "", "read the attestation summary from stdin; must be -")
+	key := fs.String("idempotency-key", "", "stable attestation identity")
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	var evidenceIDs runtimeCandidateFlags
+	fs.Var(&evidenceIDs, "evidence", "exact evidence ID; repeat for each evidence item")
+	known := map[string]bool{"--state": true, "--result": true, "--verifier": true, "--verdict": true, "--file": true, "--idempotency-key": true, "--json": false, "--evidence": true}
+	if err := rejectUnknownFlags(args, known); err != nil {
+		return err
+	}
+	if err := fs.Parse(reorderFlags(args, known)); err != nil {
+		return err
+	}
+	if *file != "-" || fs.NArg() != 0 {
+		return errors.New("attest requires --file - and no positional arguments; summary input is stdin-only")
+	}
+	summary, err := readRequiredStdin("attestation summary")
+	if err != nil {
+		return err
+	}
+	store, err := openV2(*state)
+	if err != nil {
+		return err
+	}
+	attestation, receipt, err := store.RecordAttestation(context.Background(), supervisor.RecordAttestationInput{
+		ResultID: supervisor.ResultID(*resultID), Verifier: *verifier, Verdict: *verdict, Summary: summary,
+		EvidenceIDs: append([]string(nil), evidenceIDs...), IdempotencyKey: *key,
+	})
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeJSON(out, attestationResponse{Attestation: attestation, Receipt: receipt})
+	}
+	fmt.Fprintf(out, "attestation=%s result=%s verifier=%s sequence=%d existing=%t\n", attestation.ID, attestation.ResultID, attestation.Verifier, receipt.Sequence, receipt.Existing)
+	return nil
+}
+
 func readEnvironmentJSON(path string) ([]string, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, nil
@@ -722,12 +770,16 @@ func readEnvironmentJSON(path string) ([]string, error) {
 }
 
 func readPromptStdin() (string, error) {
+	return readRequiredStdin("prompt")
+}
+
+func readRequiredStdin(label string) (string, error) {
 	raw, err := io.ReadAll(os.Stdin)
 	if err != nil {
-		return "", fmt.Errorf("read prompt input: %w", err)
+		return "", fmt.Errorf("read %s input: %w", label, err)
 	}
 	if strings.TrimSpace(string(raw)) == "" {
-		return "", errors.New("prompt input is empty")
+		return "", fmt.Errorf("%s input is empty", label)
 	}
 	return string(raw), nil
 }

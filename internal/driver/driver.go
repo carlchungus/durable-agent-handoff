@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -141,7 +142,13 @@ func disabledProjectMCPArgs(worktree string) []string {
 
 func decodeWorkerResult(raw []byte) (*supervisor.WorkerResult, bool) {
 	var result supervisor.WorkerResult
-	if json.Unmarshal(raw, &result) != nil || strings.TrimSpace(result.Status) == "" || strings.TrimSpace(result.Summary) == "" {
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&result) != nil || strings.TrimSpace(result.Status) == "" || strings.TrimSpace(result.Summary) == "" {
+		return nil, false
+	}
+	var extra any
+	if decoder.Decode(&extra) != io.EOF {
 		return nil, false
 	}
 	switch result.Status {

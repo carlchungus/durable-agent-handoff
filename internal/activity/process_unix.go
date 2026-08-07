@@ -4,8 +4,6 @@ package activity
 
 import (
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -25,7 +23,7 @@ func startProcessTreeWatchdog() (*processTreeWatchdog, error) {
 		return nil, err
 	}
 	command := exec.Command(executable)
-	command.Env = append(os.Environ(), watchdogEnvironment+"=1")
+	command.Env = append(withoutRunnerEnvironment(os.Environ()), watchdogEnvironment+"=1")
 	gate, err := command.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -37,24 +35,18 @@ func startProcessTreeWatchdog() (*processTreeWatchdog, error) {
 	return &processTreeWatchdog{command: command, gate: gate}, nil
 }
 
-func (w *processTreeWatchdog) complete(completion *runnerCompletion, result ExitResult) error {
-	writeErr := json.NewEncoder(w.gate).Encode(watchdogRequest{Completion: completion, Result: result})
+func (w *processTreeWatchdog) complete() error {
+	writeErr := json.NewEncoder(w.gate).Encode(watchdogRequest{})
 	closeErr := w.gate.Close()
 	waitErr := w.command.Wait()
-	return errors.Join(writeErr, closeErr, waitErr)
+	return errorsJoin(writeErr, closeErr, waitErr)
 }
 
 func runProcessTreeWatchdog(input io.Reader) {
 	var request watchdogRequest
-	if err := json.NewDecoder(io.LimitReader(input, 1<<20)).Decode(&request); err == nil && request.Completion != nil {
-		if store, openErr := OpenStore(request.Completion.Root); openErr == nil {
-			_ = finishRunnerAttempt(store, request.Completion, request.Result, os.Getppid())
-		}
+	if err := json.NewDecoder(input).Decode(&request); err == nil {
+		_ = request
 	}
-	// Whether the runner died or requested terminal completion, the watchdog
-	// remains in the exact dedicated group while terminating every member. On
-	// normal completion it writes the fenced terminal record first, then kills
-	// the runner and any background descendants as one contained tree.
 	_ = syscall.Kill(-syscall.Getpgrp(), syscall.SIGKILL)
 }
 
@@ -68,9 +60,9 @@ func (r *processTreeReservation) bind(pid int, _ string) (string, error) {
 		return "", err
 	}
 	if pgid != pid {
-		return "", fmt.Errorf("activity runner %d did not establish its own process group", pid)
+		return "", syscall.EINVAL
 	}
-	return fmt.Sprint(pgid), nil
+	return stringPID(pgid), nil
 }
 
 func (r *processTreeReservation) close() {}
@@ -79,19 +71,36 @@ func ConfigureBackgroundProcess(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func killProcessGroup(identity AttemptIdentity) error {
-	if !processMatches(identity) {
-		return ErrFenced
+func stringPID(pid int) string { return fmtInt(pid) }
+
+func fmtInt(value int) string {
+	if value == 0 {
+		return "0"
 	}
-	if err := syscall.Kill(-identity.PID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return err
+	negative := value < 0
+	if negative {
+		value = -value
 	}
-	return nil
+	var digits [24]byte
+	i := len(digits)
+	for value > 0 {
+		i--
+		digits[i] = byte('0' + value%10)
+		value /= 10
+	}
+	if negative {
+		i--
+		digits[i] = '-'
+	}
+	return string(digits[i:])
 }
 
-func cleanupOrphanedProcessTree(_ AttemptIdentity) error {
-	// The in-group watchdog contains descendants before the runner's process
-	// group can be recycled. Recovery must never signal a dead runner's numeric
-	// PGID because it may now identify unrelated work.
-	return nil
+func errorsJoin(values ...error) error {
+	var first error
+	for _, value := range values {
+		if value != nil && first == nil {
+			first = value
+		}
+	}
+	return first
 }

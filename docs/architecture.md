@@ -1,186 +1,221 @@
 # Architecture
 
-## Core idea
+## Supervisor v2
 
-The harness is an event-driven control plane, not a fixed pipeline. A workflow is a mutable directed acyclic graph. Nodes describe capabilities (`agent`, `command`, `human`, `finalize`, or an extension kind), not lifecycle phases.
+`handoff` is built around one Go Supervisor, not coordination between several
+durable stores.
 
 ```text
-transcript / prompt / event
-           │
-           ▼
-   durable event ledger ───────► live TUI / JSONL followers
-           │
-           ▼
-       pure reducer
-           │
-           ▼
-  materialized workflow graph
-           │
-     ready-node scheduler
-           │
-     ┌─────┼──────────────┐
-     ▼     ▼              ▼
-   Codex  Claude       Pi / custom
-     │     │              │
-     └─────┴── proposal ──┘
-                 │
-                 ▼
-           policy kernel
-            │          │
-         accept      reject + evidence
+human / scheduler / runtime Driver / finalizer
+                     │
+                     ▼
+              typed Command
+                     │
+          decide against cloned State
+                     │
+                     ▼
+      one append-only Supervisor journal
+                     │
+                     ▼
+                 pure reducer
+                     │
+       ┌─────────────┼──────────────┐
+       ▼             ▼              ▼
+   scheduler     JSON / TUI      policy gates
 ```
 
-Workers decide how to pursue the goal. They may add nodes, dependencies, evidence, or attestations; supersede obsolete work; retry; or request human input. They cannot alter the root, budgets, pause state, or finalization authority.
+The public Go seam is `github.com/carlchungus/durable-agent-handoff/supervisor`.
+Its `Store.StartExecution` method accepts the exact native Session identity,
+prompt, RuntimeSpec, root, authority and finalizer configuration, budget, and
+idempotency key. This is the seam arca-cloud promotion calls.
 
-Verifier language is normalized only at the runtime protocol boundary. The ledger stores a three-state canonical verdict for policy and, when normalization was required, the exact source verdict for auditability. Qualified passes remain non-passing, blocking failures remain blocked, and unrecognized semantics fail closed.
+## One journal, distinct identities
 
-## Why there are no mandatory phases
+ADR 0001 remains binding: conversation, logical work, process execution, and
+observation are different resources.
 
-Discovery, planning, implementation, and evaluation are useful roles, but they are not globally correct states. A tiny fix may inspect, edit, and verify in one agent turn. An uncertain incident may create several read-only discovery nodes before any plan exists. An evaluator may find a different root cause and supersede the current implementation.
+- **Workflow** owns desired Nodes, dependency declarations, root, budgets, and
+  authority/finalizer configuration.
+- **Session** owns the exact opaque native runtime identity, lineage, and root.
+  It never owns a PID, output pipe, or process state.
+- **Activity** owns one immutable logical result generation, prompt, Session,
+  and exact dependency Result bindings.
+- **Attempt** owns one immutable OS launch plus its ordered typed milestones,
+  process identity, command digest, outputs, and Lease identity.
+- **Result** is immutable and names the exact Activity generation and Attempt
+  that produced it.
+- **Message**, **Control**, and canonical-worktree **Lease** retain independent
+  identities and fences.
 
-The graph records what exists and why. Policy records what is allowed. Attestations record why a result should be trusted. This separates workflow intelligence from authority.
+These resources are maps in one rebuildable projection. They are not separate
+mutation authorities. Every command appends one journal entry containing all
+domain events required for the transition.
 
-## Event and recovery model
-
-Every accepted proposal appends one event and then atomically replaces `state.json`. The ledger uses monotonically increasing sequence numbers and `fsync`. A cross-process lease serializes writers. If the snapshot is absent or invalid, the reducer rebuilds it from `events.jsonl`.
-
-Runtime output is stored per workflow, node, and attempt:
+The journal lives in the hardened `secureledger` primitive at:
 
 ```text
-$HANDOFF_HOME/workflows/WF_ID/
+$HANDOFF_HOME/supervisor-v2/canonical/
   events.jsonl
-  state.json
-  runs/NODE_ID/ATTEMPT/
-    activity-attempt-N/
-      last-message.json
-      result.schema.json
+  state.json       # disposable projection snapshot
+  .write.lock
 ```
 
-Background sessions have their own event-sourced identity and inbox kernel:
+`events.jsonl` owns global commit order. `state.json` is never trusted over the
+journal. A missing, stale, or invalid snapshot is rebuilt by replay.
+
+## Transaction and crash model
+
+For every accepted command the Store:
+
+1. locks the canonical journal record;
+2. replays current State;
+3. returns an earlier receipt if idempotency key and input digest match;
+4. decides a complete domain-event set;
+5. applies that set to a clone and validates all invariants;
+6. appends and fsyncs one journal entry; and
+7. atomically replaces the projection snapshot.
+
+Failure before append commits nothing. Failure after append commits the whole
+command, even if snapshot replacement or response delivery fails. Retrying the
+same key returns the same resource and sequence. Reusing a key for divergent
+input fails without mutation.
+
+Rejected commands never partially mutate live State. Crash-injection tests cover
+every transaction boundary, replay without a snapshot, and concurrent writers.
+
+## Desired work and immutable dependency binding
+
+A Node contains desired Work and dependency Node identities. It has no
+`ready`, `running`, `attempt`, process, or Session field.
+
+Eligibility is a query:
+
+- each dependency must have an immutable completed Result;
+- queuing an Activity captures the exact Result ID for each dependency; and
+- later results or continuations cannot change an existing binding.
+
+Completed Results never reopen. A human reply is one atomic command that queues
+an inbox Message and creates the next Activity generation on the exact Session.
+The predecessor Activity and Result remain immutable. A successor that already
+bound the predecessor Result keeps that binding.
+
+## Attempts, budgets, and health
+
+Preparing an Attempt records its immutable launch identity and exact output
+identities before an OS process is allowed to run. Every launch is retained,
+including adapter startup failures and provider-unavailable exits.
+
+The task-attempt budget counts Attempts containing `turn_started`. Pre-turn
+failures consume only the independent launch budget; there are no refunds.
+
+Health is derived from typed milestones:
+
+| Facts observed | Derived process health |
+| --- | --- |
+| Attempt prepared, process spawned, or Session bound | `starting` |
+| `turn_started` without terminal milestone | `running` |
+| `adapter_start_failed` or `exit` | `exited` |
+
+Therefore Codex `thread.started` without `turn.started` can never be reported as
+healthy/running. Output byte growth is a transport fact, not progress.
+Meaningful progress exists only after a Driver emits `meaningful_progress`.
+
+## Runtime Drivers
+
+Codex, Claude, and Pi implement a deep Driver contract. Each Driver owns:
+
+- non-shell argv construction;
+- explicit worktree, sandbox, model, and effort selection;
+- exact native Session resume;
+- provider-specific stream decoding; and
+- typed adapter-start and process-exit milestones.
+
+The normalized milestone vocabulary is:
 
 ```text
-$HANDOFF_HOME/sessions/AGENT_ID/
-  events.jsonl
-  state.json
+process_spawned
+session_bound
+turn_started
+effect_started
+meaningful_progress
+result
+provider_unavailable
+adapter_start_failed
+exit
 ```
 
-This is deliberately separate from workflow nodes: a node describes graph work, while an agent session describes a durable conversation and its queued replies. Logical state and process liveness are independent. Message dispatch uses a monotonic fence independent of refundable node retry counts. Every accepted or rejected agent exit records a typed attempt outcome atomically with its workflow transition; reconciliation delivers or requeues only the inbox batch named by that outcome. Exact opaque runtime session IDs are retained across process exit and reply-triggered restart.
+Decoders read only documented provider fields. They do not recursively search
+arbitrary JSON for `session_id`, `thread_id`, a result, or a limit string.
+Runtime Drivers never receive GitHub merge authority.
 
-Independently controllable work uses a separate Activity ledger:
+Codex and Claude enforce `read-only` through native restrictions. Pi fails
+closed for read-only work until an external OS sandbox is configured.
+
+Service trust is explicit: `workspace` selects the provider's workspace
+restrictions and `full` selects its native full-trust flag. This policy is
+translated inside each Driver and is never implemented with a shell command or
+by placing prompt/environment data in a unit file.
+
+## Canonical-worktree writer Lease
+
+Workspace-writing Attempt creation and Lease acquisition share one journal
+transaction. The Lease key is the filesystem-canonical worktree path and its
+fence contains:
 
 ```text
-$HANDOFF_HOME/activities/ACTIVITY_ID/
-  events.jsonl
-  state.json
-  ATTEMPT_ID_stdout.log
-  ATTEMPT_ID_stderr.log
+Activity ID + Activity generation + Attempt ID
 ```
 
-A Session owns conversational identity; an Activity owns work lifecycle and
-durable output; an Attempt records one immutable process execution. PID,
-command, output, and stop authority therefore never become Session fields.
-Checklist tasks remain separate again: they are planning state, not background
-processes.
+At most one unreleased writer Lease may exist for a canonical path across all
+workflows, schedulers, and symlink aliases. A stale generation, Attempt, or
+Lease cannot record milestones or apply a Control. The exact terminal Attempt
+releases its Lease. A queued continuation waits instead of overlapping an
+already-running successor.
 
-An attachment is an ephemeral reader over an Activity revision and byte cursor.
-Disconnecting it has no lifecycle effect. Stop, signal, adopt, and restart are
-durable control intents that include the expected Activity generation and exact
-Attempt process identity (attempt ID, PID plus platform start token, supervisor
-ID, and supervisor generation). A live process is adopted once per supervisor
-incarnation; routine reconciliation by the same owner does not churn fencing
-tokens. Stale controllers and PID reuse fail closed.
+## Pure projections
 
-Every new Attempt starts through a tiny gated runner. The runner establishes a
-dedicated process tree, but cannot execute the target until the supervisor has
-fsynced the exact PID, birth token, owner, and generation to the Activity
-ledger. Supervisor death before that release closes the inherited gate and the
-target never starts. After release, the runner waits for the target and writes
-its exact completion back through the same fenced Activity transaction before
-exiting. Recovery can therefore adopt a live runner or replay its terminal
-record without a second process-authority file. `attempt.json` is read only as
-legacy compatibility for pre-v0.4 workflows.
+The reducer is the only lifecycle interpretation. `status`, list, queue, TUI,
+health, meaningful progress, verifier/repair state, publication eligibility,
+and orchestration overhead all use the same State.
 
-On Unix the runner owns a dedicated process group. On Windows it is assigned to
-a uniquely named Job Object before release, inherits the job handle across
-supervisor death, and uses `KILL_ON_JOB_CLOSE` so runner death contains every
-remaining descendant. Stop reopens and terminates the kernel job identity
-rather than re-resolving a PID ancestry snapshot. Attempt output filenames are
-reserved by the prepared event ordinal; orphan files left before that event are
-safely replaced on retry. Agent Attempts also persist the exact structured-result
-path. An absent path identifies the shared layout used by pre-v0.4 development
-builds, so migration never guesses from an ordinal or consumes a stale artifact.
+Queries are read-only. Time-sensitive views accept an explicit `asOf` value;
+polling never appends an observation or invokes reconciliation. Orchestration
+overhead is derived from persisted milestone timestamps:
 
-The ledger reducer produces the sole Activity projection used by the human TUI,
-JSON/JSONL CLI surfaces, and policy. `activity follow` advances an exact output
-cursor by polling the same durable ledger, so reconnect resumes without replaying
-or skipping bytes. The prior-art evidence and license boundary are in
-[`prior-art-codex-pi-omp.md`](prior-art-codex-pi-omp.md); the domain decision is
-recorded in
-[`ADR 0001`](adr/0001-separate-sessions-and-activities.md).
+- Attempt preparation to `process_spawned`;
+- `process_spawned` to `turn_started`; and
+- `turn_started` to first `meaningful_progress`.
 
-The ledger root is a supervisor-private trust boundary and must remain outside
-worker-writable sandboxes. Descriptor-relative opens, ownership/mode checks,
-single-link regular files, pinned identities, locks, fsync, and replay repair
-fail closed on accidental or uncoordinated path replacement. They do not claim
-to isolate an actively malicious unsandboxed process running as the supervisor's
-same OS user; such a process can also inspect or signal the supervisor directly.
-Windows fsyncs ledger files but exposes no POSIX directory-fsync contract through
-Go's directory handles; process-crash recovery is covered, while metadata
-durability across sudden power loss remains filesystem-defined on Windows.
+Publication is an authority-owned effect. The projection derives whether a
+finalizer is disabled, awaiting a Result, awaiting an independent passing
+verifier, awaiting human authorization, or eligible. An unchanged verified head
+and named checks remain mandatory for any future GitHub effect executor.
 
-## Scheduling
+## Policy and trust boundaries
 
-`handoff serve` scans active workflows and runs ready nodes up to a configurable cross-workflow concurrency bound. Per-workflow writes remain serialized. It can run under launchd or systemd-user and resumes from durable state after restart.
+- The Supervisor root is private and outside worker-writable sandboxes.
+- Paths are canonicalized before authority checks or Lease keys are created.
+- An authority envelope may narrow but never widen a runtime sandbox.
+- Enabled finalization requires explicit human and independent-verifier gates.
+- Privileged Git/GitHub execution uses argv, never a shell.
+- Proposals and imported State are validated against a clone before journal
+  mutation.
 
-The scheduler does not infer health from a PID. The observable contract is state plus events, evidence, attempt count, and persisted session ID.
+## Migration
 
-## Claude-compatible dynamic workflows
+V1 is imported once; it is not dual-run. `Store.ImportV1` reads and hashes legacy
+event ledgers, replays each ledger by its own sequence, normalizes completed and
+reopened histories, and appends one `legacy.imported` transaction. Legacy bytes
+remain backward readable and unchanged. Missing exact Session identities are
+explicitly unresolved instead of scraped or guessed. See ADR 0003.
 
-Dynamic workflows are a separate coordination contract layered over the same runtime adapters; they are not translated into a static phase DAG. A sandboxed JavaScript program owns loops, branches, `parallel`, `pipeline`, phases, and intermediate values. Go owns agent execution, caps, permissions, storage, leases, and replay.
+## Extension boundaries
 
-The durable journal records every `agent()` start in start order, its prompt/options fingerprint, and its result. On restart the script executes again from the beginning. Cached results are returned only through the completed ordered prefix. At the first unfinished or changed call, that call and the entire suffix execute live, even when later calls completed before interruption. The JavaScript heap therefore does not need to be serialized, and replay cannot manufacture an execution order the original run never observed.
+Coordination contracts such as dynamic JavaScript workflows, teams, goals, and
+schedules remain distinct state machines, but their durable changes must be
+Supervisor Commands in the same global journal. They may not introduce another
+authoritative lifecycle store.
 
-The compatibility profile targets Claude's documented 16 concurrent and 1,000 total agents. Policy may choose lower caps. The workflow program itself receives no filesystem, shell, network, process, import, or package-loader capability; only the agents it launches can request tools through their inherited capability envelope.
-
-The first embedded VM milestone evaluates async JavaScript function bodies in
-QuickJS-ng/WASM under wazero. The guest sees only frozen workflow, node,
-evidence, and structured-argument data plus a single `propose()` capability.
-Go validates the complete proposal against a cloned graph before returning it.
-WASI receives no filesystem preopens, environment, sockets, process surface, or
-host entropy; source/input/output, memory, stack, deterministic execution fuel,
-time, and mutation count are bounded. See
-[`javascript-workflow-vm.md`](javascript-workflow-vm.md) for the exact API and
-engine tradeoffs.
-
-## Routing and usage limits
-
-Role-specific preference ladders are stored outside individual workflows. Before a node starts, the supervisor selects the first candidate without an active cooldown. A recognized quota/usage-limit or rate-limit failure records provider health, returns the node to `ready`, persists the next runtime choice, and appends evidence. Ordinary runtime, auth, model-name, code, and test failures stay on the normal failure path.
-
-Cooldown state is durable across scheduler restarts. When every candidate is cooling down, resolution returns the earliest wake time and no worker is launched. The model never decides that its provider is exhausted and never edits provider health directly.
-
-## Trust boundaries
-
-1. Transcript discovery is read-only and text-only. It redacts common credentials and classifies obvious high-risk work.
-2. Runtime workers can change files only within their configured worktree and can propose graph mutations.
-3. The policy kernel validates an entire proposal against a cloned graph before applying any mutation.
-   Read-only workers cannot create a write-capable child; runtime routing preserves the parent's sandbox envelope.
-4. A finalizer is privileged and must be authorized by a human/supervisor node. Agent proposals cannot create one.
-5. Finalization requires an independent passing attestation, local diff budgets, a non-protected branch, exact named CI checks, and an unchanged PR head.
-
-## Runtime adapters
-
-Runtime-specific command construction lives behind one interface. Each adapter must provide noninteractive execution, an explicit working directory, a parseable event stream, a final result object, and exact-session resume when supported.
-
-Claude runs in safe mode with an empty strict MCP configuration. This intentionally does not inherit ambient plugins, hooks, or MCP servers. Pi and OhMyPi need stronger external isolation because they do not provide an OS sandbox.
-
-Codex and Claude support a portable `read-only` profile. Codex receives its native read-only sandbox; Claude receives a read-only tool allowlist with Bash/Edit/Write removed. Pi, OhMyPi, and arbitrary executables fail closed for `read-only` until wrapped by an external OS sandbox.
-
-## Extension path
-
-The node `kind` field is data rather than a Go enum. A future handler registry can add issue trackers, deployment observers, browser evaluators, or remote harnesses without changing graph semantics. Unknown kinds stay visible and non-runnable instead of being guessed.
-
-Likewise, discovery is source-specific. Claude Code is the first source; Codex and Pi transcript importers can implement the same sanitized record contract.
-
-## Team coordination
-
-Teams use a separate append-only ledger rather than encoding peers as workflow nodes. Logical members outlive runtime sessions. Member and process state are orthogonal, task claims use expiring fencing generations, and plan approval and cooperative shutdown are explicit messages and state transitions. This preserves the observable peer-coordination contract while allowing a Claude member to resume as Codex or Pi after a provider limit or crash.
+The existing QuickJS/WASM isolation and deterministic ordered-prefix replay
+remain suitable. Runtime invocation starts/results and accepted graph changes
+must use Supervisor commands so a script journal cannot race execution State.

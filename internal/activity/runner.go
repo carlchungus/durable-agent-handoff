@@ -1,9 +1,11 @@
+// Package activity contains only the non-durable process containment helper
+// used by the Supervisor v2 executor. Durable Activity state lives in the
+// Supervisor journal; this package has no ledger or reconciliation authority.
 package activity
 
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -17,30 +19,15 @@ const (
 )
 
 type runnerRequest struct {
-	Argv       []string          `json:"argv"`
-	Stdin      []byte            `json:"stdin,omitempty"`
-	Completion *runnerCompletion `json:"completion,omitempty"`
+	Argv  []string `json:"argv"`
+	Stdin []byte   `json:"stdin,omitempty"`
 }
 
-type runnerCompletion struct {
-	Root       string          `json:"root"`
-	ActivityID string          `json:"activity_id"`
-	Generation uint64          `json:"generation"`
-	Identity   AttemptIdentity `json:"identity"`
-}
+type watchdogRequest struct{}
 
-type watchdogRequest struct {
-	Completion *runnerCompletion `json:"completion,omitempty"`
-	Result     ExitResult        `json:"result"`
-}
-
-func (g *GatedCommand) CompleteActivity(root, activityID string, generation uint64, identity AttemptIdentity) {
-	g.request.Completion = &runnerCompletion{Root: root, ActivityID: activityID, Generation: generation, Identity: identity}
-}
-
-// GatedCommand is a small per-attempt runner. The runner establishes the
-// process-tree identity and waits on an inherited pipe. The target command is
-// not executed until Release is called after MarkRunning is durable.
+// GatedCommand establishes a dedicated process tree before releasing the
+// target. It is a transport boundary only; terminal facts are recorded by the
+// Supervisor executor after the target exits.
 type GatedCommand struct {
 	Command *exec.Cmd
 	gate    io.WriteCloser
@@ -117,7 +104,7 @@ func init() {
 	}
 	code, err := runGatedTarget(os.Stdin, os.Stdout, os.Stderr)
 	if err != nil {
-		_, _ = fmt.Fprintln(os.Stderr, "activity runner:", err)
+		_, _ = io.WriteString(os.Stderr, "activity runner: "+err.Error()+"\n")
 		os.Exit(127)
 	}
 	os.Exit(code)
@@ -137,61 +124,27 @@ func runGatedTarget(input io.Reader, stdout, stderr io.Writer) (int, error) {
 	}
 	watchdog, err := startProcessTreeWatchdog()
 	if err != nil {
-		return 0, fmt.Errorf("start process-tree watchdog: %w", err)
+		return 0, err
 	}
 	command := exec.Command(request.Argv[0], request.Argv[1:]...)
 	command.Env = withoutRunnerEnvironment(os.Environ())
 	command.Stdin = strings.NewReader(string(request.Stdin))
-	command.Stdout = stdout
-	command.Stderr = stderr
+	command.Stdout, command.Stderr = stdout, stderr
 	err = command.Run()
 	code := 0
 	if command.ProcessState != nil {
 		code = command.ProcessState.ExitCode()
 	}
-	state := StateCompleted
-	errorText := ""
-	if err != nil {
-		state = StateFailed
-		errorText = err.Error()
+	if completeErr := watchdog.complete(); err == nil {
+		err = completeErr
 	}
-	if err := watchdog.complete(request.Completion, ExitResult{State: state, ExitCode: &code, Error: errorText}); err != nil {
-		return code, fmt.Errorf("complete process-tree watchdog: %w", err)
-	}
-	return code, nil
-}
-
-// finishRunnerAttempt permits a recovered supervisor to advance ownership
-// while the same exact runner continues. The runner retries with the current
-// owner fence only when attempt ID, PID, and birth token still name itself.
-func finishRunnerAttempt(store *Store, completion *runnerCompletion, result ExitResult, runnerPID int) error {
-	for range 4 {
-		current, err := store.Load(completion.ActivityID)
-		if err != nil {
-			return err
-		}
-		if terminal(current.State) {
-			return nil
-		}
-		attempt, ok := currentAttempt(current)
-		if !ok || attempt.ID != completion.Identity.ID || attempt.PID != runnerPID || attempt.PID != completion.Identity.PID || attempt.ProcessStartToken != completion.Identity.ProcessStartToken || attempt.ProcessTreeID != completion.Identity.ProcessTreeID || !processMatches(identityOf(attempt)) {
-			return ErrFenced
-		}
-		if err = store.FinishAttempt(current.ID, current.Generation, identityOf(attempt), result); err == nil {
-			return nil
-		} else if !errors.Is(err, ErrFenced) {
-			return err
-		}
-	}
-	return ErrFenced
+	return code, err
 }
 
 func withoutRunnerEnvironment(env []string) []string {
-	runnerPrefix := runnerEnvironment + "="
-	watchdogPrefix := watchdogEnvironment + "="
 	filtered := make([]string, 0, len(env))
 	for _, item := range env {
-		if !strings.HasPrefix(item, runnerPrefix) && !strings.HasPrefix(item, watchdogPrefix) {
+		if !strings.HasPrefix(item, runnerEnvironment+"=") && !strings.HasPrefix(item, watchdogEnvironment+"=") {
 			filtered = append(filtered, item)
 		}
 	}

@@ -3,204 +3,83 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"strings"
 	"testing"
 
-	"github.com/carlchungus/durable-agent-handoff/internal/activity"
-	"github.com/carlchungus/durable-agent-handoff/internal/core"
-	agentsession "github.com/carlchungus/durable-agent-handoff/internal/session"
-	"github.com/carlchungus/durable-agent-handoff/internal/team"
+	"github.com/carlchungus/durable-agent-handoff/supervisor"
 )
 
-func TestStartAndStatusJSONContract(t *testing.T) {
-	state := t.TempDir()
-	root := t.TempDir()
+func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
+	state, root := t.TempDir(), t.TempDir()
+	if err := os.Chmod(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	request := `{"native_session":{"runtime":"codex","id":"exact-thread"},"prompt":"secret stdin prompt","runtime":{"name":"codex","sandbox":"read-only"},"root":"` + root + `","authority":{"requested_by":"human:arca","human_authorized":true,"sandbox":"read-only"},"finalizer":{"enabled":false},"budget":{"max_task_attempts":3,"max_launches":12},"idempotency_key":"arca-file-start-01"}`
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = write.WriteString(request); err != nil {
+		t.Fatal(err)
+	}
+	_ = write.Close()
+	previous := os.Stdin
+	os.Stdin = read
+	t.Cleanup(func() {
+		os.Stdin = previous
+		_ = read.Close()
+	})
 	var out, errOut bytes.Buffer
-	if err := run([]string{"start", "--state", state, "--goal", "test the CLI", "--root", root, "--runtime", "codex", "--json"}, &out, &errOut); err != nil {
+	if err = run([]string{"execution", "start", "--state", state, "--file", "-", "--json"}, &out, &errOut); err != nil {
+		t.Fatalf("start: %v stderr=%s", err, errOut.String())
+	}
+	var response struct {
+		Execution supervisor.Execution `json:"execution"`
+		Receipt   supervisor.Receipt   `json:"receipt"`
+	}
+	if err = json.Unmarshal(out.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	var created core.Workflow
-	if err := json.Unmarshal(out.Bytes(), &created); err != nil {
-		t.Fatal(err)
+	if response.Execution.ID == "" || response.Receipt.Existing || strings.Contains(out.String(), "secret stdin prompt") {
+		t.Fatalf("unexpected response=%s", out.String())
 	}
-	if created.ID == "" || created.Nodes["lead"] == nil {
-		t.Fatalf("created=%#v", created)
-	}
-	out.Reset()
-	if err := run([]string{"status", "--state", state, created.ID, "--json"}, &out, &errOut); err != nil {
-		t.Fatal(err)
-	}
-	var loaded core.Workflow
-	if err := json.Unmarshal(out.Bytes(), &loaded); err != nil {
-		t.Fatal(err)
-	}
-	if loaded.ID != created.ID || loaded.Goal != "test the CLI" {
-		t.Fatalf("loaded=%#v", loaded)
+	if err = run([]string{"execution", "start", "--state", state, "--file", "-", "--json"}, &out, &errOut); err == nil {
+		t.Fatal("closed stdin unexpectedly accepted a second request")
 	}
 }
 
-func TestFinalizationRequiresExplicitGate(t *testing.T) {
+func TestStatusListReplyAndPauseUseSupervisorProjection(t *testing.T) {
+	state, root := t.TempDir(), t.TempDir()
+	if err := os.Chmod(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	var out, errOut bytes.Buffer
-	err := run([]string{"start", "--state", t.TempDir(), "--goal", "ship", "--root", t.TempDir(), "--finalize-repo", "owner/repo"}, &out, &errOut)
-	if err == nil {
-		t.Fatal("expected missing gate error")
-	}
-}
-
-func TestPreferenceCLIStoresOrderedLadder(t *testing.T) {
-	state := t.TempDir()
-	var out, errOut bytes.Buffer
-	err := run([]string{"preference", "set", "--state", state, "planner", "--candidate", "claude:opus:xhigh", "--candidate", "codex:gpt-5.6-sol:xhigh"}, &out, &errOut)
-	if err != nil {
+	if err := run([]string{"start", "--state", state, "--root", root, "--runtime", "codex", "--session", "exact-thread", "--prompt", "work", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "cli-v2-start-01", "--json"}, &out, &errOut); err != nil {
 		t.Fatal(err)
+	}
+	var response struct {
+		Execution supervisor.Execution `json:"execution"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Execution.ID == "" {
+		t.Fatal("missing execution")
 	}
 	out.Reset()
-	if err = run([]string{"preference", "list", "--state", state}, &out, &errOut); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(out.Bytes(), []byte(`"opus"`)) || !bytes.Contains(out.Bytes(), []byte(`"gpt-5.6-sol"`)) {
-		t.Fatalf("output=%s", out.String())
-	}
-}
-
-func TestTeamCLIProducesMachineReadableState(t *testing.T) {
-	state := t.TempDir()
-	var out, errOut bytes.Buffer
-	if err := run([]string{"team", "create", "--state", state, "--name", "review", "--workflow", "wf_1", "--lead", "captain"}, &out, &errOut); err != nil {
-		t.Fatal(err)
-	}
-	var created team.Team
-	if err := json.Unmarshal(out.Bytes(), &created); err != nil {
-		t.Fatal(err)
-	}
-	if created.ID == "" || created.LeadID != "captain" || created.WorkflowID != "wf_1" {
-		t.Fatalf("created=%+v", created)
+	if err := run([]string{"list", "--state", state, "--json"}, &out, &errOut); err != nil || !strings.Contains(out.String(), string(response.Execution.ID)) {
+		t.Fatalf("list=%s err=%v", out.String(), err)
 	}
 	out.Reset()
-	if err := run([]string{"team", "status", "--state", state, created.ID}, &out, &errOut); err != nil {
-		t.Fatal(err)
-	}
-	var loaded team.Team
-	if err := json.Unmarshal(out.Bytes(), &loaded); err != nil {
-		t.Fatal(err)
-	}
-	if loaded.ID != created.ID || loaded.Members["captain"] == nil {
-		t.Fatalf("loaded=%+v", loaded)
-	}
-}
-
-func TestAgentReplyInboxAndViewAreMachineReadable(t *testing.T) {
-	state := t.TempDir()
-	st, _ := core.OpenStore(state)
-	w, _ := st.Create("continue work", t.TempDir(), core.DefaultBudget())
-	n := &core.Node{ID: "lead", Title: "lead", Kind: "agent", Runtime: core.RuntimeSpec{Name: "claude"}, SessionID: "session-exact-123"}
-	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: n}}})
-	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: n.ID, State: core.NodeRunning}}})
-	w, _ = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: n.ID, Mutations: []core.Mutation{{Op: "set_state", NodeID: n.ID, State: core.NodeCompleted}}})
-	sessions, _ := agentsession.OpenStore(state)
-	_, _ = sessions.Ensure(agentsession.Descriptor{WorkflowID: w.ID, NodeID: n.ID, Runtime: "claude", RuntimeSessionID: n.SessionID, LogicalState: agentsession.LogicalNeedsInput, ProcessState: agentsession.ProcessExited})
-
-	var out, errOut bytes.Buffer
-	if err := run([]string{"agent", "reply", "--state", state, w.ID, n.ID, "--message", "use blue"}, &out, &errOut); err != nil {
-		t.Fatal(err)
-	}
-	var message agentsession.Message
-	if err := json.Unmarshal(out.Bytes(), &message); err != nil {
-		t.Fatal(err)
-	}
-	if message.State != agentsession.MessageQueued || message.Sequence != 1 {
-		t.Fatalf("message=%+v", message)
-	}
-	w, _ = st.Load(w.ID)
-	if w.Nodes[n.ID].State != core.NodeReady || w.Nodes[n.ID].SessionID != "session-exact-123" {
-		t.Fatalf("node=%+v", w.Nodes[n.ID])
+	if err := run([]string{"status", string(response.Execution.ID), "--state", state}, &out, &errOut); err != nil || !strings.Contains(out.String(), "status=queued") {
+		t.Fatalf("status=%s err=%v", out.String(), err)
 	}
 	out.Reset()
-	if err := run([]string{"agent", "inbox", "--state", state, w.ID, n.ID, "--after", "0"}, &out, &errOut); err != nil {
+	if err := run([]string{"execution", "pause", "--state", state, "--workflow", string(response.Execution.WorkflowID), "--json"}, &out, &errOut); err != nil {
 		t.Fatal(err)
 	}
-	var inbox []agentsession.Message
-	if err := json.Unmarshal(out.Bytes(), &inbox); err != nil || len(inbox) != 1 || inbox[0].Body != "use blue" {
-		t.Fatalf("inbox=%+v err=%v", inbox, err)
-	}
-	out.Reset()
-	if err := run([]string{"agents", "--state", state, "--workflow", w.ID, "--json"}, &out, &errOut); err != nil {
-		t.Fatal(err)
-	}
-	var view []*agentsession.Session
-	if err := json.Unmarshal(out.Bytes(), &view); err != nil || len(view) != 1 {
-		t.Fatalf("view=%+v err=%v", view, err)
-	}
-	if view[0].LogicalState != agentsession.LogicalNeedsInput || view[0].ProcessState != agentsession.ProcessExited || view[0].RuntimeSessionID != "session-exact-123" {
-		t.Fatalf("view=%+v", view[0])
-	}
-	out.Reset()
-	if err := run([]string{"agents", "--state", state, "--workflow", w.ID}, &out, &errOut); err != nil {
-		t.Fatal(err)
-	}
-	if json.Valid(out.Bytes()) || !bytes.Contains(out.Bytes(), []byte("LOGICAL")) || !bytes.Contains(out.Bytes(), []byte("needs_input")) || !bytes.Contains(out.Bytes(), []byte("session-exact-123")) {
-		t.Fatalf("human agent view=%q", out.String())
-	}
-}
-
-func TestActivityCLIUsesTheDurableProjectionAndOutputCursor(t *testing.T) {
-	state := t.TempDir()
-	store, err := activity.OpenStore(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	item, err := store.Create(activity.Descriptor{ID: "activity_abcdefabcdefabcdefabcdef", Work: activity.WorkSpec{Kind: "command", Cwd: t.TempDir(), Intent: "test command"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	attempt, stdout, stderr, err := store.PrepareAttempt(item.ID, item.Generation, activity.AttemptStart{Runtime: "exec"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	attempt, err = store.MarkRunning(item.ID, item.Generation, attempt.ID, activity.ProcessIdentity{PID: 123, ProcessStartToken: "exact", SupervisorID: "supervisor-a", SupervisorGeneration: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = stdout.WriteString("hello\n"); err == nil {
-		err = stdout.Sync()
-	}
-	_ = stdout.Close()
-	_ = stderr.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity := activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
-	if err = store.FinishAttempt(item.ID, item.Generation, identity, activity.ExitResult{State: activity.StateCompleted}); err != nil {
-		t.Fatal(err)
-	}
-
-	var out, errOut bytes.Buffer
-	if err = run([]string{"activity", "list", "--state", state, "--json"}, &out, &errOut); err != nil {
-		t.Fatal(err)
-	}
-	var listed []*activity.Activity
-	if err = json.Unmarshal(out.Bytes(), &listed); err != nil || len(listed) != 1 || listed[0].ID != item.ID {
-		t.Fatalf("listed=%+v err=%v", listed, err)
-	}
-	out.Reset()
-	if err = run([]string{"activity", "read", "--state", state, item.ID, "--json"}, &out, &errOut); err != nil {
-		t.Fatal(err)
-	}
-	var read activity.Activity
-	if err = json.Unmarshal(out.Bytes(), &read); err != nil || read.State != activity.StateCompleted {
-		t.Fatalf("read=%+v err=%v", read, err)
-	}
-	out.Reset()
-	if err = run([]string{"activity", "read", "--state", state, item.ID}, &out, &errOut); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(out.Bytes(), []byte(attempt.Stdout.ID)) || !bytes.Contains(out.Bytes(), []byte("supervisor-a")) {
-		t.Fatalf("human activity read omitted reconnect identity: %q", out.String())
-	}
-	out.Reset()
-	if err = run([]string{"activity", "follow", "--state", state, item.ID, "--stream", "stdout", "--output", attempt.Stdout.ID, "--after", "0"}, &out, &errOut); err != nil {
-		t.Fatal(err)
-	}
-	if out.String() != "hello\n" {
-		t.Fatalf("follow=%q", out.String())
+	if !strings.Contains(out.String(), `"workflow_id"`) || !strings.Contains(out.String(), `"existing":false`) {
+		t.Fatalf("pause=%s", out.String())
 	}
 }

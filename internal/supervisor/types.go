@@ -90,6 +90,7 @@ type Execution struct {
 type Workflow struct {
 	ID        WorkflowID       `json:"id"`
 	Root      string           `json:"root"`
+	Role      string           `json:"role,omitempty"`
 	Authority AuthoritySpec    `json:"authority"`
 	Finalizer FinalizerSpec    `json:"finalizer"`
 	Budget    Budget           `json:"budget"`
@@ -119,6 +120,34 @@ type Session struct {
 	ParentID           SessionID             `json:"parent_id,omitempty"`
 	Root               string                `json:"root"`
 	CreatedAt          time.Time             `json:"created_at"`
+}
+
+type FinalizationState string
+
+const (
+	FinalizationPrepared FinalizationState = "prepared"
+	FinalizationMerged   FinalizationState = "merged"
+	FinalizationBlocked  FinalizationState = "blocked"
+)
+
+// Finalization is the durable record of an authority-owned publication effect.
+// The exact head and named gates are captured before GitHub is mutated.
+type Finalization struct {
+	ID             string            `json:"id"`
+	ExecutionID    ExecutionID       `json:"execution_id"`
+	WorkflowID     WorkflowID        `json:"workflow_id"`
+	IdempotencyKey string            `json:"idempotency_key"`
+	Repository     string            `json:"repository"`
+	PullRequest    string            `json:"pull_request"`
+	Gates          []string          `json:"gates"`
+	Method         string            `json:"method"`
+	HumanApproved  bool              `json:"human_approved"`
+	HeadSHA        string            `json:"head_sha"`
+	PRURL          string            `json:"pr_url,omitempty"`
+	State          FinalizationState `json:"state"`
+	Summary        string            `json:"summary,omitempty"`
+	PreparedAt     time.Time         `json:"prepared_at"`
+	CompletedAt    time.Time         `json:"completed_at,omitempty"`
 }
 
 type ResultBinding struct {
@@ -280,6 +309,7 @@ type Lease struct {
 type Control struct {
 	ID                 ControlID  `json:"id"`
 	Kind               string     `json:"kind"`
+	Actor              string     `json:"actor"`
 	ActivityID         ActivityID `json:"activity_id"`
 	ExpectedGeneration uint64     `json:"expected_generation"`
 	ExpectedAttemptID  AttemptID  `json:"expected_attempt_id"`
@@ -321,6 +351,8 @@ type State struct {
 	Leases        map[LeaseID]*Lease             `json:"leases"`
 	Controls      map[ControlID]*Control         `json:"controls"`
 	Pauses        map[WorkflowID]*Pause          `json:"pauses"`
+	Finalizations map[string]*Finalization       `json:"finalizations"`
+	RoleLadders   map[string][]RuntimeSpec       `json:"role_ladders"`
 	Idempotency   map[string]IdempotencyRecord   `json:"idempotency"`
 	LegacyImports map[string]LegacyImport        `json:"legacy_imports"`
 }
@@ -332,7 +364,7 @@ func emptyState() *State {
 		Sessions: make(map[SessionID]*Session), Activities: make(map[ActivityID]*Activity),
 		Attempts: make(map[AttemptID]*Attempt), Results: make(map[ResultID]*Result), Attestations: make(map[AttestationID]*Attestation),
 		Messages: make(map[MessageID]*Message), Leases: make(map[LeaseID]*Lease),
-		Controls: make(map[ControlID]*Control), Pauses: make(map[WorkflowID]*Pause), Idempotency: make(map[string]IdempotencyRecord),
+		Controls: make(map[ControlID]*Control), Pauses: make(map[WorkflowID]*Pause), Finalizations: make(map[string]*Finalization), RoleLadders: make(map[string][]RuntimeSpec), Idempotency: make(map[string]IdempotencyRecord),
 		LegacyImports: make(map[string]LegacyImport),
 	}
 }

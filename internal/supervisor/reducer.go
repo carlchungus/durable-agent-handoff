@@ -6,27 +6,32 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
 const (
-	eventExecutionStarted    = "execution.started"
-	eventNodeAdded           = "node.added"
-	eventNodeSuperseded      = "node.superseded"
-	eventActivityQueued      = "activity.queued"
-	eventAttemptPrepared     = "attempt.prepared"
-	eventMilestone           = "attempt.milestone"
-	eventResultCreated       = "result.created"
-	eventAttestationRecorded = "attestation.recorded"
-	eventMessageQueued       = "message.queued"
-	eventMessageDispatched   = "message.dispatched"
-	eventMessageSettled      = "message.settled"
-	eventLeaseReleased       = "lease.released"
-	eventControlRecorded     = "control.recorded"
-	eventControlApplied      = "control.applied"
-	eventWorkflowPaused      = "workflow.paused"
-	eventPauseSettled        = "workflow.pause_settled"
-	eventLegacyImported      = "legacy.imported"
+	eventExecutionStarted     = "execution.started"
+	eventNodeAdded            = "node.added"
+	eventNodeSuperseded       = "node.superseded"
+	eventActivityQueued       = "activity.queued"
+	eventAttemptPrepared      = "attempt.prepared"
+	eventMilestone            = "attempt.milestone"
+	eventResultCreated        = "result.created"
+	eventAttestationRecorded  = "attestation.recorded"
+	eventMessageQueued        = "message.queued"
+	eventMessageDispatched    = "message.dispatched"
+	eventMessageSettled       = "message.settled"
+	eventLeaseReleased        = "lease.released"
+	eventControlRecorded      = "control.recorded"
+	eventControlApplied       = "control.applied"
+	eventWorkflowPaused       = "workflow.paused"
+	eventPauseSettled         = "workflow.pause_settled"
+	eventFallbackQueued       = "activity.fallback_queued"
+	eventRoleLadderSet        = "role_ladder.set"
+	eventFinalizationPrepared = "finalization.prepared"
+	eventFinalizationSettled  = "finalization.settled"
+	eventLegacyImported       = "legacy.imported"
 )
 
 type executionStartedEvent struct {
@@ -49,6 +54,28 @@ type nodeSupersededEvent struct {
 
 type activityQueuedEvent struct {
 	Activity *Activity `json:"activity"`
+}
+
+type fallbackQueuedEvent struct {
+	Session  *Session  `json:"session"`
+	Activity *Activity `json:"activity"`
+}
+
+type roleLadderSetEvent struct {
+	Role       string        `json:"role"`
+	Candidates []RuntimeSpec `json:"candidates"`
+}
+
+type finalizationPreparedEvent struct {
+	Finalization *Finalization `json:"finalization"`
+}
+
+type finalizationSettledEvent struct {
+	ID          string            `json:"id"`
+	State       FinalizationState `json:"state"`
+	Summary     string            `json:"summary"`
+	CompletedAt time.Time         `json:"completed_at"`
+	PRURL       string            `json:"pr_url,omitempty"`
 }
 
 type attemptPreparedEvent struct {
@@ -208,6 +235,58 @@ func applyDomainEvent(state *State, domain DomainEvent) error {
 			return errors.New("activity event is incomplete or duplicate")
 		}
 		state.Activities[data.Activity.ID] = cloneActivity(data.Activity)
+	case eventFallbackQueued:
+		var data fallbackQueuedEvent
+		if err := json.Unmarshal(domain.Data, &data); err != nil {
+			return err
+		}
+		if data.Session == nil || data.Activity == nil || state.Sessions[data.Session.ID] != nil || state.Activities[data.Activity.ID] != nil {
+			return errors.New("fallback event is incomplete or duplicate")
+		}
+		workflow := state.Workflows[data.Activity.WorkflowID]
+		parent := state.Activities[data.Activity.ParentActivityID]
+		if workflow == nil || parent == nil || parent.WorkflowID != workflow.ID || data.Session.WorkflowID != workflow.ID || data.Activity.SessionID != data.Session.ID || data.Activity.ParentActivityID == data.Activity.ID {
+			return errors.New("fallback event has broken lineage")
+		}
+		state.Sessions[data.Session.ID] = cloneSession(data.Session)
+		state.Activities[data.Activity.ID] = cloneActivity(data.Activity)
+	case eventRoleLadderSet:
+		var data roleLadderSetEvent
+		if err := json.Unmarshal(domain.Data, &data); err != nil {
+			return err
+		}
+		if data.Role == "" || len(data.Candidates) == 0 {
+			return errors.New("role ladder event is incomplete")
+		}
+		state.RoleLadders[data.Role] = append([]RuntimeSpec(nil), data.Candidates...)
+	case eventFinalizationPrepared:
+		var data finalizationPreparedEvent
+		if err := json.Unmarshal(domain.Data, &data); err != nil {
+			return err
+		}
+		if data.Finalization == nil || state.Finalizations[data.Finalization.ID] != nil {
+			return errors.New("finalization preparation is incomplete or duplicate")
+		}
+		execution := state.Executions[data.Finalization.ExecutionID]
+		if execution == nil || execution.WorkflowID != data.Finalization.WorkflowID || strings.TrimSpace(data.Finalization.Repository) == "" || strings.TrimSpace(data.Finalization.PullRequest) == "" || strings.TrimSpace(data.Finalization.HeadSHA) == "" || len(data.Finalization.Gates) == 0 || data.Finalization.State != FinalizationPrepared || data.Finalization.PreparedAt.IsZero() || !data.Finalization.CompletedAt.IsZero() {
+			return errors.New("finalization preparation is incomplete")
+		}
+		state.Finalizations[data.Finalization.ID] = cloneFinalization(data.Finalization)
+	case eventFinalizationSettled:
+		var data finalizationSettledEvent
+		if err := json.Unmarshal(domain.Data, &data); err != nil {
+			return err
+		}
+		finalization := state.Finalizations[data.ID]
+		if finalization == nil || finalization.State != FinalizationPrepared || (data.State != FinalizationMerged && data.State != FinalizationBlocked) || strings.TrimSpace(data.Summary) == "" || data.CompletedAt.IsZero() {
+			return errors.New("finalization settlement targets an invalid preparation")
+		}
+		finalization.State = data.State
+		finalization.Summary = data.Summary
+		if strings.TrimSpace(data.PRURL) != "" {
+			finalization.PRURL = data.PRURL
+		}
+		finalization.CompletedAt = data.CompletedAt
 	case eventAttemptPrepared:
 		var data attemptPreparedEvent
 		if err := json.Unmarshal(domain.Data, &data); err != nil {
@@ -467,6 +546,33 @@ func validateState(state *State) error {
 			return fmt.Errorf("result %s has broken immutable provenance", id)
 		}
 	}
+	for id, finalization := range state.Finalizations {
+		execution := (*Execution)(nil)
+		if finalization != nil {
+			execution = state.Executions[finalization.ExecutionID]
+		}
+		if finalization == nil || finalization.ID != id || execution == nil || execution.WorkflowID != finalization.WorkflowID || state.Workflows[finalization.WorkflowID] == nil || strings.TrimSpace(finalization.IdempotencyKey) == "" || strings.TrimSpace(finalization.Repository) == "" || strings.TrimSpace(finalization.PullRequest) == "" || (finalization.Method != "merge" && finalization.Method != "squash" && finalization.Method != "rebase") || finalization.State == "" || (finalization.State != FinalizationPrepared && finalization.State != FinalizationMerged && finalization.State != FinalizationBlocked) || strings.TrimSpace(finalization.HeadSHA) == "" || len(finalization.Gates) == 0 {
+			return fmt.Errorf("finalization %s has broken durable publication identity", id)
+		}
+		if finalization.State == FinalizationPrepared && !finalization.CompletedAt.IsZero() || finalization.State != FinalizationPrepared && finalization.CompletedAt.IsZero() {
+			return fmt.Errorf("finalization %s has broken terminal state", id)
+		}
+	}
+	for role, candidates := range state.RoleLadders {
+		if role == "" || len(candidates) == 0 {
+			return fmt.Errorf("role ladder %q is empty", role)
+		}
+		seenNames := map[string]bool{}
+		for _, candidate := range candidates {
+			if err := validateRuntime(candidate); err != nil {
+				return fmt.Errorf("role ladder %q: %w", role, err)
+			}
+			if seenNames[candidate.Name] {
+				return fmt.Errorf("role ladder %q reuses provider identity %q", role, candidate.Name)
+			}
+			seenNames[candidate.Name] = true
+		}
+	}
 	for id, attestation := range state.Attestations {
 		if state.Results[attestation.ResultID] == nil {
 			return fmt.Errorf("attestation %s targets an unknown immutable result", id)
@@ -589,6 +695,12 @@ func cloneMilestone(v Milestone) Milestone {
 }
 func cloneResult(v *Result) *Result {
 	c := *v
+	return &c
+}
+
+func cloneFinalization(v *Finalization) *Finalization {
+	c := *v
+	c.Gates = append([]string(nil), v.Gates...)
 	return &c
 }
 func cloneAttestation(v *Attestation) *Attestation {

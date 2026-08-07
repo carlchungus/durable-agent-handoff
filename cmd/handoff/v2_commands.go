@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -18,10 +20,19 @@ import (
 
 	"github.com/carlchungus/durable-agent-handoff/internal/driver"
 	"github.com/carlchungus/durable-agent-handoff/internal/executor"
+	"github.com/carlchungus/durable-agent-handoff/internal/githubgate"
 	"github.com/carlchungus/durable-agent-handoff/internal/service"
 	v2tui "github.com/carlchungus/durable-agent-handoff/internal/tui"
 	"github.com/carlchungus/durable-agent-handoff/supervisor"
 )
+
+type runtimeCandidateFlags []string
+
+func (f *runtimeCandidateFlags) String() string { return strings.Join(*f, ",") }
+func (f *runtimeCandidateFlags) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
 
 type executionStartRequest struct {
 	IdempotencyKey string             `json:"idempotency_key"`
@@ -83,16 +94,17 @@ func cmdV2Start(args []string, out io.Writer) error {
 	file := fs.String("file", "", "strict JSON request file; use - for stdin")
 	root := fs.String("root", ".", "canonical execution root")
 	goal := fs.String("goal", "", "desired work title")
-	prompt := fs.String("prompt", "", "exact execution prompt")
+	promptFile := fs.String("prompt-file", "-", "read the secret prompt from this file; - means stdin")
 	runtimeName := fs.String("runtime", "", "codex, claude, or pi")
 	nativeSession := fs.String("session", "", "exact native runtime Session identity")
+	role := fs.String("role", "", "role ladder name, such as planner or verifier")
 	model := fs.String("model", "", "runtime model")
 	effort := fs.String("effort", "", "runtime reasoning effort")
 	sandbox := fs.String("sandbox", "workspace-write", "read-only or workspace-write")
 	authorizedBy := fs.String("authorized-by", "", "human identity authorizing execution")
 	key := fs.String("idempotency-key", "", "stable request identity")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--prompt": true, "--runtime": true, "--session": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--json": false})); err != nil {
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--prompt-file": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--json": false})); err != nil {
 		return err
 	}
 	var input supervisor.StartExecutionInput
@@ -127,7 +139,7 @@ func cmdV2Start(args []string, out io.Writer) error {
 		}
 		input = supervisor.StartExecutionInput{
 			NativeSession: supervisor.NativeSessionIdentity{Runtime: request.Runtime, ID: request.ResumeID},
-			Prompt:        request.Prompt, Goal: request.Goal,
+			Prompt:        request.Prompt, Goal: request.Goal, Role: request.Role,
 			Runtime:   supervisor.RuntimeSpec{Name: request.Runtime, Model: request.Model, Effort: request.Effort, Sandbox: request.Sandbox},
 			Root:      request.RemoteRoot,
 			Authority: supervisor.AuthoritySpec{RequestedBy: request.Role, HumanAuthorized: true, Sandbox: request.Sandbox},
@@ -137,9 +149,60 @@ func cmdV2Start(args []string, out io.Writer) error {
 		if fs.NArg() != 0 {
 			return errors.New("start does not accept positional arguments")
 		}
+		prompt, err := readPromptFile(*promptFile)
+		if err != nil {
+			return err
+		}
+		var fallbacks []supervisor.RuntimeSpec
+		store, err := supervisor.Open(stateDir(*state), supervisor.Options{})
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(*role) != "" {
+			ladder, ladderErr := store.RoleLadder(*role)
+			if ladderErr != nil {
+				return ladderErr
+			}
+			if len(ladder) == 0 {
+				return fmt.Errorf("role %q has no configured preference ladder", *role)
+			}
+			primaryIndex := 0
+			if strings.TrimSpace(*runtimeName) == "" {
+				*runtimeName = ladder[0].Name
+				if *model == "" {
+					*model = ladder[0].Model
+				}
+				if *effort == "" {
+					*effort = ladder[0].Effort
+				}
+				if *sandbox == "" {
+					*sandbox = string(ladder[0].Sandbox)
+				}
+			} else {
+				for index, candidate := range ladder {
+					if candidate.Name == *runtimeName {
+						primaryIndex = index
+						if *model == "" {
+							*model = candidate.Model
+						}
+						if *effort == "" {
+							*effort = candidate.Effort
+						}
+						break
+					}
+				}
+				if primaryIndex == 0 && ladder[0].Name != *runtimeName {
+					return fmt.Errorf("runtime %q is not configured for role %q", *runtimeName, *role)
+				}
+			}
+			if len(ladder) > primaryIndex+1 {
+				fallbacks = append([]supervisor.RuntimeSpec(nil), ladder[primaryIndex+1:]...)
+			}
+		}
 		input = supervisor.StartExecutionInput{
 			NativeSession: supervisor.NativeSessionIdentity{Runtime: *runtimeName, ID: *nativeSession},
-			Goal:          *goal, Prompt: *prompt,
+			Goal:          *goal, Prompt: prompt, Role: *role,
+			Fallbacks: fallbacks,
 			Runtime:   supervisor.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort, Sandbox: supervisor.Sandbox(*sandbox)},
 			Root:      *root,
 			Authority: supervisor.AuthoritySpec{RequestedBy: *authorizedBy, HumanAuthorized: *authorizedBy != "", Sandbox: supervisor.Sandbox(*sandbox)},
@@ -239,6 +302,124 @@ func cmdV2List(args []string, out io.Writer) error {
 		fmt.Fprintf(out, "%s workflow=%s publication=%s queue=%d\n", view.ID, view.WorkflowID, view.Publication, len(view.Queue))
 	}
 	return nil
+}
+
+func cmdV2Preference(args []string, out io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: handoff preference set|list|health")
+	}
+	switch args[0] {
+	case "set":
+		fs := flag.NewFlagSet("preference set", flag.ContinueOnError)
+		state := common(fs)
+		var values runtimeCandidateFlags
+		fs.Var(&values, "candidate", "runtime:model[:effort], repeat in preference order")
+		if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true, "--candidate": true})); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 || len(values) == 0 {
+			return errors.New("preference set requires ROLE and at least one --candidate")
+		}
+		candidates := make([]supervisor.RuntimeSpec, 0, len(values))
+		for _, value := range values {
+			parts := strings.SplitN(value, ":", 3)
+			if len(parts) < 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+				return fmt.Errorf("invalid candidate %q; expected runtime:model[:effort]", value)
+			}
+			effort := "xhigh"
+			if len(parts) == 3 && strings.TrimSpace(parts[2]) != "" {
+				effort = parts[2]
+			}
+			candidates = append(candidates, supervisor.RuntimeSpec{Name: parts[0], Model: parts[1], Effort: effort, Sandbox: supervisor.SandboxWorkspaceWrite})
+		}
+		store, err := openV2(*state)
+		if err != nil {
+			return err
+		}
+		key := "preference/" + fs.Arg(0) + "/" + preferenceDigest(candidates)
+		configured, _, err := store.SetRoleLadder(context.Background(), supervisor.SetRoleLadderInput{Role: fs.Arg(0), Candidates: candidates, IdempotencyKey: key})
+		if err != nil {
+			return err
+		}
+		return writeJSON(out, map[string]any{"role": fs.Arg(0), "candidates": configured})
+	case "list":
+		fs := flag.NewFlagSet("preference list", flag.ContinueOnError)
+		stateFlag := common(fs)
+		if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true})); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return errors.New("preference list accepts only --state")
+		}
+		store, err := openV2(*stateFlag)
+		if err != nil {
+			return err
+		}
+		state, err := store.Projection()
+		if err != nil {
+			return err
+		}
+		return writeJSON(out, map[string]any{"ladders": state.RoleLadders})
+	case "health":
+		fs := flag.NewFlagSet("preference health", flag.ContinueOnError)
+		stateDirFlag := common(fs)
+		if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true})); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return errors.New("preference health accepts only --state")
+		}
+		store, err := openV2(*stateDirFlag)
+		if err != nil {
+			return err
+		}
+		state, err := store.Projection()
+		if err != nil {
+			return err
+		}
+		type health struct {
+			Runtime             string `json:"runtime"`
+			Model               string `json:"model,omitempty"`
+			ProviderUnavailable int    `json:"provider_unavailable"`
+		}
+		counts := map[string]*health{}
+		for _, attempt := range state.Attempts {
+			if !attemptHasProviderUnavailable(attempt) {
+				continue
+			}
+			key := strings.Join([]string{attempt.Runtime.Name, attempt.Runtime.Executable, attempt.Runtime.Model, attempt.Runtime.Effort, string(attempt.Runtime.Sandbox)}, "\x00")
+			if counts[key] == nil {
+				counts[key] = &health{Runtime: attempt.Runtime.Name, Model: attempt.Runtime.Model}
+			}
+			counts[key].ProviderUnavailable++
+		}
+		items := make([]health, 0, len(counts))
+		for _, item := range counts {
+			items = append(items, *item)
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].Runtime+items[i].Model < items[j].Runtime+items[j].Model })
+		return writeJSON(out, items)
+	default:
+		return fmt.Errorf("unknown preference command %q", args[0])
+	}
+}
+
+func attemptHasProviderUnavailable(attempt *supervisor.Attempt) bool {
+	if attempt == nil {
+		return false
+	}
+	for _, milestone := range attempt.Milestones {
+		if milestone.Kind == supervisor.MilestoneProviderUnavailable {
+			return true
+		}
+	}
+	return false
+}
+
+func preferenceDigest(candidates []supervisor.RuntimeSpec) string {
+	raw, _ := json.Marshal(candidates)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:6])
 }
 
 func cmdV2Pause(args []string, out io.Writer) error {
@@ -418,20 +599,65 @@ func cmdV2Serve(args []string, out io.Writer) error {
 
 func cmdV2Service(args []string, out io.Writer) error {
 	if len(args) == 0 || args[0] != "install" {
-		return errors.New("usage: handoff service install [--state DIR] [--environment-json FILE] [--trust-mode workspace|full]")
+		return errors.New("usage: handoff service install [--state DIR] [--environment-json FILE] [--trust-mode workspace|full] [--enable]")
 	}
 	fs := flag.NewFlagSet("service install", flag.ContinueOnError)
 	state := common(fs)
 	environmentJSON := fs.String("environment-json", "", "private mode-0600 driver environment file")
 	trustMode := fs.String("trust-mode", string(driver.TrustWorkspace), "workspace or full")
-	if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true, "--environment-json": true, "--trust-mode": true})); err != nil {
+	enable := fs.Bool("enable", false, "enable and start the stable handoff.service")
+	if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true, "--environment-json": true, "--trust-mode": true, "--enable": false})); err != nil {
 		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("service install does not accept positional arguments")
 	}
 	path, err := service.InstallV2("", stateDir(*state), *environmentJSON, driver.TrustMode(*trustMode))
 	if err != nil {
 		return err
 	}
+	if *enable {
+		if err := service.EnableV2(path); err != nil {
+			return fmt.Errorf("service installed but enable failed: %w", err)
+		}
+	}
 	fmt.Fprintln(out, path)
+	return nil
+}
+
+func cmdV2GitHub(args []string, out io.Writer) error {
+	if len(args) == 0 || args[0] != "merge" {
+		return errors.New("usage: handoff github merge --execution ID --repo OWNER/REPO --pr NUMBER --gate NAME --idempotency-key KEY --approved --json")
+	}
+	fs := flag.NewFlagSet("github merge", flag.ContinueOnError)
+	state := common(fs)
+	executionID := fs.String("execution", "", "Execution ID")
+	repository := fs.String("repo", "", "OWNER/REPO")
+	pullRequest := fs.String("pr", "", "pull request number")
+	method := fs.String("method", "squash", "merge method")
+	approved := fs.Bool("approved", false, "explicit human publication approval")
+	key := fs.String("idempotency-key", "", "stable publication effect identity")
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	var gates runtimeCandidateFlags
+	fs.Var(&gates, "gate", "exact required check name, repeat for each gate")
+	if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true, "--execution": true, "--repo": true, "--pr": true, "--method": true, "--approved": false, "--idempotency-key": true, "--json": false, "--gate": true})); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || strings.TrimSpace(*executionID) == "" || strings.TrimSpace(*repository) == "" || strings.TrimSpace(*pullRequest) == "" || strings.TrimSpace(*key) == "" {
+		return errors.New("github merge requires execution, repo, pr, and idempotency-key")
+	}
+	store, err := openV2(*state)
+	if err != nil {
+		return err
+	}
+	result, err := store.Finalize(context.Background(), supervisor.FinalizationRequest{ExecutionID: supervisor.ExecutionID(*executionID), Repository: *repository, PullRequest: *pullRequest, Gates: append([]string(nil), gates...), Method: *method, HumanApproved: *approved, IdempotencyKey: *key}, githubgate.ExecRunner{})
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeJSON(out, result)
+	}
+	fmt.Fprintf(out, "finalization=%s state=%s merged=%t head=%s\n", result.FinalizationID, result.State, result.Merged, result.HeadSHA)
 	return nil
 }
 
@@ -480,6 +706,26 @@ func readEnvironmentJSON(path string) ([]string, error) {
 		env = append(env, key+"="+values[key])
 	}
 	return env, nil
+}
+
+func readPromptFile(path string) (string, error) {
+	var reader io.Reader = os.Stdin
+	if path != "-" {
+		file, err := os.Open(path)
+		if err != nil {
+			return "", err
+		}
+		defer file.Close()
+		reader = file
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		return "", fmt.Errorf("read prompt input: %w", err)
+	}
+	if strings.TrimSpace(string(raw)) == "" {
+		return "", errors.New("prompt input is empty")
+	}
+	return string(raw), nil
 }
 
 func cmdV2TUI(args []string, out io.Writer) error {

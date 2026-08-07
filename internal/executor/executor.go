@@ -55,13 +55,26 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	if node == nil || session == nil {
 		return errors.New("Activity projection has broken Node or Session identity")
 	}
-	runtimeSpec, err := selectRuntime(node.Work, state, logical.ID)
+	runtimeSpec, err := selectRuntime(node.Work, state, logical.ID, session.Native.Runtime)
 	if err != nil {
 		return err
 	}
-	runtimeDriver, err := e.Drivers(runtimeSpec.Name)
-	if err != nil {
-		return err
+	if runtimeSpec.Name != session.Native.Runtime {
+		fallback := supervisor.FindFallbackActivity(state, logical.ID, runtimeSpec)
+		if fallback == nil {
+			fallback, _, err = e.Store.StartFallbackActivity(ctx, supervisor.StartFallbackActivityInput{ParentActivityID: logical.ID, Runtime: runtimeSpec, IdempotencyKey: "fallback/" + string(logical.ID) + "/" + shortDigest(runtimeKey(runtimeSpec))})
+			if err != nil {
+				return err
+			}
+		}
+		logical = fallback
+		state, err = e.Store.Projection()
+		if err != nil {
+			return err
+		}
+		workflow = state.Workflows[logical.WorkflowID]
+		node = workflow.Nodes[logical.NodeID]
+		session = state.Sessions[logical.SessionID]
 	}
 	ordinal := 1
 	for _, attempt := range state.Attempts {
@@ -79,16 +92,35 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	if trustMode == "" {
 		trustMode = driver.TrustWorkspace
 	}
+	outputs := supervisor.OutputIdentity{Stdout: "output_" + shortDigest(stdoutPath), Stderr: "output_" + shortDigest(stderrPath), Result: "output_" + shortDigest(resultPath)}
+	preparePrelaunch := func(failure error) error {
+		attempt, receipt, prepareErr := e.Store.PrepareAttempt(ctx, supervisor.PrepareAttemptInput{
+			ActivityID: logical.ID, ExpectedGeneration: logical.Generation, Runtime: runtimeSpec,
+			CommandDigest: runstate.CommandDigest("adapter", []string{runtimeKey(runtimeSpec)}), Outputs: outputs,
+			IdempotencyKey: keyPrefix + "/prepare-prelaunch",
+		})
+		if prepareErr != nil {
+			return errors.Join(failure, prepareErr)
+		}
+		if receipt.Existing {
+			return errors.Join(failure, errors.New("prelaunch Attempt already exists; explicit recovery is required"))
+		}
+		return e.failPrelaunch(ctx, logical, attempt, keyPrefix, failure)
+	}
+	runtimeDriver, err := e.Drivers(runtimeSpec.Name)
+	if err != nil {
+		return preparePrelaunch(err)
+	}
 	launch, err := runtimeDriver.Build(driver.LaunchRequest{Runtime: runtimeSpec, Worktree: node.Work.Root, Prompt: logical.Prompt, Session: session.Native, SchemaPath: schemaPath, ResultPath: resultPath, TrustMode: trustMode})
 	if err != nil {
-		return err
+		return preparePrelaunch(err)
 	}
 	argv := append([]string{launch.Executable}, launch.Args...)
 	attempt, receipt, err := e.Store.PrepareAttempt(ctx, supervisor.PrepareAttemptInput{
 		ActivityID: logical.ID, ExpectedGeneration: logical.Generation,
 		Runtime:        runtimeSpec,
 		CommandDigest:  runstate.CommandDigest(launch.Executable, launch.Args),
-		Outputs:        supervisor.OutputIdentity{Stdout: "output_" + shortDigest(stdoutPath), Stderr: "output_" + shortDigest(stderrPath), Result: "output_" + shortDigest(resultPath)},
+		Outputs:        outputs,
 		IdempotencyKey: keyPrefix + "/prepare",
 	})
 	if err != nil {
@@ -148,7 +180,7 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 		gated.Abort()
 		_ = command.Process.Kill()
 		_ = command.Wait()
-		return err
+		return e.failAfterSpawn(ctx, logical, attempt, keyPrefix, runtimeDriver, err)
 	}
 	if err = gated.Release(); err != nil {
 		_ = command.Process.Kill()
@@ -224,16 +256,18 @@ waitLoop:
 					break waitLoop
 				}
 				stopping = true
-				if _, _, applyErr := e.Store.ApplyControl(context.Background(), supervisor.ApplyControlInput{ControlID: control.ID, ActivityID: logical.ID, ExpectedGeneration: logical.Generation, AttemptID: attempt.ID, IdempotencyKey: keyPrefix + "/control-applied/" + string(control.ID)}); applyErr != nil && !errors.Is(applyErr, supervisor.ErrFenced) {
-					processErr = errors.Join(<-waited, applyErr)
-					stopDecoder()
-					if decodeErr := <-decodeErrors; decodeErr != nil && !errors.Is(decodeErr, supervisor.ErrFenced) {
-						processErr = errors.Join(processErr, decodeErr)
+				if control.AppliedAt.IsZero() {
+					if _, _, applyErr := e.Store.ApplyControl(context.Background(), supervisor.ApplyControlInput{ControlID: control.ID, ActivityID: logical.ID, ExpectedGeneration: logical.Generation, AttemptID: attempt.ID, IdempotencyKey: keyPrefix + "/control-applied/" + string(control.ID)}); applyErr != nil && !errors.Is(applyErr, supervisor.ErrFenced) {
+						processErr = errors.Join(<-waited, applyErr)
+						stopDecoder()
+						if decodeErr := <-decodeErrors; decodeErr != nil && !errors.Is(decodeErr, supervisor.ErrFenced) {
+							processErr = errors.Join(processErr, decodeErr)
+						}
+						break waitLoop
 					}
-					break waitLoop
 				}
 			}
-			if !turnStarted && !startupFailureRecorded && time.Now().After(startupAt) {
+			if !stopping && !turnStarted && !startupFailureRecorded && time.Now().After(startupAt) {
 				control, _, controlErr := e.Store.RequestControl(context.Background(), supervisor.RequestControlInput{ActivityID: logical.ID, ExpectedGeneration: logical.Generation, ExpectedAttemptID: attempt.ID, Kind: "stop", Actor: "supervisor:startup-deadline", IdempotencyKey: keyPrefix + "/startup-control"})
 				if controlErr != nil && !errors.Is(controlErr, supervisor.ErrFenced) {
 					processErr = errors.Join(<-waited, controlErr)
@@ -279,6 +313,12 @@ waitLoop:
 	if code == -1 {
 		if current, projectionErr := e.Store.Projection(); projectionErr == nil && activityHasResult(current, logical.ID) {
 			code, processErr = 0, nil
+		} else if current, projectionErr := e.Store.Projection(); projectionErr == nil && activityHasProviderUnavailable(current, logical.ID) {
+			// The containment watchdog exits with a signal after a typed provider
+			// failure. The durable provider_unavailable milestone is the authority
+			// for routing, so do not turn that expected fallback boundary into an
+			// executor crash.
+			code, processErr = 0, nil
 		}
 	}
 	_, exitErr := e.record(context.Background(), logical, attempt, keyPrefix+"/exit", runtimeDriver.Exited(code, processErr))
@@ -306,14 +346,14 @@ func pendingControl(store *supervisor.Store, activityID supervisor.ActivityID, a
 		}
 	}
 	for _, control := range state.Controls {
-		if control.Accepted && control.ActivityID == activity.ID && control.ExpectedGeneration == activity.Generation && control.ExpectedAttemptID == attempt.ID && control.AppliedAt.IsZero() {
+		if control.Accepted && control.ActivityID == activity.ID && control.ExpectedGeneration == activity.Generation && control.ExpectedAttemptID == attempt.ID {
 			return control, turnStarted, nil
 		}
 	}
 	return nil, turnStarted, nil
 }
 
-func selectRuntime(work supervisor.WorkSpec, state *supervisor.State, activityID supervisor.ActivityID) (supervisor.RuntimeSpec, error) {
+func selectRuntime(work supervisor.WorkSpec, state *supervisor.State, activityID supervisor.ActivityID, sessionRuntime string) (supervisor.RuntimeSpec, error) {
 	candidates := append([]supervisor.RuntimeSpec{work.Runtime}, work.Fallbacks...)
 	usedUnavailable := make(map[string]bool)
 	for _, attempt := range state.Attempts {
@@ -327,7 +367,14 @@ func selectRuntime(work supervisor.WorkSpec, state *supervisor.State, activityID
 			}
 		}
 	}
-	for _, candidate := range candidates {
+	start := 0
+	for index, candidate := range candidates {
+		if candidate.Name == sessionRuntime {
+			start = index
+			break
+		}
+	}
+	for _, candidate := range candidates[start:] {
 		if !usedUnavailable[runtimeKey(candidate)] {
 			return candidate, nil
 		}
@@ -400,6 +447,14 @@ func (e *Executor) failStart(ctx context.Context, logical *supervisor.Activity, 
 	return errors.Join(failure, recordErr, exitErr)
 }
 
+func (e *Executor) failPrelaunch(ctx context.Context, logical *supervisor.Activity, attempt *supervisor.Attempt, keyPrefix string, failure error) error {
+	failed := supervisor.Milestone{Kind: supervisor.MilestoneAdapterStartFailed, Failure: failure.Error(), SourceType: "adapter"}
+	exited := supervisor.Milestone{Kind: supervisor.MilestoneExit, Exit: &supervisor.Exit{Code: 127, Error: failure.Error()}, SourceType: "adapter"}
+	_, recordErr := e.record(ctx, logical, attempt, keyPrefix+"/prelaunch-failed", failed)
+	_, exitErr := e.record(context.Background(), logical, attempt, keyPrefix+"/prelaunch-exit", exited)
+	return errors.Join(failure, recordErr, exitErr)
+}
+
 func (e *Executor) failAfterSpawn(ctx context.Context, logical *supervisor.Activity, attempt *supervisor.Attempt, keyPrefix string, runtimeDriver driver.Driver, failure error) error {
 	_, recordErr := e.record(ctx, logical, attempt, keyPrefix+"/exit", runtimeDriver.Exited(127, failure))
 	return errors.Join(failure, recordErr)
@@ -458,6 +513,20 @@ func activityHasResult(state *supervisor.State, activityID supervisor.ActivityID
 	for _, result := range state.Results {
 		if result.ActivityID == activityID {
 			return true
+		}
+	}
+	return false
+}
+
+func activityHasProviderUnavailable(state *supervisor.State, activityID supervisor.ActivityID) bool {
+	for _, attempt := range state.Attempts {
+		if attempt.ActivityID != activityID {
+			continue
+		}
+		for _, milestone := range attempt.Milestones {
+			if milestone.Kind == supervisor.MilestoneProviderUnavailable {
+				return true
+			}
 		}
 	}
 	return false

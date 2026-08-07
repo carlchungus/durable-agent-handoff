@@ -176,8 +176,8 @@ func installV2For(goos, home, binary, state, environmentJSON string, trustMode d
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return "", err
 		}
-		path := filepath.Join(dir, "io.github.carlchungus.handoff-v2.plist")
-		body := fmt.Sprintf("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>io.github.carlchungus.handoff-v2</string><key>ProgramArguments</key><array><string>%s</string><string>serve</string><string>--state</string><string>%s</string><string>--trust-mode</string><string>%s</string>", xml(binary), xml(state), xml(string(trustMode)))
+		path := filepath.Join(dir, "io.github.carlchungus.handoff.plist")
+		body := fmt.Sprintf("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>io.github.carlchungus.handoff</string><key>ProgramArguments</key><array><string>%s</string><string>serve</string><string>--state</string><string>%s</string><string>--trust-mode</string><string>%s</string>", xml(binary), xml(state), xml(string(trustMode)))
 		if environmentJSON != "" {
 			body += fmt.Sprintf("<string>--environment-json</string><string>%s</string>", xml(environmentJSON))
 		}
@@ -191,7 +191,7 @@ func installV2For(goos, home, binary, state, environmentJSON string, trustMode d
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return "", err
 		}
-		path := filepath.Join(dir, "handoff-v2.service")
+		path := filepath.Join(dir, "handoff.service")
 		body := fmt.Sprintf("[Unit]\nDescription=Durable agent handoff Supervisor v2\n\n[Service]\nExecStart=%s %s\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n", systemd(binary), args)
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			return "", err

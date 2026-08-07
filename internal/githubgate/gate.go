@@ -19,6 +19,8 @@ type PR struct {
 	URL        string  `json:"url"`
 	HeadOID    string  `json:"headRefOid"`
 	MergeState string  `json:"mergeStateStatus"`
+	State      string  `json:"state"`
+	MergedAt   string  `json:"mergedAt"`
 	Checks     []Check `json:"statusCheckRollup"`
 }
 
@@ -32,7 +34,7 @@ func (ExecRunner) Run(ctx context.Context, name string, args ...string) ([]byte,
 }
 
 func Inspect(ctx context.Context, r Runner, repo, pr string) (PR, error) {
-	b, err := r.Run(ctx, "gh", "pr", "view", pr, "--repo", repo, "--json", "number,url,headRefOid,mergeStateStatus,statusCheckRollup")
+	b, err := r.Run(ctx, "gh", "pr", "view", pr, "--repo", repo, "--json", "number,url,headRefOid,mergeStateStatus,statusCheckRollup,state,mergedAt")
 	if err != nil {
 		return PR{}, fmt.Errorf("gh pr view: %w: %s", err, b)
 	}
@@ -64,7 +66,7 @@ func Verify(p PR, gates []string) error {
 			return fmt.Errorf("gate %q was not found", gate)
 		}
 	}
-	if p.MergeState == "DIRTY" || p.MergeState == "BLOCKED" {
+	if strings.EqualFold(p.MergeState, "DIRTY") || strings.EqualFold(p.MergeState, "BLOCKED") {
 		return fmt.Errorf("pull request merge state is %s", p.MergeState)
 	}
 	return nil
@@ -81,10 +83,28 @@ func Merge(ctx context.Context, r Runner, repo, pr string, gates []string, metho
 	if method == "" {
 		method = "squash"
 	}
-	args := []string{"pr", "merge", pr, "--repo", repo, "--match-head-commit", before.HeadOID, "--" + method}
+	if _, err = MergeAtHead(ctx, r, repo, pr, before.HeadOID, method); err != nil {
+		return PR{}, err
+	}
+	return before, nil
+}
+
+// MergeAtHead performs only the authority-owned argv effect after a prepared
+// gate decision. GitHub itself rejects the command if the head changed.
+func MergeAtHead(ctx context.Context, r Runner, repo, pr, head, method string) (PR, error) {
+	if strings.TrimSpace(head) == "" {
+		return PR{}, errors.New("pull request head SHA is empty")
+	}
+	if method == "" {
+		method = "squash"
+	}
+	if method != "merge" && method != "squash" && method != "rebase" {
+		return PR{}, fmt.Errorf("unsupported merge method %q", method)
+	}
+	args := []string{"pr", "merge", pr, "--repo", repo, "--match-head-commit", head, "--" + method}
 	b, err := r.Run(ctx, "gh", args...)
 	if err != nil {
 		return PR{}, fmt.Errorf("gh pr merge: %w: %s", err, b)
 	}
-	return before, nil
+	return PR{URL: "", HeadOID: head}, nil
 }

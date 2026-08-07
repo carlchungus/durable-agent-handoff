@@ -66,6 +66,20 @@ interface:
 
 Every mutating call requires an idempotency key of 8–256 safe characters.
 
+Role/model preferences are journal commands. A fallback is not a mutable
+runtime field on the original Session: when the selected provider differs, the
+executor records a child Session and child Activity with the parent identity,
+then binds the child's exact native Session ID. The original Session remains
+immutable and exact continuations target whichever bound Session owns the
+predecessor Activity.
+
+Publication is an authority-owned durable effect. `PrepareFinalization` records
+the exact PR, head SHA, named gates, approval, and idempotency key. Only after
+that append may the finalizer invoke argv-only `gh`; `SettleFinalization`
+records merged or blocked outcome. A retry first reads the prepared record,
+rejects divergent reuse, fences a changed head, and never guesses whether a
+post-merge crash succeeded.
+
 ## Runtime milestone protocol
 
 Drivers may emit only:

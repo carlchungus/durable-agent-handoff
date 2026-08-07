@@ -44,6 +44,10 @@ func run(args []string, out, _ io.Writer) error {
 		return cmdV2Serve(args[1:], out)
 	case "service":
 		return cmdV2Service(args[1:], out)
+	case "github":
+		return cmdV2GitHub(args[1:], out)
+	case "preference":
+		return cmdV2Preference(args[1:], out)
 	case "tui":
 		return cmdV2TUI(args[1:], out)
 	case "activity":
@@ -125,13 +129,15 @@ func jsonEncoder(out io.Writer) *json.Encoder {
 const usage = `handoff — Supervisor v2 durable execution
 
 Usage:
-  handoff start [--session EXACT_ID] --runtime codex --prompt TEXT --idempotency-key KEY --authorized-by HUMAN
+  handoff start [--session EXACT_ID] --runtime codex --prompt-file - --idempotency-key KEY --authorized-by HUMAN
   handoff execution start --file - --json
   handoff execution pause --workflow ID --timeout 30s --json
   handoff status [EXECUTION_ID] [--json]
   handoff list [--json]
   handoff run WORKFLOW_ID [--once]
   handoff serve [--environment-json FILE] [--trust-mode workspace|full]
+  handoff preference set ROLE --candidate runtime:model[:effort]
+  handoff github merge --execution ID --repo OWNER/REPO --pr NUMBER --gate NAME --idempotency-key KEY --approved --json
   handoff reply --execution ID --activity ID --message TEXT
   handoff activity list|read [--json]
   handoff tui [--snapshot]

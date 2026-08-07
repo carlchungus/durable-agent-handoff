@@ -6,6 +6,23 @@ The source snapshot is **2026-08-05**. Claude Code research-preview behavior is 
 
 The current repository is a useful durable kernel, not yet a whole-system clone. Compatibility is complete only when every surface below passes its positive, denial, restart, and human/machine-view cases against a pinned Claude oracle. The 102-case contract lives in [`docs/conformance/`](conformance/README.md).
 
+## Supervisor v2 shipping contract
+
+The released `handoff` binary is a breaking Supervisor v2 control plane. Its
+normal start, run, serve, status, list, reply, TUI, and activity paths read and
+write one Supervisor journal. The supported command surface is documented in
+[`README.md`](../README.md) and the protocol in [`protocol.md`](protocol.md):
+ordinary prompts use `--prompt-file -`, promotion uses strict
+`execution start --file - --json`, pause uses exact fenced Attempts, role/model
+ladders use journaled preference commands, and guarded publication uses
+`github merge`. `handoff.service` is the stable installed service name.
+
+The old `doctor`, Claude discovery/import, team store, preference-file reset,
+activity follow/stop, and transcript/output attachment commands are deferred
+v1/product surfaces, not valid v2 compatibility adapters. They must not be
+advertised as available until they have Supervisor-journal projections and
+tests. `execution import-v1` is the sole deterministic one-way v1 importer.
+
 ## What “high fidelity” means
 
 We reproduce observable contracts, including inconvenient limitations. We do not copy proprietary source, depend on undocumented private files, or call a stronger `handoff` behavior “Claude-compatible” when it differs.

@@ -191,10 +191,12 @@ overhead is derived from persisted milestone timestamps:
 - `process_spawned` to `turn_started`; and
 - `turn_started` to first `meaningful_progress`.
 
-Publication is an authority-owned effect. The projection derives whether a
-finalizer is disabled, awaiting a Result, awaiting an independent passing
-verifier, awaiting human authorization, or eligible. An unchanged verified head
-and named checks remain mandatory for any future GitHub effect executor.
+Publication is an authority-owned durable effect. The projection derives
+whether a finalizer is disabled, awaiting a Result, awaiting an independent
+passing verifier, awaiting human authorization, or eligible. `PrepareFinalization`
+records the exact PR/head/named-gate decision before an argv-only GitHub merge;
+`SettleFinalization` records merged or blocked outcome so retries after a crash
+remain idempotent and changed heads fail closed.
 
 ## Policy and trust boundaries
 

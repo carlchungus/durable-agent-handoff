@@ -15,12 +15,13 @@ Ordinary `start` and `create` may launch a new native Session; passing
 selector:
 
 ```sh
-handoff start --runtime codex --prompt 'work' \
+printf '%s' 'work' | handoff start --runtime codex --prompt-file - \
   --root /repo --authorized-by human:id --idempotency-key request-01 --json
 handoff status EXECUTION_ID --json
 handoff list --json
 handoff tui --snapshot
 handoff activity list --json
+handoff preference set planner --candidate claude:sonnet:high --candidate codex:gpt-5:xhigh
 ```
 
 The arca-cloud promotion seam accepts one strict JSON object on stdin:
@@ -74,6 +75,9 @@ Run or serve queued Activities through the Supervisor projection:
 ```sh
 handoff run WORKFLOW_ID --trust-mode workspace
 handoff serve --trust-mode full --environment-json /private/env.json
+handoff service install --enable --trust-mode workspace --environment-json /private/env.json
+handoff github merge --execution EXECUTION_ID --repo OWNER/REPO --pr 7 \
+  --gate verify --idempotency-key publication-01 --approved --json
 ```
 
 `--environment-json` must be a regular mode-0600 JSON object. Values are read

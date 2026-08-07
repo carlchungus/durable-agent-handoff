@@ -4,6 +4,22 @@ This directory turns the compatibility matrix into a differential test contract.
 
 The reference snapshot is **2026-08-05**. Claude research-preview behavior changes quickly, so every oracle capture records the Claude Code version, platform, provider, terminal mode, and source anchors from [`manifest.json`](manifest.json).
 
+## Candidate command contract
+
+The conformance matrix describes the broader Claude workflow vocabulary; it is
+not a promise that every v1 `handoff` command still exists. Supervisor v2's
+implemented candidate surface is `start|create`, `execution start|pause|status|
+list|import-v1`, `run`, `serve`, `status`, `list`, `reply`, `activity list|read`,
+`tui`, `events`, `preference set|list|health`, `service install`, and
+`github merge`. All of these use the Supervisor journal and pure projections.
+Prompts are stdin/file-only, and activity JSON retains the cloud active-state
+shape without prompt bodies.
+
+The v1 `doctor`, `discover`, Claude import, team, preference-file reset,
+activity follow/stop, transcript attachment, and byte-cursor output surfaces
+are explicitly deferred. They must acquire journal-backed commands and
+positive/denial/restart tests before being added to the shipping contract.
+
 ## Profiles and match policy
 
 Every case names one or both profiles:

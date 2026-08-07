@@ -1,63 +1,85 @@
 ---
 name: durable-agent-handoff
-description: Recover interrupted Claude Code, Codex, Pi, or other agent work and operate it through a high-fidelity, runtime-neutral implementation of Claude-style background sessions, subagents, teams, dynamic workflows, goals, hooks, worktrees, model ladders, and supervised PR gates. Use when agent work stopped, hit usage limits, must survive crashes, needs parallel coordination, or should continue autonomously with observable state.
+description: Recover interrupted Claude Code, Codex, Pi, or other agent work through Supervisor v2's journaled sessions, activities, attempts, leases, controls, runtime fallbacks, replies, and guarded publication effects.
 ---
 
-# Durable Agent Handoff
+# Durable Agent Handoff (Supervisor v2)
 
-Use `handoff` as the durable control plane. Trust live repositories, processes, tests, CI, and PR state over transcript narration.
+Use `handoff` as the one durable control plane. Read live Supervisor
+projections, journal events, process evidence, tests, and repository policy;
+do not infer lifecycle state from a transcript or a legacy store.
 
-## Choose the coordination contract
+## Supported v2 surface
 
-Do not flatten every task into one phase graph.
+- Start a new or exact-resume execution with `handoff start` or `handoff create`.
+  Secret prompts are supplied with `--prompt-file -` (or a private file), never
+  with `--prompt` and never in argv.
+- Use the arca-cloud promotion envelope with
+  `handoff execution start --file - --json`. It accepts one strict flat JSON
+  object and returns only `workflow_id` and `node_id`.
+- Observe one journal projection with `handoff status`, `handoff list`,
+  `handoff activity list|read`, `handoff tui --snapshot`, or `handoff events`.
+  JSON activity records retain the cloud-compatible active-state fields while
+  omitting prompts.
+- Run queued work with `handoff run` or `handoff serve`. Use
+  `handoff service install [--enable]` for the stable `handoff.service` unit.
+  `serve --environment-json FILE` requires a regular mode-0600 JSON object;
+  values are transient and service units contain only the file path.
+- Configure journaled role/model ladders with `handoff preference set|list|health`.
+  Provider fallback creates a child Session with a new native identity; it
+  never mutates the original exact runtime Session.
+- Stop safely with `handoff execution pause --workflow ID --json`. Pause first
+  records exact generation/Attempt fences, then the executor applies controls;
+  leases are released only after terminal exit evidence and a durable settle.
+- Continue a bound exact Session with `handoff reply`.
+- Use `handoff github merge` only for authority-owned finalization. It journals
+  the prepared exact PR head, named gates, approval, and idempotency key before
+  an argv-only `gh` effect, then journals merged or blocked outcome.
+- Import old state only with deterministic one-way `handoff execution import-v1`.
+  The v1 source remains unchanged and is never a live write path.
 
-- Use a **background session** for independent work a human may peek, reply to, attach to, stop, or resume.
-- Use a **subagent** for a bounded delegated task that returns to one parent context. Choose fresh or forked context explicitly.
-- Use an **agent team** when a lead should dynamically assign peer sessions through shared tasks, dependencies, claims, and messages.
-- Use a **dynamic workflow** when a readable script should own fan-out, loops, branching, intermediate results, verification, and replay.
-- Use a **goal** when one session should keep taking turns until a fresh evaluator confirms a measurable condition.
+## Identity and durability rules
 
-Read `../../docs/claude-workflows-compatibility.md` before changing these semantics.
+- A Session owns conversation identity and exact native runtime identity. An
+  ordinary new start begins unbound; the first typed `session_bound` milestone
+  binds its immutable identity. Promotion and continuation require an exact
+  bound identity. Never resume a global last session.
+- An Activity is immutable logical work. An Attempt is one OS launch with an
+  exact process start token, output identities, runtime, and canonical-worktree
+  writer Lease. A `turn_started` milestone consumes task budget; pre-turn
+  adapter/provider failures consume launch budget only.
+- Controls name the exact Activity generation and Attempt. Stale controls and
+  stale milestones fail closed. Reads and polling are pure projection reads;
+  they do not reconcile, settle, release leases, or append events.
+- Drivers receive prompts on stdin and construct provider argv themselves.
+  Codex, Claude, and Pi apply workspace/full trust flags inside the driver.
+  Full trust still uses direct argv with no shell wrapper. Runtime adapters do
+  not receive GitHub merge authority.
+- Validate proposed mutations against a cloned projection before one journal
+  append. Retry an ambiguous mutation with the same idempotency key and exact
+  input; divergent reuse fails closed.
 
-## Keep durable identities separate
+## Recovery checklist
 
-- A **Session** owns conversation identity, lineage, inbox, workspace, and the exact native runtime resume handle. It never owns a PID or output pipe.
-- An **Activity** owns independently controllable work, its immutable logical work specification, durable output, lifecycle ledger, and ordered Attempts. Exact command digests belong to Attempts; command arguments are not persisted because they can contain prompts or credentials.
-- An **Attempt** is one immutable process execution with runtime/model, PID plus start token, supervisor generation, output identities, and terminal result.
-- An **Attachment** is only an ephemeral reader at an output identity, byte cursor, and snapshot revision. Disconnecting it must not stop work.
-- A stop, signal, adopt, or restart is a durable control intent fenced by Activity generation and exact Attempt identity. PID-only control fails closed.
+1. Read `AGENTS.md`, `CONTEXT.md`, `docs/architecture.md`, and
+   `docs/protocol.md` before changing semantics.
+2. Inspect `handoff status --json`, `handoff activity list --json`, and
+   `handoff events --after N` from the private state root.
+3. Confirm canonical worktree ownership, exact Session/Attempt identity,
+   process start tokens, lease state, and named publication gates before any
+   retry or stop.
+4. Preserve immutable results and continuation generations. Do not invent a
+   new Session to resume old work unless the journal records a typed fallback
+   child with narrowed authority.
+5. Before handoff, run `gofmt`, `go test ./...`, `go test -race ./...`,
+   `go vet ./...`, `git diff --check`, and the supported cross-platform builds.
 
-Do not add process/task fields to Session, use a workflow node as the only execution record, persist UI attachments, or let TUI/RPC views derive competing lifecycle state. Use one canonical ledger and one reducer projection. Before creating another durable store, deepen a shared storage primitive rather than duplicating locking, secure-root validation, torn-write repair, and atomic snapshot logic.
+## Explicitly deferred v1/product surfaces
 
-## Recover and launch
-
-1. Run `handoff doctor` and, for Claude recovery, `handoff discover claude --since 8h --json`.
-2. Inspect each worktree, branch, dirty path, commit, PR, process, transcript age, and applicable `AGENTS.md`.
-3. Skip completed or ambiguous work. Require explicit authority for auth, tenant isolation, secrets, security, billing, compliance, migrations, dependencies, infrastructure, production operations, destructive changes, or broad refactors.
-4. Use one worktree per mutable worker. Never overlap writers.
-5. Resume exact runtime session IDs; never use a global last-session selector. Revalidate imported claims against the live checkout.
-6. Configure role ladders with `handoff preference set ROLE --candidate runtime:model:effort ...`. Provider quota and rate exhaustion may advance the ladder; auth, invalid-model, code, and test failures may not.
-7. Run under `handoff serve` or `handoff service install --enable`. Observe through the TUI, JSON status, JSONL events, `handoff activity list|read|follow`, and provider health.
-8. For automated output reconnect, retain the exact output ID and byte cursor. For automated stop, pass the Activity generation and Attempt ID returned by `read`; never control a PID directly.
-
-## Durability contract
-
-- Persist runtime session identity as soon as the stream emits it.
-- Record PID plus process start token, worktree, command digest, heartbeat, stream offset, exit result, and lease owner for every attempt.
-- Give workers direct durable log file descriptors so a supervisor crash does not break their output pipe.
-- On restart: adopt a matching live process; otherwise reconcile a completed result, resume the exact session, rerun only an explicitly restart-safe task, or request human input.
-- Treat provider exhaustion as routing, not a failed task attempt. Treat machine sleep separately from idle.
-- Preserve task lists, dependencies, mailboxes, parent/child lineage, workflow replay state, and active goals across restarts.
-
-## Runtime and authority boundaries
-
-- Prefer the user's role ladder. A useful planner example is `claude:opus:xhigh`, then `codex:gpt-5.6-sol:xhigh`, then `pi:openrouter/moonshotai/kimi-latest:xhigh`.
-- Claude uses strict declared MCP configuration. Codex uses an explicit workspace sandbox and exact thread resume. Pi/OhMyPi require external isolation because they do not provide an OS sandbox.
-- Children and provider fallbacks inherit authority and may narrow it; they may not grant themselves more tools, filesystem scope, credentials, sandbox access, or merge rights.
-- Hooks and evaluators may block, retry, inject context, or attest, but deterministic policy owns roots, budgets, privileged actions, and merge gates.
-
-## GitHub boundary
-
-Workers may edit and verify. Only explicitly authorized finalization may commit, push, create a PR, or merge. Require independent pass evidence, changed-file and diff-line budgets, a non-protected branch, exact named CI checks, and an unchanged verified head SHA. Never use admin merge or force push.
-
-Stop on unexpected paths, budget exhaustion, ambiguous recovery, failed verification, changed PR heads, or missing named checks.
+The old `doctor`, `discover`, `import claude`, `preference reset`, `team`,
+`activity follow`, `activity stop`, and legacy preference-file commands are not
+v2 commands. Do not tell an installed harness to use them. Team stores,
+transcript discovery/import, byte-cursor output attachment, and the broader
+Claude workflow compatibility matrix remain deferred until they have a
+Supervisor-journal command and tests; they are not silently emulated by a
+second live ledger.

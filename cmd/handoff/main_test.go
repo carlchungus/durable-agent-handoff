@@ -50,6 +50,11 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 	if response.WorkflowID == "" || response.NodeID == "" || strings.Contains(out.String(), "secret stdin prompt") {
 		t.Fatalf("unexpected response=%s", out.String())
 	}
+	divergent := strings.Replace(request, `"promote work"`, `"different work"`, 1)
+	out.Reset()
+	if err = runWithPrompt(t, []string{"execution", "start", "--state", state, "--file", "-", "--json"}, divergent, &out, &errOut); !errors.Is(err, supervisor.ErrIdempotencyConflict) {
+		t.Fatalf("divergent strict idempotency reuse was not rejected: %v", err)
+	}
 	if err = run([]string{"execution", "start", "--state", state, "--file", "-", "--json"}, &out, &errOut); err == nil {
 		t.Fatal("closed stdin unexpectedly accepted a second request")
 	}
@@ -61,7 +66,7 @@ func TestStatusListReplyAndPauseUseSupervisorProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
-	if err := run([]string{"start", "--state", state, "--root", root, "--runtime", "codex", "--session", "exact-thread", "--prompt", "work", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "cli-v2-start-01", "--json"}, &out, &errOut); err != nil {
+	if err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--runtime", "codex", "--session", "exact-thread", "--prompt-file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "cli-v2-start-01", "--json"}, "work", &out, &errOut); err != nil {
 		t.Fatal(err)
 	}
 	var response struct {
@@ -88,6 +93,74 @@ func TestStatusListReplyAndPauseUseSupervisorProjection(t *testing.T) {
 	if !strings.Contains(out.String(), `"workflow_id"`) || !strings.Contains(out.String(), `"existing":false`) {
 		t.Fatalf("pause=%s", out.String())
 	}
+	if err := run([]string{"start", "--state", state, "--runtime", "codex", "--prompt", "secret-argv-prompt", "--authorized-by", "human:test", "--idempotency-key", "prompt-argv-rejected"}, &out, &errOut); err == nil || strings.Contains(out.String(), "secret-argv-prompt") {
+		t.Fatal("ordinary start accepted or exposed a prompt body in argv")
+	}
+	out.Reset()
+	if err := run([]string{"activity", "list", "--state", state, "--json"}, &out, &errOut); err != nil || strings.Contains(out.String(), `"prompt"`) {
+		t.Fatalf("activity projection leaked prompt or failed: output=%s err=%v", out.String(), err)
+	}
+	var activities []supervisor.ActivityView
+	if err := json.Unmarshal(out.Bytes(), &activities); err != nil || len(activities) == 0 || activities[0].State == "" || activities[0].Revision == 0 || activities[0].Work.Cwd == "" {
+		t.Fatalf("cloud activity shape missing active-state fields: activities=%+v err=%v", activities, err)
+	}
+}
+
+func TestPreferenceLadderIsJournaledAndOrdinaryStartUsesChildFallbacks(t *testing.T) {
+	state, root := t.TempDir(), t.TempDir()
+	if err := os.Chmod(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if err := run([]string{"preference", "set", "planner", "--state", state, "--candidate", "codex:gpt-5:xhigh", "--candidate", "claude:sonnet:high"}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"preference", "list", "--state", state}, &out, &errOut); err != nil || !strings.Contains(out.String(), "planner") {
+		t.Fatalf("preference list=%s err=%v", out.String(), err)
+	}
+	out.Reset()
+	if err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--role", "planner", "--authorized-by", "human:test", "--idempotency-key", "role-start-01", "--json"}, "role prompt", &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		Execution supervisor.Execution `json:"execution"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	store, err := supervisor.Open(state, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := projection.Workflows[response.Execution.WorkflowID].Nodes[response.Execution.RootNodeID].Work
+	if len(work.Fallbacks) != 1 || work.Runtime.Name != "codex" || work.Fallbacks[0].Name != "claude" {
+		t.Fatalf("role ladder was not preserved in one journal workflow: %+v", work)
+	}
+}
+
+func TestEnvironmentJSONRequiresPrivateFileAndReturnsSortedTransientValues(t *testing.T) {
+	path := t.TempDir() + "/environment.json"
+	if err := os.WriteFile(path, []byte(`{"ZED":"last","ALPHA":"first"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	values, err := readEnvironmentJSON(path)
+	if err != nil || strings.Join(values, ",") != "ALPHA=first,ZED=last" {
+		t.Fatalf("environment=%v err=%v", values, err)
+	}
+	if err = os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = readEnvironmentJSON(path); err == nil {
+		t.Fatal("world-readable environment file was accepted")
+	}
 }
 
 func TestPauseCLIWaitsForDurableExitWithoutMutatingWhilePolling(t *testing.T) {
@@ -96,7 +169,7 @@ func TestPauseCLIWaitsForDurableExitWithoutMutatingWhilePolling(t *testing.T) {
 		t.Fatal(err)
 	}
 	var startOut, errOut bytes.Buffer
-	if err := run([]string{"start", "--state", stateRoot, "--root", worktree, "--runtime", "claude", "--prompt", "work", "--sandbox", "workspace-write", "--authorized-by", "human:test", "--idempotency-key", "pause-cli-start", "--json"}, &startOut, &errOut); err != nil {
+	if err := runWithPrompt(t, []string{"start", "--state", stateRoot, "--root", worktree, "--runtime", "claude", "--prompt-file", "-", "--sandbox", "workspace-write", "--authorized-by", "human:test", "--idempotency-key", "pause-cli-start", "--json"}, "work", &startOut, &errOut); err != nil {
 		t.Fatal(err)
 	}
 	var started struct {
@@ -137,4 +210,25 @@ func TestPauseCLIWaitsForDurableExitWithoutMutatingWhilePolling(t *testing.T) {
 	if state.Leases[attempt.LeaseID] == nil || !state.Leases[attempt.LeaseID].ReleasedAt.IsZero() {
 		t.Fatal("CLI polling released the writer lease before terminal exit")
 	}
+}
+
+func runWithPrompt(t *testing.T, args []string, prompt string, out, errOut *bytes.Buffer) error {
+	t.Helper()
+	read, write, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	if _, err = write.WriteString(prompt); err != nil {
+		_ = read.Close()
+		_ = write.Close()
+		return err
+	}
+	_ = write.Close()
+	previous := os.Stdin
+	os.Stdin = read
+	defer func() {
+		os.Stdin = previous
+		_ = read.Close()
+	}()
+	return run(args, out, errOut)
 }

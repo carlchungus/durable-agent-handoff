@@ -2,6 +2,7 @@ package service
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -19,7 +20,7 @@ func TestInstallV2UnitContainsNoPromptOrEnvironmentValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(raw)
-	if !strings.Contains(text, "Supervisor v2") || !strings.Contains(text, "--trust-mode full") || !strings.Contains(text, "--environment-json /private/env.json") || strings.Contains(text, "prompt") {
+	if filepath.Base(path) != "handoff.service" || !strings.Contains(text, "Supervisor v2") || !strings.Contains(text, "--trust-mode full") || !strings.Contains(text, "--environment-json /private/env.json") || strings.Contains(text, "prompt") {
 		t.Fatalf("unit=%s", text)
 	}
 }

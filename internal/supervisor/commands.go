@@ -19,6 +19,8 @@ type StartExecutionInput struct {
 	Prompt         string                `json:"prompt"`
 	Goal           string                `json:"goal,omitempty"`
 	Runtime        RuntimeSpec           `json:"runtime"`
+	Fallbacks      []RuntimeSpec         `json:"fallbacks,omitempty"`
+	Role           string                `json:"role,omitempty"`
 	Root           string                `json:"root"`
 	Authority      AuthoritySpec         `json:"authority"`
 	Finalizer      FinalizerSpec         `json:"finalizer"`
@@ -46,6 +48,7 @@ func (s *Store) StartExecution(ctx context.Context, input StartExecutionInput) (
 	input.Authority.AllowedRoots = append([]string(nil), input.Authority.AllowedRoots...)
 	input.Finalizer.RequiredChecks = append([]string(nil), input.Finalizer.RequiredChecks...)
 	input.Finalizer.Verifiers = append([]string(nil), input.Finalizer.Verifiers...)
+	input.Fallbacks = append([]RuntimeSpec(nil), input.Fallbacks...)
 	for index, root := range input.Authority.AllowedRoots {
 		input.Authority.AllowedRoots[index], err = canonicalDirectory(root)
 		if err != nil {
@@ -88,14 +91,14 @@ func (c startExecutionCommand) decide(state *State, now time.Time) ([]DomainEven
 	activityID := ActivityID(stableID("activity", in.IdempotencyKey+"/1"))
 	digest, _ := c.digest()
 	workflow := &Workflow{
-		ID: workflowID, Root: in.Root, Authority: in.Authority, Finalizer: in.Finalizer, Budget: in.Budget,
+		ID: workflowID, Root: in.Root, Role: in.Role, Authority: in.Authority, Finalizer: in.Finalizer, Budget: in.Budget,
 		Nodes: map[NodeID]*Node{}, CreatedAt: now,
 	}
 	title := in.Goal
 	if strings.TrimSpace(title) == "" {
 		title = "Root execution"
 	}
-	node := &Node{ID: nodeID, WorkflowID: workflowID, Title: title, Work: WorkSpec{Kind: "agent", Prompt: in.Prompt, Root: in.Root, Runtime: in.Runtime}, CreatedAt: now}
+	node := &Node{ID: nodeID, WorkflowID: workflowID, Title: title, Work: WorkSpec{Kind: "agent", Prompt: in.Prompt, Root: in.Root, Runtime: in.Runtime, Fallbacks: append([]RuntimeSpec(nil), in.Fallbacks...)}, CreatedAt: now}
 	session := &Session{ID: sessionID, WorkflowID: workflowID, Native: in.NativeSession, Root: in.Root, CreatedAt: now}
 	activity := &Activity{ID: activityID, WorkflowID: workflowID, NodeID: nodeID, SessionID: sessionID, Generation: 1, Prompt: in.Prompt, CreatedAt: now}
 	execution := &Execution{ID: executionID, WorkflowID: workflowID, RootNodeID: nodeID, SessionID: sessionID, FirstActivity: activityID, IdempotencyKey: in.IdempotencyKey, InputDigest: digest, CreatedAt: now}
@@ -114,6 +117,21 @@ func validateStartInput(in StartExecutionInput) error {
 	}
 	if err := validateRuntime(in.Runtime); err != nil {
 		return err
+	}
+	for _, fallback := range in.Fallbacks {
+		if err := validateRuntime(fallback); err != nil {
+			return fmt.Errorf("fallback runtime: %w", err)
+		}
+		if in.Authority.Sandbox == SandboxReadOnly && fallback.Sandbox != SandboxReadOnly {
+			return errors.New("read-only workflow cannot use a write-capable fallback")
+		}
+	}
+	seenRuntimeNames := map[string]bool{in.Runtime.Name: true}
+	for _, fallback := range in.Fallbacks {
+		if seenRuntimeNames[fallback.Name] {
+			return fmt.Errorf("runtime fallback reuses provider identity %q", fallback.Name)
+		}
+		seenRuntimeNames[fallback.Name] = true
 	}
 	if !in.Authority.HumanAuthorized || strings.TrimSpace(in.Authority.RequestedBy) == "" {
 		return errors.New("StartExecution requires explicit human authorization")
@@ -154,6 +172,149 @@ func validateRuntime(runtime RuntimeSpec) error {
 		return fmt.Errorf("unsupported runtime sandbox %q", runtime.Sandbox)
 	}
 	return nil
+}
+
+type SetRoleLadderInput struct {
+	Role           string        `json:"role"`
+	Candidates     []RuntimeSpec `json:"candidates"`
+	IdempotencyKey string        `json:"-"`
+}
+
+type setRoleLadderCommand struct{ Input SetRoleLadderInput }
+
+func (c setRoleLadderCommand) commandType() string     { return "SetRoleLadder" }
+func (c setRoleLadderCommand) idempotencyKey() string  { return c.Input.IdempotencyKey }
+func (c setRoleLadderCommand) digest() (string, error) { return digestValue(c.Input, "IdempotencyKey") }
+
+func (s *Store) SetRoleLadder(ctx context.Context, input SetRoleLadderInput) ([]RuntimeSpec, Receipt, error) {
+	receipt, err := s.Execute(ctx, setRoleLadderCommand{Input: input})
+	if err != nil {
+		return nil, receipt, err
+	}
+	state, err := s.Projection()
+	if err != nil {
+		return nil, receipt, err
+	}
+	return append([]RuntimeSpec(nil), state.RoleLadders[input.Role]...), receipt, nil
+}
+
+func (s *Store) RoleLadder(role string) ([]RuntimeSpec, error) {
+	state, err := s.Projection()
+	if err != nil {
+		return nil, err
+	}
+	return append([]RuntimeSpec(nil), state.RoleLadders[strings.TrimSpace(role)]...), nil
+}
+
+func (c setRoleLadderCommand) decide(state *State, now time.Time) ([]DomainEvent, string, error) {
+	if strings.TrimSpace(c.Input.Role) == "" || len(c.Input.Candidates) == 0 {
+		return nil, "", errors.New("role ladder requires a role and at least one candidate")
+	}
+	candidates := make([]RuntimeSpec, len(c.Input.Candidates))
+	seen := map[string]bool{}
+	seenNames := map[string]bool{}
+	for index, candidate := range c.Input.Candidates {
+		if err := validateRuntime(candidate); err != nil {
+			return nil, "", fmt.Errorf("candidate %d: %w", index, err)
+		}
+		key := runtimeSpecKey(candidate)
+		if seen[key] {
+			return nil, "", fmt.Errorf("duplicate role ladder candidate %q", key)
+		}
+		if seenNames[candidate.Name] {
+			return nil, "", fmt.Errorf("role ladder reuses provider identity %q", candidate.Name)
+		}
+		seen[key] = true
+		seenNames[candidate.Name] = true
+		candidates[index] = candidate
+	}
+	return []DomainEvent{mustEvent(eventRoleLadderSet, roleLadderSetEvent{Role: strings.TrimSpace(c.Input.Role), Candidates: candidates})}, c.Input.Role, nil
+}
+
+type StartFallbackActivityInput struct {
+	ParentActivityID ActivityID  `json:"parent_activity_id"`
+	Runtime          RuntimeSpec `json:"runtime"`
+	IdempotencyKey   string      `json:"-"`
+}
+
+type startFallbackActivityCommand struct{ Input StartFallbackActivityInput }
+
+func (c startFallbackActivityCommand) commandType() string    { return "StartFallbackActivity" }
+func (c startFallbackActivityCommand) idempotencyKey() string { return c.Input.IdempotencyKey }
+func (c startFallbackActivityCommand) digest() (string, error) {
+	return digestValue(c.Input, "IdempotencyKey")
+}
+
+func (s *Store) StartFallbackActivity(ctx context.Context, input StartFallbackActivityInput) (*Activity, Receipt, error) {
+	receipt, err := s.Execute(ctx, startFallbackActivityCommand{Input: input})
+	if err != nil {
+		return nil, receipt, err
+	}
+	state, err := s.Projection()
+	if err != nil {
+		return nil, receipt, err
+	}
+	activity := state.Activities[ActivityID(receipt.ResourceID)]
+	if activity == nil {
+		return nil, receipt, errors.New("committed fallback Activity is absent")
+	}
+	return cloneActivity(activity), receipt, nil
+}
+
+func (c startFallbackActivityCommand) decide(state *State, now time.Time) ([]DomainEvent, string, error) {
+	parent := state.Activities[c.Input.ParentActivityID]
+	if parent == nil || resultForActivity(state, parent.ID) != nil {
+		return nil, "", errors.New("fallback requires an incomplete parent Activity")
+	}
+	workflow := state.Workflows[parent.WorkflowID]
+	if workflow == nil {
+		return nil, "", errors.New("fallback parent workflow does not exist")
+	}
+	node := workflow.Nodes[parent.NodeID]
+	parentSession := state.Sessions[parent.SessionID]
+	if workflow == nil || node == nil || parentSession == nil || parentSession.ImportedUnresolved {
+		return nil, "", errors.New("fallback parent has broken durable identity")
+	}
+	if !runtimeAllowed(node.Work, c.Input.Runtime) {
+		return nil, "", errors.New("fallback runtime is not an authorized Work candidate")
+	}
+	if c.Input.Runtime.Name == parentSession.Native.Runtime {
+		return nil, "", errors.New("same-runtime retry must preserve the existing Session")
+	}
+	for _, activity := range state.Activities {
+		if activity.ParentActivityID != parent.ID {
+			continue
+		}
+		session := state.Sessions[activity.SessionID]
+		if session != nil && session.Native.Runtime == c.Input.Runtime.Name {
+			return nil, "", errors.New("fallback child already exists")
+		}
+	}
+	sessionID := SessionID(stableID("session", c.Input.IdempotencyKey))
+	activityID := ActivityID(stableID("activity", c.Input.IdempotencyKey))
+	session := &Session{ID: sessionID, WorkflowID: workflow.ID, Native: NativeSessionIdentity{Runtime: c.Input.Runtime.Name}, ParentID: parentSession.ID, Root: parentSession.Root, CreatedAt: now}
+	activity := &Activity{ID: activityID, WorkflowID: parent.WorkflowID, NodeID: parent.NodeID, SessionID: sessionID, Generation: parent.Generation, ParentActivityID: parent.ID, Prompt: parent.Prompt, DependencyBindings: append([]ResultBinding(nil), parent.DependencyBindings...), CreatedAt: now}
+	return []DomainEvent{mustEvent(eventFallbackQueued, fallbackQueuedEvent{Session: session, Activity: activity})}, string(activityID), nil
+}
+
+func FindFallbackActivity(state *State, parent ActivityID, runtime RuntimeSpec) *Activity {
+	if state == nil {
+		return nil
+	}
+	for _, activity := range state.Activities {
+		if activity.ParentActivityID != parent {
+			continue
+		}
+		session := state.Sessions[activity.SessionID]
+		if session != nil && session.Native.Runtime == runtime.Name {
+			return cloneActivity(activity)
+		}
+	}
+	return nil
+}
+
+func runtimeSpecKey(runtime RuntimeSpec) string {
+	return strings.Join([]string{runtime.Name, runtime.Executable, runtime.Model, runtime.Effort, string(runtime.Sandbox)}, "\x00")
 }
 
 type AddNodeInput struct {
@@ -214,6 +375,7 @@ func (c addNodeCommand) decide(state *State, now time.Time) ([]DomainEvent, stri
 	if err = validateRuntime(in.Work.Runtime); err != nil {
 		return nil, "", err
 	}
+	seenRuntimeNames := map[string]bool{in.Work.Runtime.Name: true}
 	for _, fallback := range in.Work.Fallbacks {
 		if err = validateRuntime(fallback); err != nil {
 			return nil, "", fmt.Errorf("fallback runtime: %w", err)
@@ -221,6 +383,10 @@ func (c addNodeCommand) decide(state *State, now time.Time) ([]DomainEvent, stri
 		if workflow.Authority.Sandbox == SandboxReadOnly && fallback.Sandbox != SandboxReadOnly {
 			return nil, "", errors.New("read-only workflow cannot add write-capable fallback")
 		}
+		if seenRuntimeNames[fallback.Name] {
+			return nil, "", fmt.Errorf("runtime fallback reuses provider identity %q", fallback.Name)
+		}
+		seenRuntimeNames[fallback.Name] = true
 	}
 	if workflow.Authority.Sandbox == SandboxReadOnly && in.Work.Runtime.Sandbox != SandboxReadOnly {
 		return nil, "", errors.New("read-only workflow cannot add write-capable work")
@@ -319,8 +485,8 @@ func (c continueSessionCommand) decide(state *State, now time.Time) ([]DomainEve
 	execution := state.Executions[in.ExecutionID]
 	session := state.Sessions[in.SessionID]
 	predecessor := state.Activities[in.PredecessorActivityID]
-	if execution == nil || session == nil || predecessor == nil || execution.SessionID != in.SessionID || predecessor.SessionID != in.SessionID {
-		return nil, "", errors.New("continuation must name the execution's exact session and predecessor")
+	if execution == nil || session == nil || predecessor == nil || execution.WorkflowID != session.WorkflowID || predecessor.WorkflowID != execution.WorkflowID || predecessor.SessionID != in.SessionID {
+		return nil, "", errors.New("continuation must name the execution's exact session lineage and predecessor")
 	}
 	if session.ImportedUnresolved || strings.TrimSpace(session.Native.ID) == "" {
 		return nil, "", errors.New("continuation requires a previously bound exact native Session")
@@ -556,8 +722,8 @@ func validateMilestone(state *State, attempt *Attempt, activity *Activity, m Mil
 			return fmt.Errorf("unsupported result status %q", m.Result.Status)
 		}
 	case MilestoneProviderUnavailable:
-		if strings.TrimSpace(m.Failure) == "" {
-			return errors.New("provider_unavailable requires a classified reason")
+		if turnStarted || strings.TrimSpace(m.Failure) == "" {
+			return errors.New("provider_unavailable is pre-turn and requires a classified reason")
 		}
 	case MilestoneAdapterStartFailed:
 		if turnStarted || strings.TrimSpace(m.Failure) == "" {
@@ -707,7 +873,7 @@ func (c pauseWorkflowCommand) decide(state *State, now time.Time) ([]DomainEvent
 		if activity == nil {
 			continue
 		}
-		control := &Control{ID: ControlID(stableID("control", string(in.WorkflowID)+"/pause/"+string(attempt.ID))), Kind: "pause", ActivityID: activity.ID, ExpectedGeneration: activity.Generation, ExpectedAttemptID: attempt.ID, Accepted: true, CreatedAt: now}
+		control := &Control{ID: ControlID(stableID("control", string(in.WorkflowID)+"/pause/"+string(attempt.ID))), Kind: "pause", Actor: in.RequestedBy, ActivityID: activity.ID, ExpectedGeneration: activity.Generation, ExpectedAttemptID: attempt.ID, Accepted: true, CreatedAt: now}
 		events = append(events, mustEvent(eventControlRecorded, controlRecordedEvent{Control: control}))
 		events = append(events, settleMessages(state, activity.ID, attempt.ID, false, now)...)
 		pause.FencedAttemptIDs = append(pause.FencedAttemptIDs, attempt.ID)
@@ -856,7 +1022,7 @@ func (c requestControlCommand) decide(state *State, now time.Time) ([]DomainEven
 		reason = "activity is paused or generation or exact Attempt identity changed"
 	}
 	id := ControlID(stableID("control", in.IdempotencyKey))
-	control := &Control{ID: id, Kind: in.Kind, ActivityID: in.ActivityID, ExpectedGeneration: in.ExpectedGeneration, ExpectedAttemptID: in.ExpectedAttemptID, Accepted: accepted, Reason: reason, CreatedAt: now}
+	control := &Control{ID: id, Kind: in.Kind, Actor: in.Actor, ActivityID: in.ActivityID, ExpectedGeneration: in.ExpectedGeneration, ExpectedAttemptID: in.ExpectedAttemptID, Accepted: accepted, Reason: reason, CreatedAt: now}
 	return []DomainEvent{mustEvent(eventControlRecorded, controlRecordedEvent{Control: control})}, string(id), nil
 }
 

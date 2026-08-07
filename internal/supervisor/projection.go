@@ -97,9 +97,30 @@ type NodeView struct {
 	ActivityIDs    []ActivityID `json:"activity_ids,omitempty"`
 }
 
+type ExecutionStatus string
+
+const (
+	ExecutionWaiting    ExecutionStatus = "waiting"
+	ExecutionQueued     ExecutionStatus = "queued"
+	ExecutionScheduled  ExecutionStatus = "scheduled"
+	ExecutionStarting   ExecutionStatus = "starting"
+	ExecutionRunning    ExecutionStatus = "running"
+	ExecutionDeciding   ExecutionStatus = "deciding"
+	ExecutionNeedsHuman ExecutionStatus = "needs_human"
+	ExecutionBlocked    ExecutionStatus = "blocked"
+	ExecutionCompleted  ExecutionStatus = "completed"
+	ExecutionPaused     ExecutionStatus = "paused"
+	ExecutionFailed     ExecutionStatus = "failed"
+)
+
 type ExecutionView struct {
 	ID           ExecutionID      `json:"id"`
 	WorkflowID   WorkflowID       `json:"workflow_id"`
+	Title        string           `json:"title,omitempty"`
+	Status       ExecutionStatus  `json:"status"`
+	Active       bool             `json:"active"`
+	Summary      string           `json:"summary,omitempty"`
+	UpdatedAt    time.Time        `json:"updated_at"`
 	Nodes        []NodeView       `json:"nodes"`
 	Activities   []ActivityView   `json:"activities"`
 	Attempts     []AttemptView    `json:"attempts"`
@@ -126,7 +147,10 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 		return nil, os.ErrNotExist
 	}
 	workflow := state.Workflows[execution.WorkflowID]
-	view := &ExecutionView{ID: execution.ID, WorkflowID: workflow.ID, AsOf: asOf.UTC()}
+	view := &ExecutionView{ID: execution.ID, WorkflowID: workflow.ID, UpdatedAt: execution.CreatedAt.UTC(), AsOf: asOf.UTC()}
+	if root := workflow.Nodes[execution.RootNodeID]; root != nil {
+		view.Title = root.Title
+	}
 	for _, activity := range orderedActivities(state, workflow.ID) {
 		item := projectActivity(state, activity, asOf)
 		view.Activities = append(view.Activities, item)
@@ -199,7 +223,106 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 		view.Nodes = append(view.Nodes, item)
 	}
 	view.Publication = projectPublication(workflow, state)
+	if state.Pauses[workflow.ID] != nil {
+		view.Status, view.Active = ExecutionPaused, false
+	} else {
+		view.Status, view.Active = projectExecutionStatus(view)
+	}
+	view.Summary, view.UpdatedAt = projectExecutionSummary(state, workflow.ID, view.UpdatedAt)
 	return view, nil
+}
+
+func projectExecutionStatus(view *ExecutionView) (ExecutionStatus, bool) {
+	latest := make(map[NodeID]ActivityView)
+	for _, activity := range view.Activities {
+		current, ok := latest[activity.NodeID]
+		if !ok || activity.Generation >= current.Generation {
+			latest[activity.NodeID] = activity
+		}
+	}
+
+	statuses := make(map[ActivityStatus]bool)
+	waiting := false
+	for _, node := range view.Nodes {
+		if node.Status == NodeSuperseded {
+			continue
+		}
+		if activity, ok := latest[node.ID]; ok {
+			statuses[activity.Status] = true
+			continue
+		}
+		if node.Status == NodeEligible || node.Status == NodeWaitingDependencies {
+			waiting = true
+		}
+	}
+
+	for _, candidate := range []struct {
+		activity ActivityStatus
+		status   ExecutionStatus
+	}{
+		{ActivityNeedsHuman, ExecutionNeedsHuman},
+		{ActivityBlocked, ExecutionBlocked},
+		{ActivityRunning, ExecutionRunning},
+		{ActivityStarting, ExecutionStarting},
+		{ActivityDeciding, ExecutionDeciding},
+		{ActivityQueued, ExecutionQueued},
+		{ActivityRetryable, ExecutionQueued},
+		{ActivityScheduled, ExecutionScheduled},
+	} {
+		if statuses[candidate.activity] {
+			return candidate.status, true
+		}
+	}
+	if waiting {
+		return ExecutionWaiting, true
+	}
+	if statuses[ActivityFailed] {
+		return ExecutionFailed, false
+	}
+	if statuses[ActivityPaused] {
+		return ExecutionPaused, false
+	}
+	return ExecutionCompleted, false
+}
+
+func projectExecutionSummary(state *State, workflowID WorkflowID, updatedAt time.Time) (string, time.Time) {
+	summary := ""
+	var summaryAt time.Time
+	consider := func(at time.Time, value string) {
+		if at.After(updatedAt) {
+			updatedAt = at.UTC()
+		}
+		if strings.TrimSpace(value) != "" && (summaryAt.IsZero() || !at.Before(summaryAt)) {
+			summary = strings.Join(strings.Fields(value), " ")
+			summaryAt = at
+		}
+	}
+	for _, activity := range orderedActivities(state, workflowID) {
+		consider(activity.CreatedAt, "")
+	}
+	for _, attempt := range orderedAttempts(state, workflowID) {
+		consider(attempt.CreatedAt, "")
+		for _, milestone := range attempt.Milestones {
+			consider(milestone.At, milestone.Progress)
+		}
+	}
+	results := make([]*Result, 0, len(state.Results))
+	for _, result := range state.Results {
+		if result.WorkflowID == workflowID {
+			results = append(results, result)
+		}
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].CreatedAt.Before(results[j].CreatedAt) || results[i].CreatedAt.Equal(results[j].CreatedAt) && results[i].ID < results[j].ID
+	})
+	for _, result := range results {
+		consider(result.CreatedAt, result.Summary)
+	}
+	if pause := state.Pauses[workflowID]; pause != nil {
+		consider(pause.RequestedAt, "")
+		consider(pause.CompletedAt, "")
+	}
+	return summary, updatedAt
 }
 
 func projectActivity(state *State, activity *Activity, asOf time.Time) ActivityView {

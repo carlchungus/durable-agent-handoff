@@ -13,7 +13,10 @@ func RenderText(view *ExecutionView) string {
 		return ""
 	}
 	var output strings.Builder
-	fmt.Fprintf(&output, "Execution %s\nWorkflow %s\nPublication %s\n", view.ID, view.WorkflowID, view.Publication)
+	fmt.Fprintf(&output, "Execution %s\nWorkflow %s\nTitle %s\nStatus %s\nUpdated %s\nPublication %s\n", view.ID, view.WorkflowID, singleLine(view.Title), view.Status, view.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z"), view.Publication)
+	if view.Summary != "" {
+		fmt.Fprintf(&output, "Progress %s\n", singleLine(view.Summary))
+	}
 	if view.NextWakeAt != nil {
 		fmt.Fprintf(&output, "NextWake %s\n", view.NextWakeAt.UTC().Format("2006-01-02T15:04:05Z"))
 	}

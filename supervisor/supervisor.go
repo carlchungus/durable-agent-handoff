@@ -68,6 +68,7 @@ type (
 	ApplyControlInput          = internal.ApplyControlInput
 	ImportV1Input              = internal.ImportV1Input
 	ExecutionView              = internal.ExecutionView
+	ExecutionStatus            = internal.ExecutionStatus
 	NodeView                   = internal.NodeView
 	ActivityView               = internal.ActivityView
 	AttemptView                = internal.AttemptView
@@ -108,6 +109,7 @@ const (
 	HealthExited       = internal.HealthExited
 	ActivityDeciding   = internal.ActivityDeciding
 	ActivityNeedsHuman = internal.ActivityNeedsHuman
+	ExecutionPaused    = internal.ExecutionPaused
 
 	PublicationDisabled       = internal.PublicationDisabled
 	PublicationAwaitingResult = internal.PublicationAwaitingResult

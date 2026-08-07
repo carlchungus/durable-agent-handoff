@@ -325,32 +325,123 @@ func cmdV2List(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	state := common(fs)
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--json": false})); err != nil {
+	all := fs.Bool("all", false, "include completed, paused, and failed workstreams")
+	watch := fs.Duration("watch", 0, "keep watching and emit material changes, such as 30s")
+	known := map[string]bool{"--state": true, "--json": false, "--all": false, "--watch": true}
+	if err := fs.Parse(reorderFlags(args, known)); err != nil {
 		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("list accepts no positional arguments")
+	}
+	if *watch < 0 {
+		return errors.New("watch interval must not be negative")
 	}
 	store, err := openV2(*state)
 	if err != nil {
 		return err
 	}
-	views, err := v2Views(store)
-	if err != nil {
+	emit := func(previous string) (string, error) {
+		views, viewErr := v2Views(store)
+		if viewErr != nil {
+			return previous, viewErr
+		}
+		views = visibleWorkstreams(views, *all)
+		digest := workstreamDigest(views)
+		if digest == previous {
+			return previous, nil
+		}
+		if *jsonOut {
+			if *watch > 0 {
+				viewErr = writeJSON(out, struct {
+					ObservedAt  time.Time                   `json:"observed_at"`
+					Workstreams []*supervisor.ExecutionView `json:"workstreams"`
+				}{ObservedAt: time.Now().UTC(), Workstreams: views})
+			} else {
+				viewErr = writeJSON(out, views)
+			}
+		} else {
+			viewErr = renderWorkstreamList(out, views, *all, *watch > 0)
+		}
+		return digest, viewErr
+	}
+
+	last, err := emit("")
+	if err != nil || *watch == 0 {
 		return err
 	}
-	if *jsonOut {
-		return writeJSON(out, views)
-	}
-	for _, view := range views {
-		needsHuman := 0
-		for _, activity := range view.Activities {
-			if activity.Status == supervisor.ActivityNeedsHuman {
-				needsHuman++
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ticker := time.NewTicker(*watch)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			last, err = emit(last)
+			if err != nil {
+				return err
 			}
 		}
+	}
+}
+
+func visibleWorkstreams(views []*supervisor.ExecutionView, all bool) []*supervisor.ExecutionView {
+	visible := make([]*supervisor.ExecutionView, 0, len(views))
+	for _, view := range views {
+		if all || view.Active {
+			visible = append(visible, view)
+		}
+	}
+	sort.SliceStable(visible, func(i, j int) bool {
+		return visible[i].UpdatedAt.After(visible[j].UpdatedAt)
+	})
+	return visible
+}
+
+func workstreamDigest(views []*supervisor.ExecutionView) string {
+	type item struct {
+		ID         supervisor.ExecutionID     `json:"id"`
+		Status     supervisor.ExecutionStatus `json:"status"`
+		Title      string                     `json:"title"`
+		Summary    string                     `json:"summary"`
+		UpdatedAt  time.Time                  `json:"updated_at"`
+		NextWakeAt *time.Time                 `json:"next_wake_at,omitempty"`
+	}
+	items := make([]item, 0, len(views))
+	for _, view := range views {
+		items = append(items, item{ID: view.ID, Status: view.Status, Title: view.Title, Summary: view.Summary, UpdatedAt: view.UpdatedAt, NextWakeAt: view.NextWakeAt})
+	}
+	raw, _ := json.Marshal(items)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func renderWorkstreamList(out io.Writer, views []*supervisor.ExecutionView, all, watching bool) error {
+	if watching {
+		if _, err := fmt.Fprintf(out, "Observed %s\n", time.Now().UTC().Format(time.RFC3339)); err != nil {
+			return err
+		}
+	}
+	if len(views) == 0 {
+		message := "No active workstreams."
+		if all {
+			message = "No workstreams."
+		}
+		_, err := fmt.Fprintln(out, message)
+		return err
+	}
+	for _, view := range views {
 		nextWake := "-"
 		if view.NextWakeAt != nil {
 			nextWake = view.NextWakeAt.UTC().Format(time.RFC3339)
 		}
-		fmt.Fprintf(out, "%s workflow=%s publication=%s queue=%d pending_turns=%d needs_human=%d next_wake=%s\n", view.ID, view.WorkflowID, view.Publication, len(view.Queue), len(view.PendingTurns), needsHuman, nextWake)
+		title := strings.Join(strings.Fields(view.Title), " ")
+		summary := strings.Join(strings.Fields(view.Summary), " ")
+		if _, err := fmt.Fprintf(out, "%s status=%s updated=%s next_wake=%s title=%q progress=%q\n", view.ID, view.Status, view.UpdatedAt.UTC().Format(time.RFC3339), nextWake, title, summary); err != nil {
+			return err
+		}
 	}
 	return nil
 }

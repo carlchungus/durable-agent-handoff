@@ -139,7 +139,8 @@ inactive after a crash, reboot, or service-manager failure. It never restarts a
 healthy service or interrupts a live worker. systemd timers are persistent
 across missed wakeups, and launchd uses the equivalent `StartInterval` fallback.
 
-`--environment-json` must be a regular mode-0600 JSON object. Values are read
+`--environment-json` must be a private regular JSON file: POSIX hosts require
+mode `0600`; Windows requires an owner/System/Administrators-only DACL. Values are read
 only at service startup and passed to drivers without being persisted. Service
 units contain only argv, the private state root, the environment-file path,
 and trust mode. On every service start, inherited Attempts are reconciled before

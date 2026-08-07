@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/driver"
+	"github.com/carlchungus/durable-agent-handoff/internal/evaluator"
 	"github.com/carlchungus/durable-agent-handoff/internal/executor"
 	"github.com/carlchungus/durable-agent-handoff/supervisor"
 )
@@ -26,9 +28,15 @@ type ServeOptions struct {
 	TrustMode       driver.TrustMode
 	OutputRoot      string
 	StartupDeadline time.Duration
+	// EvaluationRetryDelay bounds transient evaluator failures. It is process
+	// state only: unresolved Claims remain durable and are retried after restart.
+	EvaluationRetryDelay time.Duration
 	// RunActivity is a test seam for the service drain contract. Production
 	// callers leave it nil so the durable Executor is used.
 	RunActivity func(context.Context, supervisor.ActivityID) error
+	// Evaluator is a fresh, tool-less terminal-claim evaluator. Production
+	// callers leave it nil to use OpenRouter from the transient environment.
+	Evaluator evaluator.Evaluator
 }
 
 // ServeV2 reconciles inherited Attempts once before scheduling queued
@@ -56,6 +64,9 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 	if options.StartupDeadline <= 0 {
 		options.StartupDeadline = 30 * time.Second
 	}
+	if options.EvaluationRetryDelay <= 0 {
+		options.EvaluationRetryDelay = 30 * time.Second
+	}
 	if err := ctx.Err(); err != nil {
 		return nil
 	}
@@ -66,6 +77,8 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 	var mu sync.Mutex
 	var activeWorkers sync.WaitGroup
 	active := map[supervisor.ActivityID]bool{}
+	activeEvaluations := map[supervisor.ClaimID]bool{}
+	evaluationRetryAt := map[supervisor.ClaimID]time.Time{}
 	run := func() {
 		if ctx.Err() != nil {
 			return
@@ -78,6 +91,75 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 			return
 		}
 		for _, view := range views {
+			for _, claimID := range view.EvaluationQueue {
+				if ctx.Err() != nil {
+					return
+				}
+				mu.Lock()
+				if activeEvaluations[claimID] || time.Now().Before(evaluationRetryAt[claimID]) {
+					mu.Unlock()
+					continue
+				}
+				select {
+				case sem <- struct{}{}:
+					activeEvaluations[claimID] = true
+				default:
+					mu.Unlock()
+					return
+				}
+				activeWorkers.Add(1)
+				mu.Unlock()
+				go func(id supervisor.ClaimID) {
+					failed := false
+					defer func() {
+						activeWorkers.Done()
+						<-sem
+						mu.Lock()
+						delete(activeEvaluations, id)
+						if failed {
+							evaluationRetryAt[id] = time.Now().Add(options.EvaluationRetryDelay)
+						} else {
+							delete(evaluationRetryAt, id)
+						}
+						mu.Unlock()
+					}()
+					state, projectionErr := store.Projection()
+					if projectionErr != nil {
+						failed = true
+						if logf != nil {
+							logf("claim=%s evaluation_projection_error=%v", id, projectionErr)
+						}
+						return
+					}
+					request, requestErr := claimEvaluationRequest(state, id)
+					if requestErr != nil {
+						failed = true
+						if logf != nil {
+							logf("claim=%s evaluation_request_error=%v", id, requestErr)
+						}
+						return
+					}
+					claimEvaluator := options.Evaluator
+					if claimEvaluator == nil {
+						claimEvaluator = evaluator.OpenRouter{APIKey: environmentValue(options.Environment, "OPENROUTER_API_KEY"), Endpoint: environmentValue(options.Environment, "HANDOFF_EVALUATOR_ENDPOINT"), Mode: evaluator.ModeToolCall}
+					}
+					decision, evaluationErr := claimEvaluator.Evaluate(ctx, request)
+					if evaluationErr != nil {
+						failed = true
+						if logf != nil {
+							logf("claim=%s evaluation_error=%v", id, evaluationErr)
+						}
+						return
+					}
+					_, _, resolveErr := store.ResolveClaim(context.Background(), supervisor.ResolveClaimInput{ClaimID: id, Decision: decision, IdempotencyKey: "evaluation/" + string(id)})
+					if resolveErr != nil {
+						failed = true
+						if logf != nil {
+							logf("claim=%s evaluation_commit_error=%v", id, resolveErr)
+						}
+					}
+				}(claimID)
+			}
 			for _, activityID := range view.Queue {
 				if ctx.Err() != nil {
 					return
@@ -130,6 +212,62 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 			run()
 		}
 	}
+}
+
+func claimEvaluationRequest(state *supervisor.State, claimID supervisor.ClaimID) (evaluator.Request, error) {
+	claim := state.Claims[claimID]
+	if claim == nil {
+		return evaluator.Request{}, errors.New("evaluation claim is absent")
+	}
+	workflow := state.Workflows[claim.WorkflowID]
+	activity := state.Activities[claim.ActivityID]
+	if workflow == nil || activity == nil {
+		return evaluator.Request{}, errors.New("evaluation claim has broken workflow or activity identity")
+	}
+	node := workflow.Nodes[claim.NodeID]
+	if node == nil {
+		return evaluator.Request{}, errors.New("evaluation claim has no desired work")
+	}
+	request := evaluator.Request{Model: workflow.Autonomy.EvaluatorModel, Goal: node.Title, Prompt: activity.Prompt, Claim: claim.Result}
+	if workflow.Finalizer.Enabled {
+		request.SupervisorContext = "An enabled deterministic finalizer is already human-authorized to publish only after the worker result is accepted and the exact configured external checks pass on an unchanged head. Publication is intentionally not worker authority."
+	} else {
+		request.SupervisorContext = "No Supervisor-owned downstream finalizer is enabled for this workflow."
+	}
+	if attempt := state.Attempts[claim.AttemptID]; attempt != nil {
+		for _, milestone := range attempt.Milestones {
+			switch milestone.Kind {
+			case supervisor.MilestoneEffectStarted:
+				request.Evidence = appendBounded(request.Evidence, "effect: "+milestone.Effect)
+			case supervisor.MilestoneMeaningfulProgress:
+				request.Evidence = appendBounded(request.Evidence, "progress: "+milestone.Progress)
+			}
+		}
+	}
+	return request, nil
+}
+
+func appendBounded(values []string, value string) []string {
+	const maxItems = 20
+	const maxBytes = 1000
+	if len(value) > maxBytes {
+		value = value[:maxBytes]
+	}
+	values = append(values, value)
+	if len(values) > maxItems {
+		values = values[len(values)-maxItems:]
+	}
+	return values
+}
+
+func environmentValue(environment []string, name string) string {
+	prefix := name + "="
+	for index := len(environment) - 1; index >= 0; index-- {
+		if strings.HasPrefix(environment[index], prefix) {
+			return strings.TrimPrefix(environment[index], prefix)
+		}
+	}
+	return ""
 }
 
 func supervisorViews(store *supervisor.Store) ([]*supervisor.ExecutionView, error) {

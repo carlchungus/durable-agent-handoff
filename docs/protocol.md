@@ -57,6 +57,7 @@ interface:
 | `ContinueSession` | human Message + exact-Session continuation Activity generation |
 | `PrepareAttempt` | immutable Attempt + canonical-worktree writer Lease + inbox dispatch |
 | `RecordMilestone` | typed milestone plus any Result, inbox settlement, or terminal-exit Lease release |
+| `ResolveClaim` | fresh evaluator decision plus accepted Result, typed escalation, or exact-Session continuation |
 | `RequestControl` | accepted/rejected exact Activity-generation and Attempt fence |
 | `PauseWorkflow` | records exact controls and enters requested/draining; executor-applied terminal exits release Leases |
 | `SettlePause` | idempotently marks a draining pause completed after every fenced Attempt has exited |
@@ -102,8 +103,16 @@ Drivers may emit only:
 turns/results, milestones after a Result other than `exit`, non-monotonic event
 times, and stale Lease/Attempt fences are rejected.
 
-Result status is `completed`, `needs_human`, or `blocked`. A reply to any Result
-creates a continuation Activity; it never changes the Result or predecessor.
+Worker status is `completed`, `continue`, `needs_human`, or `blocked`.
+Non-autonomous `needs_human` requires a typed blocker and concrete question;
+`continue` is reserved for evaluator-controlled autonomous workflows. An
+autonomous worker status creates a Claim, not a Result. The service evaluates
+the Claim with a fresh tool-less model and commits one `accept`, `continue`, or
+`escalate` decision through `ResolveClaim`. A reply to any Result creates a
+continuation Activity; it never changes the Result or predecessor.
+`accept` records evaluator-owned terminal truth as a completed Result even when
+the worker mislabeled already-completed Activity work as blocked on a configured
+Supervisor finalizer.
 
 Worker Result payloads do not carry publication authority. Independently hosted
 CI and GitHub checks provide verification; handoff does not pretend that
@@ -180,7 +189,8 @@ with `idempotency_key`, `goal`, `prompt`, `remote_root`, `runtime`, `resume_id`,
 `sandbox`, and `role`, plus optional `model`, `effort`, and flat
 `finalizer_enabled`, `finalizer_required_checks`, and
 `finalizer_require_human` fields. Unknown fields and a second JSON value are
-rejected. Finalizer configuration is persisted in the immutable
+rejected. It also accepts flat `autonomous`, `evaluator_model`, and `max_turns`
+fields. Finalizer and autonomy configuration are persisted in the immutable
 `StartExecutionInput`; an enabled finalizer requires a nonempty canonical exact
 set of external GitHub checks, while human approval is independently optional.
 Its only JSON response shape is:

@@ -44,8 +44,11 @@ observation are different resources.
   and exact dependency Result bindings.
 - **Attempt** owns one immutable OS launch plus its ordered typed milestones,
   process identity, command digest, outputs, and Lease identity.
+- **Claim** is an autonomous worker's untrusted terminal assertion and names
+  the exact Activity generation and Attempt that produced it.
+- **Evaluation** is one fresh tool-less semantic decision over a Claim.
 - **Result** is immutable and names the exact Activity generation and Attempt
-  that produced it.
+  that produced it; autonomous Claims create Results only after Evaluation.
 - **Message**, **Control**, and canonical-worktree **Lease** retain independent
   identities and fences.
 
@@ -100,6 +103,14 @@ Completed Results never reopen. A human reply is one atomic command that queues
 an inbox Message and creates the next Activity generation on the exact Session.
 The predecessor Activity and Result remain immutable. A successor that already
 bound the predecessor Result keeps that binding.
+
+An autonomous `continue` decision uses the same transaction boundary: it records
+the Evaluation and predecessor Result, queues the evaluator reason as an inbox
+Message, and creates the next Activity generation on the exact bound Session.
+An untyped worker request for a human remains a Claim and cannot stop a goal by
+itself. A real escalation requires a typed workflow-wide blocker and concrete
+question. Exhausting the durable turn budget becomes a visible `budget`
+escalation instead of a hidden retry error.
 
 ## Attempts, budgets, and health
 
@@ -158,6 +169,13 @@ exit
 Decoders read only documented provider fields. They do not recursively search
 arbitrary JSON for `session_id`, `thread_id`, a result, or a limit string.
 Runtime Drivers never receive GitHub merge authority.
+
+Terminal evaluation is not a runtime Driver. It is a stateless OpenRouter HTTP
+adapter with no tools, workspace, native Session, or merge authority. The
+service invokes it only for persisted autonomous Claims. A forced decision tool
+is used by default; strict structured output is retained only for live provider
+compatibility probes. Evaluator failure leaves the Claim pending and cannot
+manufacture completion or human escalation.
 
 Codex and Claude enforce `read-only` through native restrictions. Pi fails
 closed for read-only work until an external OS sandbox is configured.

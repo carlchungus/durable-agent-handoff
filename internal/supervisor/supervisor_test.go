@@ -460,6 +460,197 @@ func TestNewSessionBindsOnceAndContinuationRequiresExactBoundIdentity(t *testing
 	}
 }
 
+func TestAutonomousClaimIsEvaluatedBeforeExactSessionContinuation(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	execution, _, err := store.StartExecution(context.Background(), StartExecutionInput{
+		NativeSession: NativeSessionIdentity{Runtime: "claude", ID: "campaign-session"},
+		Goal:          "Ship 100 safe type-hardening pull requests; skip unsuitable candidates",
+		Prompt:        "Find and ship the next safe type-hardening change",
+		Runtime:       RuntimeSpec{Name: "claude", Sandbox: SandboxWorkspaceWrite},
+		Root:          worktree,
+		Authority:     AuthoritySpec{RequestedBy: "human:test", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite},
+		Budget:        Budget{MaxTaskAttempts: 20, MaxLaunches: 40},
+		Autonomy: AutonomySpec{
+			Enabled:        true,
+			EvaluatorModel: "deepseek/deepseek-v4-flash-0731",
+			MaxTurns:       100,
+		},
+		IdempotencyKey: "autonomous-evaluation-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := store.Projection()
+	activity := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "autonomous-evaluation-attempt")
+	milestone(t, store, activity, attempt, "autonomous-evaluation-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 701, StartToken: "campaign-process"}})
+	milestone(t, store, activity, attempt, "autonomous-evaluation-turn", Milestone{Kind: MilestoneTurnStarted})
+	milestone(t, store, activity, attempt, "autonomous-evaluation-claim", Milestone{Kind: MilestoneResult, Result: &WorkerResult{Status: "needs_human", Summary: "This candidate cannot be changed safely"}})
+	milestone(t, store, activity, attempt, "autonomous-evaluation-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 0}})
+
+	view, err := store.View(execution.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.EvaluationQueue) != 1 || view.Activities[0].Status != ActivityEvaluating || view.Activities[0].ResultID != "" {
+		t.Fatalf("unverified worker claim became terminal: %+v", view)
+	}
+	claimID := view.EvaluationQueue[0]
+	continuation, _, err := store.ResolveClaim(context.Background(), ResolveClaimInput{
+		ClaimID: claimID,
+		Decision: EvaluationDecision{
+			Outcome: "continue",
+			Reason:  "The rejected candidate is local; select another safe candidate for the open-ended campaign.",
+			Model:   "deepseek/deepseek-v4-flash-0731",
+		},
+		IdempotencyKey: "autonomous-evaluation-resolve",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if continuation == nil || continuation.ParentActivityID != activity.ID || continuation.SessionID != activity.SessionID || continuation.Generation != activity.Generation+1 {
+		t.Fatalf("evaluation did not create an exact-session continuation: %+v", continuation)
+	}
+	state, _ = store.Projection()
+	if state.Sessions[continuation.SessionID].Native.ID != "campaign-session" {
+		t.Fatalf("continuation lost exact native session: %+v", state.Sessions[continuation.SessionID])
+	}
+	view, err = store.View(execution.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.EvaluationQueue) != 0 || len(view.Queue) != 1 || view.Queue[0] != continuation.ID {
+		t.Fatalf("evaluated continuation was not the only queued work: %+v", view)
+	}
+	if result := resultForActivity(state, activity.ID); result == nil || result.Status != "continue" {
+		t.Fatalf("predecessor did not retain its immutable continuation decision: %+v", result)
+	}
+}
+
+func TestEvaluatorCanAcceptCompletedWorkMislabeledAsPublicationBlocker(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	execution, _, err := store.StartExecution(context.Background(), StartExecutionInput{
+		NativeSession: NativeSessionIdentity{Runtime: "claude", ID: "publication-boundary-session"},
+		Goal:          "Implement and verify a safe change; the finalizer owns publication",
+		Prompt:        "Implement and verify the change",
+		Runtime:       RuntimeSpec{Name: "claude", Sandbox: SandboxWorkspaceWrite}, Root: worktree,
+		Authority: AuthoritySpec{RequestedBy: "human:test", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite}, Budget: DefaultBudget(),
+		Autonomy: AutonomySpec{Enabled: true, EvaluatorModel: "fake/evaluator", MaxTurns: 10}, IdempotencyKey: "publication-boundary-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := store.Projection()
+	activity := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "publication-boundary-attempt")
+	milestone(t, store, activity, attempt, "publication-boundary-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 704, StartToken: "publication-boundary-process"}})
+	milestone(t, store, activity, attempt, "publication-boundary-turn", Milestone{Kind: MilestoneTurnStarted})
+	milestone(t, store, activity, attempt, "publication-boundary-claim", Milestone{Kind: MilestoneResult, Result: &WorkerResult{
+		Status:  "needs_human",
+		Summary: "Implemented and committed 691958899; focused tests, typechecks, format, and the full check passed. Push and PR creation were not performed because publication belongs to the Supervisor finalizer.",
+	}})
+	milestone(t, store, activity, attempt, "publication-boundary-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 0}})
+	state, _ = store.Projection()
+	claim := claimForActivity(state, activity.ID)
+	continuation, _, err := store.ResolveClaim(context.Background(), ResolveClaimInput{
+		ClaimID:        claim.ID,
+		Decision:       EvaluationDecision{Outcome: "accept", Reason: "The worker Activity is complete; the authorized deterministic finalizer owns publication.", Model: "fake/evaluator"},
+		IdempotencyKey: "publication-boundary-accept",
+	})
+	if err != nil || continuation != nil {
+		t.Fatalf("evaluator could not accept terminal worker work: continuation=%+v err=%v", continuation, err)
+	}
+	state, _ = store.Projection()
+	result := resultForActivity(state, activity.ID)
+	view, err := store.View(execution.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.Status != "completed" || len(view.EvaluationQueue) != 0 || view.Activities[0].Status != ActivityCompleted {
+		t.Fatalf("accepted terminal work did not become a completed Result: result=%+v view=%+v", result, view)
+	}
+}
+
+func TestAutonomousEscalationRequiresTypedWorkflowWideBlocker(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	execution, _, err := store.StartExecution(context.Background(), StartExecutionInput{
+		NativeSession:  NativeSessionIdentity{Runtime: "claude", ID: "blocked-session"},
+		Goal:           "Complete the authorized work unless the whole workflow requires a human",
+		Prompt:         "Complete the work",
+		Runtime:        RuntimeSpec{Name: "claude", Sandbox: SandboxWorkspaceWrite},
+		Root:           worktree,
+		Authority:      AuthoritySpec{RequestedBy: "human:test", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite},
+		Budget:         DefaultBudget(),
+		Autonomy:       AutonomySpec{Enabled: true, EvaluatorModel: "fake/evaluator", MaxTurns: 10},
+		IdempotencyKey: "typed-escalation-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := store.Projection()
+	activity := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "typed-escalation-attempt")
+	milestone(t, store, activity, attempt, "typed-escalation-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 702, StartToken: "blocked-process"}})
+	milestone(t, store, activity, attempt, "typed-escalation-turn", Milestone{Kind: MilestoneTurnStarted})
+	milestone(t, store, activity, attempt, "typed-escalation-claim", Milestone{Kind: MilestoneResult, Result: &WorkerResult{Status: "needs_human", Summary: "Production credentials are unavailable"}})
+	milestone(t, store, activity, attempt, "typed-escalation-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 0}})
+	state, _ = store.Projection()
+	claim := claimForActivity(state, activity.ID)
+	sequence := state.Sequence
+	_, _, err = store.ResolveClaim(context.Background(), ResolveClaimInput{ClaimID: claim.ID, Decision: EvaluationDecision{Outcome: "escalate", Reason: "The entire workflow needs production credentials.", Model: "fake/evaluator", BlockerKind: "credential"}, IdempotencyKey: "typed-escalation-invalid"})
+	if err == nil {
+		t.Fatal("untyped human escalation was accepted")
+	}
+	state, _ = store.Projection()
+	if state.Sequence != sequence || len(state.Evaluations) != 0 {
+		t.Fatalf("rejected escalation partially mutated state: sequence=%d evaluations=%+v", state.Sequence, state.Evaluations)
+	}
+	continuation, _, err := store.ResolveClaim(context.Background(), ResolveClaimInput{ClaimID: claim.ID, Decision: EvaluationDecision{Outcome: "escalate", Reason: "The entire workflow needs production credentials.", Model: "fake/evaluator", BlockerKind: "credential", Question: "Which approved credential should this workflow use?"}, IdempotencyKey: "typed-escalation-valid"})
+	if err != nil || continuation != nil {
+		t.Fatalf("typed escalation result=%+v err=%v", continuation, err)
+	}
+	view, err := store.View(execution.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.EvaluationQueue) != 0 || view.Activities[0].Status != ActivityNeedsHuman || view.Activities[0].BlockerKind != "credential" || view.Activities[0].Question == "" {
+		t.Fatalf("typed blocker was not surfaced in the canonical view: %+v", view.Activities[0])
+	}
+	if rendered := RenderText(view); !strings.Contains(rendered, "blocker=credential") || !strings.Contains(rendered, "Which approved credential") {
+		t.Fatalf("human view hid the escalation: %s", rendered)
+	}
+}
+
+func TestAutonomousTurnBudgetBecomesVisibleHumanEscalation(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	execution, _, err := store.StartExecution(context.Background(), StartExecutionInput{
+		NativeSession: NativeSessionIdentity{Runtime: "claude", ID: "budget-session"}, Goal: "Keep trying safely", Prompt: "Try the next candidate",
+		Runtime: RuntimeSpec{Name: "claude", Sandbox: SandboxWorkspaceWrite}, Root: worktree,
+		Authority: AuthoritySpec{RequestedBy: "human:test", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite}, Budget: DefaultBudget(),
+		Autonomy: AutonomySpec{Enabled: true, EvaluatorModel: "fake/evaluator", MaxTurns: 1}, IdempotencyKey: "turn-budget-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := store.Projection()
+	activity := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "turn-budget-attempt")
+	milestone(t, store, activity, attempt, "turn-budget-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 703, StartToken: "budget-process"}})
+	milestone(t, store, activity, attempt, "turn-budget-turn", Milestone{Kind: MilestoneTurnStarted})
+	milestone(t, store, activity, attempt, "turn-budget-claim", Milestone{Kind: MilestoneResult, Result: &WorkerResult{Status: "continue", Summary: "Try another candidate"}})
+	milestone(t, store, activity, attempt, "turn-budget-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 0}})
+	state, _ = store.Projection()
+	claim := claimForActivity(state, activity.ID)
+	continuation, _, err := store.ResolveClaim(context.Background(), ResolveClaimInput{ClaimID: claim.ID, Decision: EvaluationDecision{Outcome: "continue", Reason: "Another candidate remains available.", Model: "fake/evaluator"}, IdempotencyKey: "turn-budget-resolve"})
+	if err != nil || continuation != nil {
+		t.Fatalf("budget exhaustion should escalate visibly, not error or continue: continuation=%+v err=%v", continuation, err)
+	}
+	view, _ := store.View(execution.ID, time.Now().UTC())
+	if view.Activities[0].Status != ActivityNeedsHuman || view.Activities[0].BlockerKind != "budget" || view.Activities[0].Question == "" {
+		t.Fatalf("turn budget did not become a visible human escalation: %+v", view.Activities[0])
+	}
+}
+
 func TestCompletedPredecessorIsImmutableAndContinuationQueuesBehindSuccessorLease(t *testing.T) {
 	store, _, worktree := openTestStore(t, Options{})
 	execution := startTestExecution(t, store, worktree, "continuation-start", DefaultBudget())

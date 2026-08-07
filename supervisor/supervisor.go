@@ -22,6 +22,8 @@ type (
 	ActivityID                 = internal.ActivityID
 	AttemptID                  = internal.AttemptID
 	ResultID                   = internal.ResultID
+	ClaimID                    = internal.ClaimID
+	EvaluationID               = internal.EvaluationID
 	MessageID                  = internal.MessageID
 	ControlID                  = internal.ControlID
 	LeaseID                    = internal.LeaseID
@@ -31,6 +33,7 @@ type (
 	AuthoritySpec              = internal.AuthoritySpec
 	FinalizerSpec              = internal.FinalizerSpec
 	Budget                     = internal.Budget
+	AutonomySpec               = internal.AutonomySpec
 	WorkSpec                   = internal.WorkSpec
 	Execution                  = internal.Execution
 	Workflow                   = internal.Workflow
@@ -39,6 +42,9 @@ type (
 	Activity                   = internal.Activity
 	Attempt                    = internal.Attempt
 	Result                     = internal.Result
+	Claim                      = internal.Claim
+	Evaluation                 = internal.Evaluation
+	EvaluationDecision         = internal.EvaluationDecision
 	ResultBinding              = internal.ResultBinding
 	ProcessIdentity            = internal.ProcessIdentity
 	OutputIdentity             = internal.OutputIdentity
@@ -60,6 +66,7 @@ type (
 	ContinueSessionInput       = internal.ContinueSessionInput
 	PrepareAttemptInput        = internal.PrepareAttemptInput
 	RecordMilestoneInput       = internal.RecordMilestoneInput
+	ResolveClaimInput          = internal.ResolveClaimInput
 	RequestControlInput        = internal.RequestControlInput
 	PauseWorkflowInput         = internal.PauseWorkflowInput
 	SettlePauseInput           = internal.SettlePauseInput
@@ -100,10 +107,12 @@ const (
 	MilestoneAdapterStartFailed  = internal.MilestoneAdapterStartFailed
 	MilestoneExit                = internal.MilestoneExit
 
-	HealthNotLaunched = internal.HealthNotLaunched
-	HealthStarting    = internal.HealthStarting
-	HealthRunning     = internal.HealthRunning
-	HealthExited      = internal.HealthExited
+	HealthNotLaunched  = internal.HealthNotLaunched
+	HealthStarting     = internal.HealthStarting
+	HealthRunning      = internal.HealthRunning
+	HealthExited       = internal.HealthExited
+	ActivityEvaluating = internal.ActivityEvaluating
+	ActivityNeedsHuman = internal.ActivityNeedsHuman
 
 	PublicationDisabled       = internal.PublicationDisabled
 	PublicationAwaitingResult = internal.PublicationAwaitingResult

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/driver"
+	"github.com/carlchungus/durable-agent-handoff/internal/evaluator"
 	"github.com/carlchungus/durable-agent-handoff/internal/executor"
 	"github.com/carlchungus/durable-agent-handoff/internal/githubgate"
 	"github.com/carlchungus/durable-agent-handoff/internal/privatepath"
@@ -49,6 +50,9 @@ type executionStartRequest struct {
 	FinalizerEnabled        bool               `json:"finalizer_enabled,omitempty"`
 	FinalizerRequiredChecks []string           `json:"finalizer_required_checks,omitempty"`
 	FinalizerRequireHuman   bool               `json:"finalizer_require_human,omitempty"`
+	Autonomous              bool               `json:"autonomous,omitempty"`
+	EvaluatorModel          string             `json:"evaluator_model,omitempty"`
+	MaxTurns                int                `json:"max_turns,omitempty"`
 }
 
 type executionStartResponse struct {
@@ -114,8 +118,11 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 	var requiredChecks runtimeCandidateFlags
 	fs.Var(&requiredChecks, "required-check", "required external GitHub check; repeat for each check")
 	requireHuman := fs.Bool("require-human", false, "require human approval before finalization")
+	autonomous := fs.Bool("autonomous", false, "evaluate terminal claims and continue the exact Session until the goal is met")
+	evaluatorModel := fs.String("evaluator-model", "", "tool-less OpenRouter evaluator model")
+	maxTurns := fs.Int("max-turns", 0, "maximum evaluator-controlled Session turns")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--finalizer-enabled": false, "--required-check": true, "--require-human": false, "--json": false}
+	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--finalizer-enabled": false, "--required-check": true, "--require-human": false, "--autonomous": false, "--evaluator-model": true, "--max-turns": true, "--json": false}
 	if err := rejectUnknownFlags(args, known); err != nil {
 		return err
 	}
@@ -151,6 +158,7 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 			Root:      request.RemoteRoot,
 			Authority: supervisor.AuthoritySpec{RequestedBy: request.Role, HumanAuthorized: true, Sandbox: request.Sandbox},
 			Finalizer: supervisor.FinalizerSpec{Enabled: request.FinalizerEnabled, RequiredChecks: append([]string(nil), request.FinalizerRequiredChecks...), RequireHuman: request.FinalizerRequireHuman},
+			Autonomy:  autonomySpec(request.Autonomous, request.EvaluatorModel, request.MaxTurns),
 			Budget:    supervisor.DefaultBudget(), IdempotencyKey: request.IdempotencyKey,
 		}
 	} else {
@@ -215,6 +223,7 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 			Root:      *root,
 			Authority: supervisor.AuthoritySpec{RequestedBy: *authorizedBy, HumanAuthorized: *authorizedBy != "", Sandbox: supervisor.Sandbox(*sandbox)},
 			Finalizer: supervisor.FinalizerSpec{Enabled: *finalizerEnabled, RequiredChecks: append([]string(nil), requiredChecks...), RequireHuman: *requireHuman},
+			Autonomy:  autonomySpec(*autonomous, *evaluatorModel, *maxTurns),
 			Budget:    supervisor.DefaultBudget(), IdempotencyKey: *key,
 		}
 	}
@@ -234,6 +243,21 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 	}
 	fmt.Fprintf(out, "execution=%s workflow=%s session=%s sequence=%d existing=%t\n", execution.ID, execution.WorkflowID, execution.SessionID, receipt.Sequence, receipt.Existing)
 	return nil
+}
+
+func autonomySpec(enabled bool, model string, maxTurns int) supervisor.AutonomySpec {
+	if !enabled {
+		// Preserve invalid partial configuration so the domain validator rejects
+		// it instead of silently ignoring a misspelled autonomous invocation.
+		return supervisor.AutonomySpec{EvaluatorModel: model, MaxTurns: maxTurns}
+	}
+	if strings.TrimSpace(model) == "" {
+		model = evaluator.DefaultModel
+	}
+	if maxTurns == 0 {
+		maxTurns = 100
+	}
+	return supervisor.AutonomySpec{Enabled: true, EvaluatorModel: model, MaxTurns: maxTurns}
 }
 
 func openV2(state string) (*supervisor.Store, error) {
@@ -308,7 +332,13 @@ func cmdV2List(args []string, out io.Writer) error {
 		return writeJSON(out, views)
 	}
 	for _, view := range views {
-		fmt.Fprintf(out, "%s workflow=%s publication=%s queue=%d\n", view.ID, view.WorkflowID, view.Publication, len(view.Queue))
+		needsHuman := 0
+		for _, activity := range view.Activities {
+			if activity.Status == supervisor.ActivityNeedsHuman {
+				needsHuman++
+			}
+		}
+		fmt.Fprintf(out, "%s workflow=%s publication=%s queue=%d evaluations=%d needs_human=%d\n", view.ID, view.WorkflowID, view.Publication, len(view.Queue), len(view.EvaluationQueue), needsHuman)
 	}
 	return nil
 }
@@ -795,7 +825,11 @@ func cmdV2Activity(args []string, out io.Writer) error {
 					}
 				}
 			}
-			fmt.Fprintf(out, "%s generation=%d status=%s attempts=%d\n", activity.ID, activity.Generation, activity.Status, attempts)
+			fmt.Fprintf(out, "%s generation=%d status=%s attempts=%d", activity.ID, activity.Generation, activity.Status, attempts)
+			if activity.BlockerKind != "" {
+				fmt.Fprintf(out, " blocker=%s question=%q", activity.BlockerKind, activity.Question)
+			}
+			fmt.Fprintln(out)
 		}
 		return nil
 	}
@@ -810,7 +844,11 @@ func cmdV2Activity(args []string, out io.Writer) error {
 			if *jsonOut {
 				return writeJSON(out, activity)
 			}
-			fmt.Fprintf(out, "%s generation=%d status=%s\n", activity.ID, activity.Generation, activity.Status)
+			fmt.Fprintf(out, "%s generation=%d status=%s", activity.ID, activity.Generation, activity.Status)
+			if activity.BlockerKind != "" {
+				fmt.Fprintf(out, " blocker=%s question=%q", activity.BlockerKind, activity.Question)
+			}
+			fmt.Fprintln(out)
 			return nil
 		}
 	}

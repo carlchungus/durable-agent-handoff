@@ -19,7 +19,7 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 	if err := os.Chmod(state, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	request, err := json.Marshal(executionStartRequest{IdempotencyKey: "arca-file-start-01", Goal: "promote work", Prompt: "secret stdin prompt", RemoteRoot: root, Runtime: "codex", ResumeID: "exact-thread", Sandbox: supervisor.SandboxReadOnly, Role: "arca-cloud", FinalizerEnabled: true, FinalizerRequiredChecks: []string{"verify"}, FinalizerRequireHuman: true})
+	request, err := json.Marshal(executionStartRequest{IdempotencyKey: "arca-file-start-01", Goal: "promote work", Prompt: "secret stdin prompt", RemoteRoot: root, Runtime: "codex", ResumeID: "exact-thread", Sandbox: supervisor.SandboxReadOnly, Role: "arca-cloud", FinalizerEnabled: true, FinalizerRequiredChecks: []string{"verify"}, FinalizerRequireHuman: true, Autonomous: true, EvaluatorModel: "deepseek/deepseek-v4-flash-0731", MaxTurns: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,6 +66,9 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 	if finalizer := projection.Workflows[response.WorkflowID].Finalizer; !finalizer.Enabled || !finalizer.RequireHuman || len(finalizer.RequiredChecks) != 1 || finalizer.RequiredChecks[0] != "verify" {
 		t.Fatalf("promotion finalizer was not persisted immutably: %+v", finalizer)
 	}
+	if autonomy := projection.Workflows[response.WorkflowID].Autonomy; !autonomy.Enabled || autonomy.EvaluatorModel != "deepseek/deepseek-v4-flash-0731" || autonomy.MaxTurns != 100 {
+		t.Fatalf("promotion autonomy was not persisted immutably: %+v", autonomy)
+	}
 	divergent := strings.Replace(string(request), `"promote work"`, `"different work"`, 1)
 	out.Reset()
 	if err = runWithPrompt(t, []string{"execution", "start", "--state", state, "--file", "-", "--json"}, divergent, &out, &errOut); !errors.Is(err, supervisor.ErrIdempotencyConflict) {
@@ -110,6 +113,29 @@ func TestOrdinaryStartPersistsAdvertisedFinalizerAndRejectsIncompleteConfig(t *t
 	after, _ := store.Events(0)
 	if len(after) != len(before) {
 		t.Fatal("rejected incomplete finalizer mutated the journal")
+	}
+}
+
+func TestStartRejectsEvaluatorConfigurationWithoutAutonomy(t *testing.T) {
+	state, root := t.TempDir(), t.TempDir()
+	if err := os.Chmod(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--goal", "keep shipping", "--runtime", "codex", "--file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "partial-autonomy", "--evaluator-model", "fake/evaluator"}, "ship", &out, &errOut)
+	if err == nil || !strings.Contains(err.Error(), "require autonomous execution") {
+		t.Fatalf("partial autonomy configuration was not rejected: %v", err)
+	}
+	store, openErr := supervisor.Open(state, supervisor.Options{})
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	events, eventsErr := store.Events(0)
+	if eventsErr != nil {
+		t.Fatal(eventsErr)
+	}
+	if len(events) != 0 {
+		t.Fatal("rejected partial autonomy configuration mutated the journal")
 	}
 }
 

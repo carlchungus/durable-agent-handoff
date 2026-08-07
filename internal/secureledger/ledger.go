@@ -14,7 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
+	"github.com/carlchungus/durable-agent-handoff/internal/privatepath"
+	"github.com/carlchungus/durable-agent-handoff/internal/processidentity"
 )
 
 const (
@@ -425,6 +426,10 @@ func (l *Ledger) openRoot() (*os.Root, error) {
 		_ = root.Close()
 		return nil, err
 	}
+	if err = validatePrivateRoot(root); err != nil {
+		_ = root.Close()
+		return nil, fmt.Errorf("unsafe secure ledger root %q: %w", l.rootPath, err)
+	}
 	openedIdentity, openedErr := identifyRoot(root)
 	afterIdentity, afterErr := identifyRootPath(l.rootPath)
 	if openedErr != nil || afterErr != nil || !sameStorageIdentity(beforeIdentity, openedIdentity) || !sameStorageIdentity(beforeIdentity, afterIdentity) {
@@ -510,6 +515,10 @@ func (l *Ledger) openChildRoot(parent *os.Root, name string, create bool) (*os.R
 		_ = child.Close()
 		return nil, err
 	}
+	if err = validatePrivateRoot(child); err != nil {
+		_ = child.Close()
+		return nil, fmt.Errorf("unsafe secure ledger component %q: %w", name, err)
+	}
 	openedIdentity, openedErr := identifyRoot(child)
 	afterIdentity, afterErr := identifyChildRoot(parent, name)
 	if openedErr != nil || afterErr != nil || !sameStorageIdentity(beforeIdentity, openedIdentity) || !sameStorageIdentity(beforeIdentity, afterIdentity) {
@@ -554,6 +563,15 @@ func identifyRoot(root *os.Root) (storageIdentity, error) {
 	return identifyStorageFile(file)
 }
 
+func validatePrivateRoot(root *os.Root) error {
+	file, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return privatepath.ValidateOpenedDirectory(file)
+}
+
 func identifyRegularPath(root *os.Root, name string) (storageIdentity, error) {
 	file, err := root.OpenFile(name, os.O_RDONLY, 0)
 	if err != nil {
@@ -567,58 +585,69 @@ func identifyRegularPath(root *os.Root, name string) (storageIdentity, error) {
 }
 
 func (l *Ledger) openRegular(root *os.Root, name string, flag int, perm os.FileMode) (*os.File, error) {
-	before, err := root.Lstat(name)
-	existed := err == nil
-	var beforeIdentity storageIdentity
-	if err == nil {
-		if !before.Mode().IsRegular() {
-			return nil, fmt.Errorf("secure ledger file %q is not a regular file", name)
+	for attempts := 0; attempts < 8; attempts++ {
+		before, err := root.Lstat(name)
+		existed := err == nil
+		var beforeIdentity storageIdentity
+		if err == nil {
+			if !before.Mode().IsRegular() {
+				return nil, fmt.Errorf("secure ledger file %q is not a regular file", name)
+			}
+			beforeIdentity, err = identifyRegularPath(root, name)
+			if err != nil {
+				return nil, err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) || flag&os.O_CREATE == 0 {
+			return nil, err
 		}
-		beforeIdentity, err = identifyRegularPath(root, name)
+		if l.safetyHooks.afterFilePrecheck != nil {
+			l.safetyHooks.afterFilePrecheck(name)
+		}
+		openFlag := flag
+		exclusiveCreate := !existed && flag&os.O_CREATE != 0 && flag&os.O_EXCL == 0
+		if exclusiveCreate {
+			openFlag |= os.O_EXCL
+		}
+		file, err := root.OpenFile(name, openFlag, perm)
+		if exclusiveCreate && errors.Is(err, os.ErrExist) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
-	} else if !errors.Is(err, os.ErrNotExist) || flag&os.O_CREATE == 0 {
-		return nil, err
-	}
-	if l.safetyHooks.afterFilePrecheck != nil {
-		l.safetyHooks.afterFilePrecheck(name)
-	}
-	file, err := root.OpenFile(name, flag, perm)
-	if err != nil {
-		return nil, err
-	}
-	after, pathErr := root.Lstat(name)
-	safetyErr := validateRegularFile(file)
-	if pathErr != nil || safetyErr != nil || !after.Mode().IsRegular() {
-		_ = file.Close()
-		if pathErr != nil {
-			return nil, pathErr
-		}
-		if safetyErr != nil {
-			return nil, fmt.Errorf("unsafe secure ledger file %q: %w", name, safetyErr)
-		}
-		return nil, fmt.Errorf("secure ledger file %q is not a regular file", name)
-	}
-	openedIdentity, openedErr := identifyStorageFile(file)
-	afterIdentity, afterErr := identifyRegularPath(root, name)
-	if openedErr != nil || afterErr != nil || !sameStorageIdentity(openedIdentity, afterIdentity) || existed && !sameStorageIdentity(beforeIdentity, openedIdentity) {
-		_ = file.Close()
-		if openedErr != nil {
-			return nil, openedErr
-		}
-		if afterErr != nil {
-			return nil, afterErr
-		}
-		return nil, fmt.Errorf("secure ledger file %q changed while opening", name)
-	}
-	if !existed {
-		if err = syncRoot(root); err != nil {
+		after, pathErr := root.Lstat(name)
+		safetyErr := errors.Join(validateRegularFile(file), privatepath.ValidateOpenedFile(file))
+		if pathErr != nil || safetyErr != nil || !after.Mode().IsRegular() {
 			_ = file.Close()
-			return nil, fmt.Errorf("sync secure ledger directory after creating %q: %w", name, err)
+			if pathErr != nil {
+				return nil, pathErr
+			}
+			if safetyErr != nil {
+				return nil, fmt.Errorf("unsafe secure ledger file %q: %w", name, safetyErr)
+			}
+			return nil, fmt.Errorf("secure ledger file %q is not a regular file", name)
 		}
+		openedIdentity, openedErr := identifyStorageFile(file)
+		afterIdentity, afterErr := identifyRegularPath(root, name)
+		if openedErr != nil || afterErr != nil || !sameStorageIdentity(openedIdentity, afterIdentity) || existed && !sameStorageIdentity(beforeIdentity, openedIdentity) {
+			_ = file.Close()
+			if openedErr != nil {
+				return nil, openedErr
+			}
+			if afterErr != nil {
+				return nil, afterErr
+			}
+			return nil, fmt.Errorf("secure ledger file %q changed while opening", name)
+		}
+		if !existed {
+			if err = syncRoot(root); err != nil {
+				_ = file.Close()
+				return nil, fmt.Errorf("sync secure ledger directory after creating %q: %w", name, err)
+			}
+		}
+		return file, nil
 	}
-	return file, nil
+	return nil, fmt.Errorf("secure ledger file %q was created concurrently too many times", name)
 }
 
 func (l *Ledger) acquire(id string) (*Txn, error) {
@@ -648,7 +677,7 @@ func (l *Ledger) acquire(id string) (*Txn, error) {
 			return nil, fmt.Errorf("lock secure ledger record %s: %w", id, lockErr)
 		}
 		if locked {
-			owner := lockOwner{PID: os.Getpid(), StartToken: runstate.ProcessStartToken(os.Getpid()), LeaseID: fmt.Sprintf("%d-%d", os.Getpid(), l.now().UnixNano()), State: lockActive, UpdatedAt: l.now().UTC()}
+			owner := lockOwner{PID: os.Getpid(), StartToken: processidentity.ProcessStartToken(os.Getpid()), LeaseID: fmt.Sprintf("%d-%d", os.Getpid(), l.now().UnixNano()), State: lockActive, UpdatedAt: l.now().UTC()}
 			tx := &Txn{ledger: l, id: id, root: root, file: file, lock: lock, owner: owner}
 			if l.safetyHooks.afterLock != nil {
 				l.safetyHooks.afterLock()

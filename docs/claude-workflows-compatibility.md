@@ -6,6 +6,25 @@ The source snapshot is **2026-08-05**. Claude Code research-preview behavior is 
 
 The current repository is a useful durable kernel, not yet a whole-system clone. Compatibility is complete only when every surface below passes its positive, denial, restart, and human/machine-view cases against a pinned Claude oracle. The 102-case contract lives in [`docs/conformance/`](conformance/README.md).
 
+## Supervisor v2 shipping contract
+
+The released `handoff` binary is a breaking Supervisor v2 control plane. Its
+normal start, run, serve, status, list, reply, TUI, and activity paths read and
+write one Supervisor journal. The supported command surface is documented in
+[`README.md`](../README.md) and the protocol in [`protocol.md`](protocol.md):
+ordinary prompts use `--file -` (stdin-only), promotion uses strict
+`execution start --file - --json`, pause uses exact fenced Attempts, role/model
+ladders use journaled preference commands, and guarded publication uses
+`github merge`. `handoff.service` is the stable installed service name.
+
+The old `doctor`, Claude discovery/import, team store, preference-file reset,
+activity follow/stop, and transcript/output attachment commands are deferred
+v1/product surfaces, not valid v2 compatibility adapters. They must not be
+advertised as available until they have Supervisor-journal projections and
+tests. `execution import-v1` is the sole deterministic one-way v1 importer; it
+normalizes workflow-history ledgers only and does not recover exact legacy
+Session or Activity identities.
+
 ## What “high fidelity” means
 
 We reproduce observable contracts, including inconvenient limitations. We do not copy proprietary source, depend on undocumented private files, or call a stronger `handoff` behavior “Claude-compatible” when it differs.
@@ -25,7 +44,7 @@ The initial named divergences are durable fenced team claims and restore (`TEAM-
 | --- | --- | --- | ---: | --- |
 | Sessions | continuously saved transcript; exact-ID resume; continue; rename; picker scoping; fork with a new identity; clear, compact, export, and retention | explicit lineage, transcript locator, retention and normalized runtime identity | 5 | partial: SES-001 passes; SES-002–005 are gaps |
 | Agent View | dispatch independent background sessions; needs-input/working/completed grouping; pin/filter; peek/reply; attach/detach/stop/delete; restart exited work on reply | durable inbox and separate logical/process state exposed in JSON and TUI | 5 | partial: VIEW-001 and VIEW-002 pass; VIEW-003–005 are gaps |
-| Supervisor | session execution survives terminal exit, update, sleep and supported reconnect; stale processes are not shown as live | leases, heartbeat, PID start-token validation, fencing, live adoption and exact resume | 4 | partial: SUP-001 passes; SUP-002–004 are gaps |
+| Supervisor | session execution survives terminal exit, update, sleep and supported reconnect; stale processes are not shown as live | leases, heartbeat, PID start-token validation, fencing, fail-closed orphan recovery, and exact resume; safe live adoption remains deferred | 4 | partial: SUP-001 passes; SUP-002–004 are gaps |
 | Subagents | fresh or forked context; named definitions; model/effort/tools/skills/MCP/hooks/memory/permissions/worktree/background; exact resume; depth, count and concurrency limits | immutable runtime identity, transcript isolation and capability narrowing | 7 | partial substrate only: SUB-001–007 remain gaps |
 | Teams | fixed lead plus peers; shared tasks/dependencies/claims; direct and broadcast mailbox; plan approval; idle/failure/shutdown; no nesting | typed durable mailbox, generation-fenced claims, crash restore by exact identity | 8 | partial |
 | Dynamic workflows | real JavaScript with top-level `await`, `agent()` and `pipeline()`; dynamic branches/loops; 16 concurrent and 1,000 total agents; pause/stop/restart; ordered replay; saved scopes and args | sandboxed runtime adapters over one journaled invocation model | 5 | partial |
@@ -76,9 +95,9 @@ Before useful work starts, every attempt durably records workflow/node/parent/te
 
 At supervisor start:
 
-1. A matching live process and current fencing token is adopted; it is not spawned twice.
-2. A dead process with an exact resumable runtime session ID is replaced by a process resuming only that ID.
-3. A dead process without a resume ID is retried only when the operation is declared restart-safe.
+1. An exact live PID/start-token orphan is detected before scheduling; the current v2 service fails closed because safe runtime adoption is not yet implemented.
+2. A dead or prepared inherited Attempt is terminalized through one authority-owned journal command, its exact Lease is released, and the immutable Activity becomes retryable.
+3. A dead process with an exact resumable runtime session ID may then be retried by the normal scheduler, resuming only that ID; a dead process without a resume ID is retried only when the operation is restart-safe.
 4. Ambiguous identity, stale fencing, dirty worktree ownership or non-idempotent work transitions to `needs_input` with evidence.
 5. Sleep advances wall time but never fabricates worker idleness or lease expiry. Remote and runtime updates are replayed from durable cursors.
 
@@ -88,7 +107,7 @@ Claude-current cases retain Claude’s documented restore limitations. The durab
 
 This is not a checklist engine with hard-coded discovery, plan, execute and verify gates. The high-fidelity workflow surface runs sandboxed JavaScript with top-level `await`; the script may branch, loop, fan out, launch different agent roles, inspect results, revise its approach, or call several workflows sequentially. Only the orchestration API is available to the script; filesystem and shell work goes through policy-bounded agents.
 
-Planning is itself agent work. A planner can emit or revise a workflow script from current evidence. Independent verifier agents can decide semantic conditions that commands cannot establish. A workflow may self-mutate its future control flow, but it cannot rewrite completed ledger history, elevate permissions, change its oracle profile, erase costs, or weaken merge/recovery gates.
+Planning is itself agent work. A planner can emit or revise a workflow script from current evidence. Independent review/check agents can decide semantic conditions that commands cannot establish. A workflow may self-mutate its future control flow, but it cannot rewrite completed ledger history, elevate permissions, change its oracle profile, erase costs, or weaken merge/recovery gates.
 
 On pause or crash, completed `agent()` results replay only through the ordered prefix before the first unfinished invocation. That invocation and all later invocations run again. Stopped or unrecoverable agents retain pipeline shape with a `null` result, matching the documented workflow contract.
 
@@ -126,7 +145,7 @@ Implementation proceeds as a dynamic evidence loop, not mandatory product phases
 2. Capture the pinned Claude oracle, including failures, UI frames, process tree and files allowed by the fixture.
 3. Have the implementing agent change the smallest shared primitive or surface adapter that explains the diff.
 4. Run the candidate cases plus affected restart, denial and view cases.
-5. Use deterministic assertions where semantics are mechanical and independent verifier agents where correctness is semantic.
+5. Use deterministic assertions where semantics are mechanical and independent review/check agents where correctness is semantic.
 6. Keep, revise or replace the approach based on evidence; record any plan mutation as an event.
 7. Never relax an expectation as an implementation shortcut. Oracle changes require source review and an explicit compatibility decision.
 

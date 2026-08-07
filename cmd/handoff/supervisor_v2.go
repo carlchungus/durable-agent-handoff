@@ -44,7 +44,7 @@ func cmdExecutionStart(args []string, out io.Writer) error {
 	if file != "-" {
 		return errors.New("execution start requires --file - --json; prompt input is stdin-only")
 	}
-	return cmdV2StartMode(args, out, true)
+	return cmdV2StartMode(args, out, true, true)
 }
 
 func cmdExecutionImport(args []string, out io.Writer) error {

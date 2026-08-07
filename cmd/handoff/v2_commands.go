@@ -50,7 +50,7 @@ type executionStartRequest struct {
 	FinalizerEnabled        bool               `json:"finalizer_enabled,omitempty"`
 	FinalizerRequiredChecks []string           `json:"finalizer_required_checks,omitempty"`
 	FinalizerRequireHuman   bool               `json:"finalizer_require_human,omitempty"`
-	Autonomous              bool               `json:"autonomous,omitempty"`
+	OneShot                 bool               `json:"one_shot,omitempty"`
 	EvaluatorModel          string             `json:"evaluator_model,omitempty"`
 	MaxTurns                int                `json:"max_turns,omitempty"`
 }
@@ -97,10 +97,17 @@ func cmdV2Init(args []string, out io.Writer) error {
 }
 
 func cmdV2Start(args []string, out io.Writer) error {
-	return cmdV2StartMode(args, out, false)
+	return cmdV2StartMode(args, out, false, false)
 }
 
-func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
+func cmdV2Goal(args []string, out io.Writer) error {
+	if len(args) == 0 || args[0] != "start" {
+		return errors.New("usage: handoff goal start --goal GOAL --runtime RUNTIME --file -")
+	}
+	return cmdV2StartMode(args[1:], out, false, true)
+}
+
+func cmdV2StartMode(args []string, out io.Writer, promotion, goalMode bool) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	state := common(fs)
 	file := fs.String("file", "", "read strict request or prompt from stdin; must be -")
@@ -118,11 +125,10 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 	var requiredChecks runtimeCandidateFlags
 	fs.Var(&requiredChecks, "required-check", "required external GitHub check; repeat for each check")
 	requireHuman := fs.Bool("require-human", false, "require human approval before finalization")
-	autonomous := fs.Bool("autonomous", false, "evaluate terminal claims and continue the exact Session until the goal is met")
-	evaluatorModel := fs.String("evaluator-model", "", "tool-less OpenRouter evaluator model")
-	maxTurns := fs.Int("max-turns", 0, "maximum evaluator-controlled Session turns")
+	evaluatorModel := fs.String("evaluator-model", "", "small OpenRouter model that decides each turn")
+	maxTurns := fs.Int("max-turns", 0, "maximum turns before asking a human")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--finalizer-enabled": false, "--required-check": true, "--require-human": false, "--autonomous": false, "--evaluator-model": true, "--max-turns": true, "--json": false}
+	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--finalizer-enabled": false, "--required-check": true, "--require-human": false, "--evaluator-model": true, "--max-turns": true, "--json": false}
 	if err := rejectUnknownFlags(args, known); err != nil {
 		return err
 	}
@@ -151,15 +157,16 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 		if strings.TrimSpace(request.ResumeID) == "" || strings.TrimSpace(request.Role) == "" || strings.TrimSpace(request.Goal) == "" {
 			return errors.New("promotion request requires goal, resume_id, and role")
 		}
+		model, turns := goalFields(!request.OneShot, request.EvaluatorModel, request.MaxTurns)
 		input = supervisor.StartExecutionInput{
 			NativeSession: supervisor.NativeSessionIdentity{Runtime: request.Runtime, ID: request.ResumeID},
 			Prompt:        request.Prompt, Goal: request.Goal, Role: request.Role,
-			Runtime:   supervisor.RuntimeSpec{Name: request.Runtime, Model: request.Model, Effort: request.Effort, Sandbox: request.Sandbox},
-			Root:      request.RemoteRoot,
-			Authority: supervisor.AuthoritySpec{RequestedBy: request.Role, HumanAuthorized: true, Sandbox: request.Sandbox},
-			Finalizer: supervisor.FinalizerSpec{Enabled: request.FinalizerEnabled, RequiredChecks: append([]string(nil), request.FinalizerRequiredChecks...), RequireHuman: request.FinalizerRequireHuman},
-			Autonomy:  autonomySpec(request.Autonomous, request.EvaluatorModel, request.MaxTurns),
-			Budget:    supervisor.DefaultBudget(), IdempotencyKey: request.IdempotencyKey,
+			Runtime:        supervisor.RuntimeSpec{Name: request.Runtime, Model: request.Model, Effort: request.Effort, Sandbox: request.Sandbox},
+			Root:           request.RemoteRoot,
+			Authority:      supervisor.AuthoritySpec{RequestedBy: request.Role, HumanAuthorized: true, Sandbox: request.Sandbox},
+			Finalizer:      supervisor.FinalizerSpec{Enabled: request.FinalizerEnabled, RequiredChecks: append([]string(nil), request.FinalizerRequiredChecks...), RequireHuman: request.FinalizerRequireHuman},
+			EvaluatorModel: model, MaxTurns: turns,
+			Budget: supervisor.DefaultBudget(), IdempotencyKey: request.IdempotencyKey,
 		}
 	} else {
 		if *file != "-" || fs.NArg() != 0 {
@@ -215,16 +222,17 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 				fallbacks = append([]supervisor.RuntimeSpec(nil), ladder[primaryIndex+1:]...)
 			}
 		}
+		decisionModel, turns := goalFields(goalMode, *evaluatorModel, *maxTurns)
 		input = supervisor.StartExecutionInput{
 			NativeSession: supervisor.NativeSessionIdentity{Runtime: *runtimeName, ID: *nativeSession},
 			Goal:          *goal, Prompt: prompt, Role: *role,
-			Fallbacks: fallbacks,
-			Runtime:   supervisor.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort, Sandbox: supervisor.Sandbox(*sandbox)},
-			Root:      *root,
-			Authority: supervisor.AuthoritySpec{RequestedBy: *authorizedBy, HumanAuthorized: *authorizedBy != "", Sandbox: supervisor.Sandbox(*sandbox)},
-			Finalizer: supervisor.FinalizerSpec{Enabled: *finalizerEnabled, RequiredChecks: append([]string(nil), requiredChecks...), RequireHuman: *requireHuman},
-			Autonomy:  autonomySpec(*autonomous, *evaluatorModel, *maxTurns),
-			Budget:    supervisor.DefaultBudget(), IdempotencyKey: *key,
+			Fallbacks:      fallbacks,
+			Runtime:        supervisor.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort, Sandbox: supervisor.Sandbox(*sandbox)},
+			Root:           *root,
+			Authority:      supervisor.AuthoritySpec{RequestedBy: *authorizedBy, HumanAuthorized: *authorizedBy != "", Sandbox: supervisor.Sandbox(*sandbox)},
+			Finalizer:      supervisor.FinalizerSpec{Enabled: *finalizerEnabled, RequiredChecks: append([]string(nil), requiredChecks...), RequireHuman: *requireHuman},
+			EvaluatorModel: decisionModel, MaxTurns: turns,
+			Budget: supervisor.DefaultBudget(), IdempotencyKey: *key,
 		}
 	}
 	store, err := supervisor.Open(stateDir(*state), supervisor.Options{})
@@ -245,11 +253,9 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 	return nil
 }
 
-func autonomySpec(enabled bool, model string, maxTurns int) supervisor.AutonomySpec {
+func goalFields(enabled bool, model string, maxTurns int) (string, int) {
 	if !enabled {
-		// Preserve invalid partial configuration so the domain validator rejects
-		// it instead of silently ignoring a misspelled autonomous invocation.
-		return supervisor.AutonomySpec{EvaluatorModel: model, MaxTurns: maxTurns}
+		return model, maxTurns
 	}
 	if strings.TrimSpace(model) == "" {
 		model = evaluator.DefaultModel
@@ -257,7 +263,7 @@ func autonomySpec(enabled bool, model string, maxTurns int) supervisor.AutonomyS
 	if maxTurns == 0 {
 		maxTurns = 100
 	}
-	return supervisor.AutonomySpec{Enabled: true, EvaluatorModel: model, MaxTurns: maxTurns}
+	return model, maxTurns
 }
 
 func openV2(state string) (*supervisor.Store, error) {
@@ -338,7 +344,7 @@ func cmdV2List(args []string, out io.Writer) error {
 				needsHuman++
 			}
 		}
-		fmt.Fprintf(out, "%s workflow=%s publication=%s queue=%d evaluations=%d needs_human=%d\n", view.ID, view.WorkflowID, view.Publication, len(view.Queue), len(view.EvaluationQueue), needsHuman)
+		fmt.Fprintf(out, "%s workflow=%s publication=%s queue=%d pending_turns=%d needs_human=%d\n", view.ID, view.WorkflowID, view.Publication, len(view.Queue), len(view.PendingTurns), needsHuman)
 	}
 	return nil
 }

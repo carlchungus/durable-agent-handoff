@@ -21,10 +21,10 @@ func RenderText(view *ExecutionView) string {
 		}
 		output.WriteByte('\n')
 	}
-	if len(view.EvaluationQueue) > 0 {
-		output.WriteString("EvaluationQueue")
-		for index, claimID := range view.EvaluationQueue {
-			fmt.Fprintf(&output, " %d:%s", index+1, claimID)
+	if len(view.PendingTurns) > 0 {
+		output.WriteString("PendingTurns")
+		for index, activityID := range view.PendingTurns {
+			fmt.Fprintf(&output, " %d:%s", index+1, activityID)
 		}
 		output.WriteByte('\n')
 	}

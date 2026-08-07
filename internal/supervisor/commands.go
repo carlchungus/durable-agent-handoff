@@ -25,7 +25,8 @@ type StartExecutionInput struct {
 	Authority      AuthoritySpec         `json:"authority"`
 	Finalizer      FinalizerSpec         `json:"finalizer"`
 	Budget         Budget                `json:"budget"`
-	Autonomy       AutonomySpec          `json:"autonomy,omitempty"`
+	EvaluatorModel string                `json:"evaluator_model,omitempty"`
+	MaxTurns       int                   `json:"max_turns,omitempty"`
 	IdempotencyKey string                `json:"-"`
 }
 
@@ -92,7 +93,7 @@ func (c startExecutionCommand) decide(state *State, now time.Time) ([]DomainEven
 	activityID := ActivityID(stableID("activity", in.IdempotencyKey+"/1"))
 	digest, _ := c.digest()
 	workflow := &Workflow{
-		ID: workflowID, Root: in.Root, Role: in.Role, Authority: in.Authority, Finalizer: in.Finalizer, Budget: in.Budget, Autonomy: in.Autonomy,
+		ID: workflowID, Root: in.Root, Role: in.Role, Authority: in.Authority, Finalizer: in.Finalizer, Budget: in.Budget, EvaluatorModel: in.EvaluatorModel, MaxTurns: in.MaxTurns,
 		Nodes: map[NodeID]*Node{}, CreatedAt: now,
 	}
 	title := in.Goal
@@ -143,12 +144,10 @@ func validateStartInput(in StartExecutionInput) error {
 	if in.Budget.MaxTaskAttempts < 1 || in.Budget.MaxLaunches < in.Budget.MaxTaskAttempts {
 		return errors.New("budget requires positive task attempts and at least as many OS launches")
 	}
-	if in.Autonomy.Enabled {
-		if strings.TrimSpace(in.Goal) == "" || strings.TrimSpace(in.Autonomy.EvaluatorModel) == "" || in.Autonomy.MaxTurns < 1 {
-			return errors.New("autonomous execution requires a goal, evaluator model, and at least one turn")
+	if in.EvaluatorModel != "" || in.MaxTurns != 0 {
+		if strings.TrimSpace(in.Goal) == "" || strings.TrimSpace(in.EvaluatorModel) == "" || in.MaxTurns < 1 {
+			return errors.New("a goal requires its text, evaluator model, and at least one turn")
 		}
-	} else if in.Autonomy.EvaluatorModel != "" || in.Autonomy.MaxTurns != 0 {
-		return errors.New("evaluator model and turn budget require autonomous execution")
 	}
 	if in.Finalizer.Enabled && len(in.Finalizer.RequiredChecks) == 0 {
 		return errors.New("enabled finalizer requires a non-empty canonical set of external GitHub checks")
@@ -565,6 +564,9 @@ func (c prepareAttemptCommand) decide(state *State, now time.Time) ([]DomainEven
 	if resultForActivity(state, activity.ID) != nil {
 		return nil, "", errors.New("completed Activity is immutable")
 	}
+	if workerResultForActivity(state, activity.ID) != nil {
+		return nil, "", errors.New("worker turn is waiting for a decision")
+	}
 	if fallbackChildForActivity(state, activity.ID) != nil {
 		return nil, "", ErrFenced
 	}
@@ -670,10 +672,7 @@ func (c recordMilestoneCommand) decide(state *State, now time.Time) ([]DomainEve
 	terminal := m.Kind == MilestoneExit || m.Kind == MilestoneAdapterStartFailed || m.Kind == MilestoneProviderUnavailable
 	if m.Kind == MilestoneResult {
 		workflow := state.Workflows[activity.WorkflowID]
-		if workflow != nil && workflow.Autonomy.Enabled {
-			claim := &Claim{ID: ClaimID(stableID("claim", string(activity.ID))), WorkflowID: activity.WorkflowID, NodeID: activity.NodeID, ActivityID: activity.ID, AttemptID: attempt.ID, Generation: activity.Generation, Result: *m.Result, CreatedAt: now}
-			events = append(events, mustEvent(eventClaimCreated, claimCreatedEvent{Claim: claim}))
-		} else {
+		if workflow == nil || !runsAsGoal(workflow) {
 			result := &Result{ID: ResultID(stableID("result", string(activity.ID))), WorkflowID: activity.WorkflowID, NodeID: activity.NodeID, ActivityID: activity.ID, AttemptID: attempt.ID, Generation: activity.Generation, Status: m.Result.Status, Summary: m.Result.Summary, BlockerKind: m.Result.BlockerKind, Question: m.Result.Question, CreatedAt: now}
 			events = append(events, mustEvent(eventResultCreated, resultCreatedEvent{Result: result}))
 		}
@@ -690,23 +689,24 @@ func (c recordMilestoneCommand) decide(state *State, now time.Time) ([]DomainEve
 	return events, string(attempt.ID), nil
 }
 
-type ResolveClaimInput struct {
-	ClaimID        ClaimID            `json:"claim_id"`
-	Decision       EvaluationDecision `json:"decision"`
-	IdempotencyKey string             `json:"-"`
+type DecideTurnInput struct {
+	ActivityID         ActivityID   `json:"activity_id"`
+	ExpectedGeneration uint64       `json:"expected_generation"`
+	AttemptID          AttemptID    `json:"attempt_id"`
+	Decision           TurnDecision `json:"decision"`
+	IdempotencyKey     string       `json:"-"`
 }
 
-type resolveClaimCommand struct{ Input ResolveClaimInput }
+type decideTurnCommand struct{ Input DecideTurnInput }
 
-func (c resolveClaimCommand) commandType() string     { return "ResolveClaim" }
-func (c resolveClaimCommand) idempotencyKey() string  { return c.Input.IdempotencyKey }
-func (c resolveClaimCommand) digest() (string, error) { return digestValue(c.Input, "IdempotencyKey") }
+func (c decideTurnCommand) commandType() string     { return "DecideTurn" }
+func (c decideTurnCommand) idempotencyKey() string  { return c.Input.IdempotencyKey }
+func (c decideTurnCommand) digest() (string, error) { return digestValue(c.Input, "IdempotencyKey") }
 
-// ResolveClaim durably applies one fresh evaluator decision. A continuation
-// decision creates the immutable predecessor Result, evaluator Message, and
-// next exact-session Activity in the same journal transaction.
-func (s *Store) ResolveClaim(ctx context.Context, input ResolveClaimInput) (*Activity, Receipt, error) {
-	receipt, err := s.Execute(ctx, resolveClaimCommand{Input: input})
+// DecideTurn records one decision. Continuing also creates the next exact-
+// session Activity and its message in the same journal transaction.
+func (s *Store) DecideTurn(ctx context.Context, input DecideTurnInput) (*Activity, Receipt, error) {
+	receipt, err := s.Execute(ctx, decideTurnCommand{Input: input})
 	if err != nil {
 		return nil, receipt, err
 	}
@@ -720,40 +720,42 @@ func (s *Store) ResolveClaim(ctx context.Context, input ResolveClaimInput) (*Act
 	return cloneActivity(state.Activities[ActivityID(receipt.ResourceID)]), receipt, nil
 }
 
-func (c resolveClaimCommand) decide(state *State, now time.Time) ([]DomainEvent, string, error) {
-	claim := state.Claims[c.Input.ClaimID]
-	if claim == nil || evaluationForClaim(state, c.Input.ClaimID) != nil {
-		return nil, "", errors.New("claim is unknown or already evaluated")
+func (c decideTurnCommand) decide(state *State, now time.Time) ([]DomainEvent, string, error) {
+	activity := state.Activities[c.Input.ActivityID]
+	attempt := state.Attempts[c.Input.AttemptID]
+	if activity == nil || attempt == nil || activity.Generation != c.Input.ExpectedGeneration || attempt.ActivityID != activity.ID || attempt.ActivityGeneration != activity.Generation || resultForActivity(state, activity.ID) != nil || !attemptHasExit(attempt) {
+		return nil, "", ErrFenced
 	}
-	activity := state.Activities[claim.ActivityID]
-	workflow := state.Workflows[claim.WorkflowID]
+	workerResult := workerResultForAttempt(attempt)
+	if workerResult == nil {
+		return nil, "", errors.New("turn has no worker result")
+	}
+	workflow := state.Workflows[activity.WorkflowID]
 	session := (*Session)(nil)
 	if activity != nil {
 		session = state.Sessions[activity.SessionID]
 	}
 	decision := c.Input.Decision
-	if workflow == nil || !workflow.Autonomy.Enabled || activity == nil || session == nil || strings.TrimSpace(decision.Model) == "" || decision.Model != workflow.Autonomy.EvaluatorModel || strings.TrimSpace(decision.Reason) == "" {
-		return nil, "", errors.New("evaluation does not match the autonomous workflow contract")
+	if workflow == nil || !runsAsGoal(workflow) || session == nil || strings.TrimSpace(decision.Model) == "" || decision.Model != workflow.EvaluatorModel || strings.TrimSpace(decision.Reason) == "" {
+		return nil, "", errors.New("decision does not match this goal")
 	}
 	if decision.Outcome != "accept" && decision.Outcome != "continue" && decision.Outcome != "escalate" {
-		return nil, "", fmt.Errorf("unsupported evaluation outcome %q", decision.Outcome)
+		return nil, "", fmt.Errorf("unsupported turn decision %q", decision.Outcome)
 	}
 	if decision.Outcome == "escalate" && (strings.TrimSpace(decision.BlockerKind) == "" || strings.TrimSpace(decision.Question) == "") {
 		return nil, "", errors.New("human escalation requires a typed blocker and concrete question")
 	}
-	turns := claimsForNode(state, claim.WorkflowID, claim.NodeID)
-	if decision.Outcome == "continue" && turns >= workflow.Autonomy.MaxTurns {
+	turns := turnsForNode(state, activity.WorkflowID, activity.NodeID)
+	if decision.Outcome == "continue" && turns >= workflow.MaxTurns {
 		decision.Outcome = "escalate"
-		decision.Reason = fmt.Sprintf("Autonomous turn budget exhausted after %d turns. Last evaluator reason: %s", turns, decision.Reason)
+		decision.Reason = fmt.Sprintf("Turn limit reached after %d turns. Last decision: %s", turns, decision.Reason)
 		decision.BlockerKind = "budget"
-		decision.Question = "Should this workflow receive a larger autonomous turn budget?"
+		decision.Question = "Should this goal receive a larger turn limit?"
 	}
-	evaluation := &Evaluation{ID: EvaluationID(stableID("evaluation", string(claim.ID))), ClaimID: claim.ID, Decision: decision, CreatedAt: now}
-	status, blockerKind, question := claim.Result.Status, claim.Result.BlockerKind, claim.Result.Question
+	status, blockerKind, question := workerResult.Status, workerResult.BlockerKind, workerResult.Question
 	if decision.Outcome == "accept" {
-		// The evaluator, not the worker, owns terminal-state truth. This matters
-		// when a worker completed its Activity but mislabeled Supervisor-owned
-		// publication or verification as a human blocker.
+		// The separate decision can accept completed work even when the worker
+		// incorrectly described an available follow-up step as a human blocker.
 		status, blockerKind, question = "completed", "", ""
 	}
 	if decision.Outcome == "continue" {
@@ -762,16 +764,13 @@ func (c resolveClaimCommand) decide(state *State, now time.Time) ([]DomainEvent,
 	if decision.Outcome == "escalate" {
 		status, blockerKind, question = "needs_human", decision.BlockerKind, decision.Question
 	}
-	result := &Result{ID: ResultID(stableID("result", string(activity.ID))), WorkflowID: claim.WorkflowID, NodeID: claim.NodeID, ActivityID: activity.ID, AttemptID: claim.AttemptID, Generation: claim.Generation, Status: status, Summary: decision.Reason, BlockerKind: blockerKind, Question: question, CreatedAt: now}
-	events := []DomainEvent{
-		mustEvent(eventEvaluationRecorded, evaluationRecordedEvent{Evaluation: evaluation}),
-		mustEvent(eventResultCreated, resultCreatedEvent{Result: result}),
-	}
+	result := &Result{ID: ResultID(stableID("result", string(activity.ID))), WorkflowID: activity.WorkflowID, NodeID: activity.NodeID, ActivityID: activity.ID, AttemptID: attempt.ID, Generation: activity.Generation, Status: status, Summary: decision.Reason, BlockerKind: blockerKind, Question: question, Decision: decision.Outcome, DecidedBy: decision.Model, CreatedAt: now}
+	events := []DomainEvent{mustEvent(eventResultCreated, resultCreatedEvent{Result: result})}
 	if decision.Outcome != "continue" {
 		return events, "", nil
 	}
 	if session.ImportedUnresolved || strings.TrimSpace(session.Native.ID) == "" {
-		return nil, "", errors.New("autonomous continuation requires an exact bound native Session")
+		return nil, "", errors.New("continuing a goal requires an exact bound native Session")
 	}
 	generation := nextActivityGeneration(state, activity.NodeID, activity.Generation+1)
 	continuationID := ActivityID(stableID("activity", c.Input.IdempotencyKey+"/continuation"))
@@ -838,11 +837,11 @@ func validateMilestone(state *State, attempt *Attempt, activity *Activity, m Mil
 			return fmt.Errorf("unsupported result status %q", m.Result.Status)
 		}
 		workflow := state.Workflows[activity.WorkflowID]
-		if m.Result.Status == "continue" && (workflow == nil || !workflow.Autonomy.Enabled) {
-			return errors.New("continue result requires an autonomous evaluator-controlled workflow")
+		if m.Result.Status == "continue" && !runsAsGoal(workflow) {
+			return errors.New("continue result requires a goal")
 		}
-		if m.Result.Status == "needs_human" && (m.Result.BlockerKind == "" || m.Result.Question == "") && (workflow == nil || !workflow.Autonomy.Enabled) {
-			return errors.New("non-autonomous human stop requires a typed workflow-wide blocker and concrete question")
+		if m.Result.Status == "needs_human" && (m.Result.BlockerKind == "" || m.Result.Question == "") && !runsAsGoal(workflow) {
+			return errors.New("one-shot human stop requires a blocker and concrete question")
 		}
 		if (m.Result.BlockerKind == "") != (m.Result.Question == "") {
 			return errors.New("result blocker kind and question must be supplied together")
@@ -1119,30 +1118,39 @@ func resultForActivity(state *State, activityID ActivityID) *Result {
 	}
 	return nil
 }
-func claimForActivity(state *State, activityID ActivityID) *Claim {
-	for _, claim := range state.Claims {
-		if claim.ActivityID == activityID {
-			return claim
-		}
-	}
-	return nil
-}
-func evaluationForClaim(state *State, claimID ClaimID) *Evaluation {
-	for _, evaluation := range state.Evaluations {
-		if evaluation.ClaimID == claimID {
-			return evaluation
-		}
-	}
-	return nil
-}
-func claimsForNode(state *State, workflowID WorkflowID, nodeID NodeID) int {
+func turnsForNode(state *State, workflowID WorkflowID, nodeID NodeID) int {
 	count := 0
-	for _, claim := range state.Claims {
-		if claim.WorkflowID == workflowID && claim.NodeID == nodeID {
+	for _, activity := range state.Activities {
+		if activity.WorkflowID == workflowID && activity.NodeID == nodeID && workerResultForActivity(state, activity.ID) != nil {
 			count++
 		}
 	}
 	return count
+}
+
+func runsAsGoal(workflow *Workflow) bool {
+	return workflow != nil && strings.TrimSpace(workflow.EvaluatorModel) != "" && workflow.MaxTurns > 0
+}
+
+func workerResultForActivity(state *State, activityID ActivityID) *WorkerResult {
+	for _, attempt := range orderedAttemptsForActivity(state, activityID) {
+		if result := workerResultForAttempt(attempt); result != nil {
+			return result
+		}
+	}
+	return nil
+}
+
+func workerResultForAttempt(attempt *Attempt) *WorkerResult {
+	if attempt == nil {
+		return nil
+	}
+	for _, milestone := range attempt.Milestones {
+		if milestone.Kind == MilestoneResult {
+			return milestone.Result
+		}
+	}
+	return nil
 }
 func nextActivityGeneration(state *State, nodeID NodeID, minimum uint64) uint64 {
 	generation := minimum

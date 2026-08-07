@@ -1,9 +1,8 @@
-# handoff Supervisor v2
+# handoff
 
-`handoff` is a durable control plane for long-running agent execution. The
-Supervisor owns one append-only journal and one reducer projection. Sessions,
-Activities, Attempts, Results, Messages, Controls, and writer Leases remain
-separate identities, but no legacy store may mutate alongside the journal.
+`handoff` keeps long-running agent work alive, observable, and resumable. It
+stores every change in one append-only journal so a crash cannot leave several
+state files disagreeing with each other.
 
 The state root must be supervisor-private and outside every worker-writable
 root. Set `HANDOFF_HOME` or pass `--state` to select it.
@@ -17,11 +16,11 @@ selector:
 ```sh
 printf '%s' 'work' | handoff start --runtime codex --file - \
   --root /repo --authorized-by human:id --idempotency-key request-01 --json
-# An autonomous merge-capable execution must configure its gates at start.
-printf '%s' 'ship it' | handoff start --runtime codex --file - \
+# A goal keeps running until it is done or genuinely needs a human.
+printf '%s' 'ship it' | handoff goal start --runtime codex --file - \
   --root /repo --goal 'ship the verified change' \
   --authorized-by human:id --idempotency-key request-02 \
-  --autonomous --max-turns 100 \
+  --max-turns 100 \
   --finalizer-enabled --required-check verify --require-human --json
 handoff status EXECUTION_ID --json
 handoff list --json
@@ -46,7 +45,6 @@ handoff execution start --file - --json <<'JSON'
   "finalizer_enabled": true,
   "finalizer_required_checks": ["verify"],
   "finalizer_require_human": true,
-  "autonomous": true,
   "evaluator_model": "deepseek/deepseek-v4-flash-0731",
   "max_turns": 100
 }
@@ -61,19 +59,18 @@ checks are the verification authority; handoff does not pretend that same-UID
 workers can authenticate their own Results. Reusing a key with different
 canonical input fails closed.
 
-Autonomous executions persist worker terminal output as an untrusted Claim,
-not a Result. A fresh tool-less OpenRouter evaluator receives only the desired
-goal, Activity prompt, bounded typed milestones, worker Claim, and explicit
-Supervisor-owned downstream capabilities. `accept` creates the immutable
-completed Result even when the worker mislabeled Supervisor-owned publication
-as a human blocker. `continue` atomically creates the next Activity generation
-on the exact Session, and `escalate` requires a typed workflow-wide blocker plus
-one concrete question. DeepSeek's forced evaluation tool is the default extraction mode;
-strict `response_format` remains available for compatibility probes because it
-was unreliable against the checked-in real-transcript corpus.
-Evaluator context describes only capabilities the Supervisor actually owns: a
-configured finalizer can merge an explicitly supplied PR, but cannot push,
-create or discover PRs, or start itself.
+A goal has a simple loop: run one worker turn, ask a small tool-less model to
+choose `accept`, `continue`, or `escalate`, then act on that choice. The worker
+turn stays on the exact process attempt that produced it; the decision is
+stored on the normal result. `continue` creates the next turn on the same
+native session in the same journal write. `escalate` must include one concrete
+blocker and question. A model failure leaves the turn pending and retries it.
+
+DeepSeek's forced decision tool is the default because strict
+`response_format` was unreliable against the checked-in real transcripts. The
+model is told exactly what the configured follow-up step can do: the current
+GitHub finalizer can merge an explicitly supplied PR, but cannot push a branch,
+create or discover a PR, or start itself.
 
 Pause is synchronous and idempotent. It records exact stop controls, waits for
 the executor to apply them and record terminal exits, releases writer Leases

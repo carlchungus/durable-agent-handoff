@@ -4,7 +4,7 @@
     "source": "ubuntu-32gb-ash-1 supervisor-v2 result on 2026-08-07",
     "goal": "Continue the type-hardening campaign until 100 safe pull requests have shipped; skip unsuitable candidates and keep the campaign moving.",
     "prompt": "Find, implement, verify, publish, and safely merge the next low-risk type-contract cleanup.",
-    "claim": {
+    "turn": {
       "status": "needs_human",
       "summary": "I’m inspecting the campaign state, repository guidance, available type-safety workflow, and GitHub overlap before selecting the next safe candidate."
     },
@@ -15,7 +15,7 @@
     "source": "ubuntu-32gb-ash-2 supervisor-v2 result on 2026-08-07",
     "goal": "Process the seven open pull requests, repair safe issues, and merge each one that satisfies its exact gates.",
     "prompt": "Work through PRs 3941, 3940, 3942, 3943, 3944, 3946, and 3947 one at a time.",
-    "claim": {
+    "turn": {
       "status": "needs_human",
       "summary": "I’m starting with PR #3941 in this worktree, then I’ll process #3940, #3942, #3943, #3944, #3946, and #3947 strictly one at a time. I’ll inspect scoped instructions, current main/live heads, comments, conflicts, and raw CI logs before making any branch-local fixes."
     },
@@ -26,7 +26,7 @@
     "source": "ubuntu-32gb-ash-2 supervisor-v2 result on 2026-08-07",
     "goal": "Verify the artifacts fix against the applied migration, deepen black-box regression coverage, and publish independently verified pull requests.",
     "prompt": "Investigate the artifacts rollout and recent bug fixes, then implement and ship the missing test coverage.",
-    "claim": {
+    "turn": {
       "status": "completed",
       "summary": "I’ll run this as a bounded release campaign from a fresh origin/main baseline: first verify #3964 against the applied migration and identify any production-ordering gap without changing production/schema, then audit recent fixes, add high-confidence black-box regressions, and publish independent PRs with focused and broad verification. I’m using the repository’s GitHub workflow guidance for safe PR publication and CI follow-up."
     },
@@ -38,7 +38,7 @@
     "goal": "Implement, verify, publish, and safely merge the next type-hardening pull request in the campaign.",
     "prompt": "Own the campaign outcome; use the deterministic finalizer for publication after independent verification.",
     "supervisor_context": "A configured deterministic finalizer can merge only an explicitly supplied existing pull request after an accepted completed Result and exact unchanged-head checks. It does not push branches, create or discover pull requests, or start itself. This worker's immutable Activity authority explicitly prohibited push and PR creation, exact-Session continuation cannot widen that authority, and no external publication automation is listed.",
-    "claim": {
+    "turn": {
       "status": "needs_human",
       "summary": "Implemented one scoped invariant cleanup and committed locally as 691958899b82051e9c74aaf9709b5ba606bb02be. Shared active grid statuses are now tuple-derived with an Exclude/AssertNever policy-match proof and canonical predicate; two client consumers use it. Focused tests, native shared/web typechecks, format, and full bun run check all passed. Worktree is clean and one commit ahead of origin/main. Push, PR creation, and merge were not performed because explicitly prohibited; human takeover is needed for that lifecycle."
     },

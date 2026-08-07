@@ -14,9 +14,9 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/supervisor"
 )
 
-type evaluatorFunc func(context.Context, evaluator.Request) (supervisor.EvaluationDecision, error)
+type evaluatorFunc func(context.Context, evaluator.Request) (supervisor.TurnDecision, error)
 
-func (f evaluatorFunc) Evaluate(ctx context.Context, request evaluator.Request) (supervisor.EvaluationDecision, error) {
+func (f evaluatorFunc) Evaluate(ctx context.Context, request evaluator.Request) (supervisor.TurnDecision, error) {
 	return f(ctx, request)
 }
 
@@ -98,7 +98,7 @@ func TestServeV2GracefulCancellationDrainsActiveExecutor(t *testing.T) {
 	}
 }
 
-func TestServeV2EvaluatesRealTerminalClaimBeforeSchedulingContinuation(t *testing.T) {
+func TestServeV2DecidesTurnBeforeSchedulingContinuation(t *testing.T) {
 	stateRoot, worktree, outputRoot := t.TempDir(), t.TempDir(), t.TempDir()
 	for _, path := range []string{stateRoot, worktree, outputRoot} {
 		if err := os.Chmod(path, 0o700); err != nil {
@@ -118,15 +118,16 @@ func TestServeV2EvaluatesRealTerminalClaimBeforeSchedulingContinuation(t *testin
 		Authority:      supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite},
 		Finalizer:      supervisor.FinalizerSpec{Enabled: true, RequiredChecks: []string{"approve"}},
 		Budget:         supervisor.Budget{MaxTaskAttempts: 10, MaxLaunches: 20},
-		Autonomy:       supervisor.AutonomySpec{Enabled: true, EvaluatorModel: "fake/evaluator", MaxTurns: 100},
-		IdempotencyKey: "serve-evaluation-start",
+		EvaluatorModel: "fake/evaluator",
+		MaxTurns:       100,
+		IdempotencyKey: "serve-decision-start",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	state, _ := store.Projection()
 	activity := state.Activities[execution.FirstActivity]
-	attempt, _, err := store.PrepareAttempt(context.Background(), supervisor.PrepareAttemptInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, CommandDigest: "test-command", Outputs: supervisor.OutputIdentity{Stdout: "test-out", Stderr: "test-err"}, IdempotencyKey: "serve-evaluation-prepare"})
+	attempt, _, err := store.PrepareAttempt(context.Background(), supervisor.PrepareAttemptInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, CommandDigest: "test-command", Outputs: supervisor.OutputIdentity{Stdout: "test-out", Stderr: "test-err"}, IdempotencyKey: "serve-decision-prepare"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,10 +137,10 @@ func TestServeV2EvaluatesRealTerminalClaimBeforeSchedulingContinuation(t *testin
 			t.Fatal(recordErr)
 		}
 	}
-	record("serve-evaluation-spawn", supervisor.Milestone{Kind: supervisor.MilestoneProcessSpawned, Process: &supervisor.ProcessIdentity{PID: 901, StartToken: "test-process"}})
-	record("serve-evaluation-turn", supervisor.Milestone{Kind: supervisor.MilestoneTurnStarted})
-	record("serve-evaluation-result", supervisor.Milestone{Kind: supervisor.MilestoneResult, Result: &supervisor.WorkerResult{Status: "needs_human", Summary: "This candidate is unsafe"}})
-	record("serve-evaluation-exit", supervisor.Milestone{Kind: supervisor.MilestoneExit, Exit: &supervisor.Exit{Code: 0}})
+	record("serve-decision-spawn", supervisor.Milestone{Kind: supervisor.MilestoneProcessSpawned, Process: &supervisor.ProcessIdentity{PID: 901, StartToken: "test-process"}})
+	record("serve-decision-turn", supervisor.Milestone{Kind: supervisor.MilestoneTurnStarted})
+	record("serve-decision-result", supervisor.Milestone{Kind: supervisor.MilestoneResult, Result: &supervisor.WorkerResult{Status: "needs_human", Summary: "This candidate is unsafe"}})
+	record("serve-decision-exit", supervisor.Milestone{Kind: supervisor.MilestoneExit, Exit: &supervisor.Exit{Code: 0}})
 
 	continuationStarted := make(chan supervisor.ActivityID, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -149,11 +150,11 @@ func TestServeV2EvaluatesRealTerminalClaimBeforeSchedulingContinuation(t *testin
 			Interval:   100 * time.Millisecond,
 			Workers:    1,
 			OutputRoot: outputRoot,
-			Evaluator: evaluatorFunc(func(_ context.Context, request evaluator.Request) (supervisor.EvaluationDecision, error) {
-				if request.Goal == "" || request.Prompt == "" || request.Claim.Summary != "This candidate is unsafe" || !strings.Contains(request.SupervisorContext, "does not push branches") {
-					return supervisor.EvaluationDecision{}, errors.New("evaluator request lost durable context")
+			Evaluator: evaluatorFunc(func(_ context.Context, request evaluator.Request) (supervisor.TurnDecision, error) {
+				if request.Goal == "" || request.Prompt == "" || request.Turn.Summary != "This candidate is unsafe" || !strings.Contains(request.SupervisorContext, "does not push branches") {
+					return supervisor.TurnDecision{}, errors.New("evaluator request lost durable context")
 				}
-				return supervisor.EvaluationDecision{Outcome: "continue", Reason: "The local candidate is unsuitable; select another safe candidate.", Model: "fake/evaluator"}, nil
+				return supervisor.TurnDecision{Outcome: "continue", Reason: "The local candidate is unsuitable; select another safe candidate.", Model: "fake/evaluator"}, nil
 			}),
 			RunActivity: func(_ context.Context, id supervisor.ActivityID) error {
 				continuationStarted <- id
@@ -173,26 +174,26 @@ func TestServeV2EvaluatesRealTerminalClaimBeforeSchedulingContinuation(t *testin
 	}
 	state, _ = store.Projection()
 	continuation := state.Activities[continuationID]
-	if continuation == nil || continuation.ParentActivityID != activity.ID || continuation.SessionID != activity.SessionID || len(state.Evaluations) != 1 {
-		t.Fatalf("durable evaluated continuation missing: continuation=%+v evaluations=%+v", continuation, state.Evaluations)
+	if continuation == nil || continuation.ParentActivityID != activity.ID || continuation.SessionID != activity.SessionID {
+		t.Fatalf("durable decided continuation missing: continuation=%+v", continuation)
 	}
 }
 
 func TestServeV2BacksOffTransientEvaluatorFailures(t *testing.T) {
-	store, outputRoot := pendingAutonomousClaim(t, "fake/evaluator")
+	store, outputRoot := pendingGoalTurn(t, "fake/evaluator")
 	calls := make(chan struct{}, 10)
 	unexpectedActivities := make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
 		done <- ServeV2(ctx, store, ServeOptions{
-			Interval:             100 * time.Millisecond,
-			Workers:              1,
-			OutputRoot:           outputRoot,
-			EvaluationRetryDelay: time.Second,
-			Evaluator: evaluatorFunc(func(context.Context, evaluator.Request) (supervisor.EvaluationDecision, error) {
+			Interval:           100 * time.Millisecond,
+			Workers:            1,
+			OutputRoot:         outputRoot,
+			DecisionRetryDelay: time.Second,
+			Evaluator: evaluatorFunc(func(context.Context, evaluator.Request) (supervisor.TurnDecision, error) {
 				calls <- struct{}{}
-				return supervisor.EvaluationDecision{}, errors.New("transient provider failure")
+				return supervisor.TurnDecision{}, errors.New("transient provider failure")
 			}),
 			RunActivity: func(context.Context, supervisor.ActivityID) error {
 				select {
@@ -221,17 +222,17 @@ func TestServeV2BacksOffTransientEvaluatorFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(state.Claims) != 1 || len(state.Evaluations) != 0 {
-		t.Fatalf("failed evaluation mutated durable claim state: claims=%d evaluations=%d", len(state.Claims), len(state.Evaluations))
+	if len(state.Results) != 0 {
+		t.Fatalf("failed decision created a result: results=%d", len(state.Results))
 	}
 	select {
 	case <-unexpectedActivities:
-		t.Fatal("an unresolved Claim scheduled worker continuation")
+		t.Fatal("a pending turn scheduled worker continuation")
 	default:
 	}
 }
 
-func pendingAutonomousClaim(t *testing.T, model string) (*supervisor.Store, string) {
+func pendingGoalTurn(t *testing.T, model string) (*supervisor.Store, string) {
 	t.Helper()
 	stateRoot, worktree, outputRoot := t.TempDir(), t.TempDir(), t.TempDir()
 	for _, path := range []string{stateRoot, worktree, outputRoot} {
@@ -251,7 +252,8 @@ func pendingAutonomousClaim(t *testing.T, model string) (*supervisor.Store, stri
 		Root:           worktree,
 		Authority:      supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite},
 		Budget:         supervisor.Budget{MaxTaskAttempts: 10, MaxLaunches: 20},
-		Autonomy:       supervisor.AutonomySpec{Enabled: true, EvaluatorModel: model, MaxTurns: 100},
+		EvaluatorModel: model,
+		MaxTurns:       100,
 		IdempotencyKey: "retry-start",
 	})
 	if err != nil {

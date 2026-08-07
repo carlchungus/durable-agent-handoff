@@ -39,7 +39,7 @@ execution, receipt, err := store.StartExecution(ctx, supervisor.StartExecutionIn
 ```
 
 `StartExecution` accepts an optional native Session ID for ordinary new-session
-launches. A missing ID creates a Supervisor-owned unbound Session; the first
+launches. A missing ID creates an unbound Session; the first
 typed `session_bound` milestone binds it immutably. Continuations and the
 promotion seam require an exact bound identity. It never selects a global last
 Session. The same idempotency key and canonical request returns the same
@@ -57,7 +57,7 @@ interface:
 | `ContinueSession` | human Message + exact-Session continuation Activity generation |
 | `PrepareAttempt` | immutable Attempt + canonical-worktree writer Lease + inbox dispatch |
 | `RecordMilestone` | typed milestone plus any Result, inbox settlement, or terminal-exit Lease release |
-| `ResolveClaim` | fresh evaluator decision plus accepted Result, typed escalation, or exact-Session continuation |
+| `DecideTurn` | decision plus Result and, for `continue`, the next turn on the same Session |
 | `RequestControl` | accepted/rejected exact Activity-generation and Attempt fence |
 | `PauseWorkflow` | records exact controls and enters requested/draining; executor-applied terminal exits release Leases |
 | `SettlePause` | idempotently marks a draining pause completed after every fenced Attempt has exited |
@@ -103,16 +103,12 @@ Drivers may emit only:
 turns/results, milestones after a Result other than `exit`, non-monotonic event
 times, and stale Lease/Attempt fences are rejected.
 
-Worker status is `completed`, `continue`, `needs_human`, or `blocked`.
-Non-autonomous `needs_human` requires a typed blocker and concrete question;
-`continue` is reserved for evaluator-controlled autonomous workflows. An
-autonomous worker status creates a Claim, not a Result. The service evaluates
-the Claim with a fresh tool-less model and commits one `accept`, `continue`, or
-`escalate` decision through `ResolveClaim`. A reply to any Result creates a
-continuation Activity; it never changes the Result or predecessor.
-`accept` records evaluator-owned terminal truth as a completed Result even when
-the worker mislabeled already-completed Activity work as blocked on a configured
-Supervisor finalizer.
+Worker status is `completed`, `continue`, `needs_human`, or `blocked`. For a
+one-shot run, `needs_human` requires a blocker and concrete question. For a
+goal, the service reads the worker result from its exact Attempt and asks a
+fresh tool-less model for `accept`, `continue`, or `escalate`. `DecideTurn`
+stores that decision on the normal Result. A reply to any Result creates a new
+Activity; it never changes the Result or predecessor.
 
 Worker Result payloads do not carry publication authority. Independently hosted
 CI and GitHub checks provide verification; handoff does not pretend that
@@ -189,9 +185,9 @@ with `idempotency_key`, `goal`, `prompt`, `remote_root`, `runtime`, `resume_id`,
 `sandbox`, and `role`, plus optional `model`, `effort`, and flat
 `finalizer_enabled`, `finalizer_required_checks`, and
 `finalizer_require_human` fields. Unknown fields and a second JSON value are
-rejected. It also accepts flat `autonomous`, `evaluator_model`, and `max_turns`
-fields. Finalizer and autonomy configuration are persisted in the immutable
-`StartExecutionInput`; an enabled finalizer requires a nonempty canonical exact
+rejected. It also accepts `one_shot`, `evaluator_model`, and `max_turns`.
+Machine starts run as goals unless `one_shot` is true. These settings are
+persisted in `StartExecutionInput`; an enabled finalizer requires a nonempty canonical exact
 set of external GitHub checks, while human approval is independently optional.
 Its only JSON response shape is:
 

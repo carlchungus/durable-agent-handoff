@@ -28,13 +28,13 @@ type ServeOptions struct {
 	TrustMode       driver.TrustMode
 	OutputRoot      string
 	StartupDeadline time.Duration
-	// EvaluationRetryDelay bounds transient evaluator failures. It is process
-	// state only: unresolved Claims remain durable and are retried after restart.
-	EvaluationRetryDelay time.Duration
+	// DecisionRetryDelay bounds transient model failures. Pending turns remain
+	// durable and are retried after restart.
+	DecisionRetryDelay time.Duration
 	// RunActivity is a test seam for the service drain contract. Production
 	// callers leave it nil so the durable Executor is used.
 	RunActivity func(context.Context, supervisor.ActivityID) error
-	// Evaluator is a fresh, tool-less terminal-claim evaluator. Production
+	// Evaluator is the fresh, tool-less model that decides a completed turn. Production
 	// callers leave it nil to use OpenRouter from the transient environment.
 	Evaluator evaluator.Evaluator
 }
@@ -64,8 +64,8 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 	if options.StartupDeadline <= 0 {
 		options.StartupDeadline = 30 * time.Second
 	}
-	if options.EvaluationRetryDelay <= 0 {
-		options.EvaluationRetryDelay = 30 * time.Second
+	if options.DecisionRetryDelay <= 0 {
+		options.DecisionRetryDelay = 30 * time.Second
 	}
 	if err := ctx.Err(); err != nil {
 		return nil
@@ -77,8 +77,8 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 	var mu sync.Mutex
 	var activeWorkers sync.WaitGroup
 	active := map[supervisor.ActivityID]bool{}
-	activeEvaluations := map[supervisor.ClaimID]bool{}
-	evaluationRetryAt := map[supervisor.ClaimID]time.Time{}
+	activeDecisions := map[supervisor.ActivityID]bool{}
+	decisionRetryAt := map[supervisor.ActivityID]time.Time{}
 	run := func() {
 		if ctx.Err() != nil {
 			return
@@ -91,35 +91,35 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 			return
 		}
 		for _, view := range views {
-			for _, claimID := range view.EvaluationQueue {
+			for _, activityID := range view.PendingTurns {
 				if ctx.Err() != nil {
 					return
 				}
 				mu.Lock()
-				if activeEvaluations[claimID] || time.Now().Before(evaluationRetryAt[claimID]) {
+				if activeDecisions[activityID] || time.Now().Before(decisionRetryAt[activityID]) {
 					mu.Unlock()
 					continue
 				}
 				select {
 				case sem <- struct{}{}:
-					activeEvaluations[claimID] = true
+					activeDecisions[activityID] = true
 				default:
 					mu.Unlock()
 					return
 				}
 				activeWorkers.Add(1)
 				mu.Unlock()
-				go func(id supervisor.ClaimID) {
+				go func(id supervisor.ActivityID) {
 					failed := false
 					defer func() {
 						activeWorkers.Done()
 						<-sem
 						mu.Lock()
-						delete(activeEvaluations, id)
+						delete(activeDecisions, id)
 						if failed {
-							evaluationRetryAt[id] = time.Now().Add(options.EvaluationRetryDelay)
+							decisionRetryAt[id] = time.Now().Add(options.DecisionRetryDelay)
 						} else {
-							delete(evaluationRetryAt, id)
+							delete(decisionRetryAt, id)
 						}
 						mu.Unlock()
 					}()
@@ -127,38 +127,38 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 					if projectionErr != nil {
 						failed = true
 						if logf != nil {
-							logf("claim=%s evaluation_projection_error=%v", id, projectionErr)
+							logf("activity=%s decision_projection_error=%v", id, projectionErr)
 						}
 						return
 					}
-					request, requestErr := claimEvaluationRequest(state, id)
+					request, attemptID, generation, requestErr := turnDecisionRequest(state, id)
 					if requestErr != nil {
 						failed = true
 						if logf != nil {
-							logf("claim=%s evaluation_request_error=%v", id, requestErr)
+							logf("activity=%s decision_request_error=%v", id, requestErr)
 						}
 						return
 					}
-					claimEvaluator := options.Evaluator
-					if claimEvaluator == nil {
-						claimEvaluator = evaluator.OpenRouter{APIKey: environmentValue(options.Environment, "OPENROUTER_API_KEY"), Endpoint: environmentValue(options.Environment, "HANDOFF_EVALUATOR_ENDPOINT"), Mode: evaluator.ModeToolCall}
+					turnEvaluator := options.Evaluator
+					if turnEvaluator == nil {
+						turnEvaluator = evaluator.OpenRouter{APIKey: environmentValue(options.Environment, "OPENROUTER_API_KEY"), Endpoint: environmentValue(options.Environment, "HANDOFF_EVALUATOR_ENDPOINT"), Mode: evaluator.ModeToolCall}
 					}
-					decision, evaluationErr := claimEvaluator.Evaluate(ctx, request)
+					decision, evaluationErr := turnEvaluator.Evaluate(ctx, request)
 					if evaluationErr != nil {
 						failed = true
 						if logf != nil {
-							logf("claim=%s evaluation_error=%v", id, evaluationErr)
+							logf("activity=%s decision_error=%v", id, evaluationErr)
 						}
 						return
 					}
-					_, _, resolveErr := store.ResolveClaim(context.Background(), supervisor.ResolveClaimInput{ClaimID: id, Decision: decision, IdempotencyKey: "evaluation/" + string(id)})
+					_, _, resolveErr := store.DecideTurn(context.Background(), supervisor.DecideTurnInput{ActivityID: id, ExpectedGeneration: generation, AttemptID: attemptID, Decision: decision, IdempotencyKey: "decision/" + string(id)})
 					if resolveErr != nil {
 						failed = true
 						if logf != nil {
-							logf("claim=%s evaluation_commit_error=%v", id, resolveErr)
+							logf("activity=%s decision_commit_error=%v", id, resolveErr)
 						}
 					}
-				}(claimID)
+				}(activityID)
 			}
 			for _, activityID := range view.Queue {
 				if ctx.Err() != nil {
@@ -214,27 +214,44 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 	}
 }
 
-func claimEvaluationRequest(state *supervisor.State, claimID supervisor.ClaimID) (evaluator.Request, error) {
-	claim := state.Claims[claimID]
-	if claim == nil {
-		return evaluator.Request{}, errors.New("evaluation claim is absent")
+func turnDecisionRequest(state *supervisor.State, activityID supervisor.ActivityID) (evaluator.Request, supervisor.AttemptID, uint64, error) {
+	activity := state.Activities[activityID]
+	if activity == nil {
+		return evaluator.Request{}, "", 0, errors.New("pending turn is absent")
 	}
-	workflow := state.Workflows[claim.WorkflowID]
-	activity := state.Activities[claim.ActivityID]
+	workflow := state.Workflows[activity.WorkflowID]
 	if workflow == nil || activity == nil {
-		return evaluator.Request{}, errors.New("evaluation claim has broken workflow or activity identity")
+		return evaluator.Request{}, "", 0, errors.New("pending turn has broken workflow identity")
 	}
-	node := workflow.Nodes[claim.NodeID]
+	node := workflow.Nodes[activity.NodeID]
 	if node == nil {
-		return evaluator.Request{}, errors.New("evaluation claim has no desired work")
+		return evaluator.Request{}, "", 0, errors.New("pending turn has no goal")
 	}
-	request := evaluator.Request{Model: workflow.Autonomy.EvaluatorModel, Goal: node.Title, Prompt: activity.Prompt, Claim: claim.Result}
+	var attempt *supervisor.Attempt
+	var turn *supervisor.WorkerResult
+	for _, candidate := range state.Attempts {
+		if candidate.ActivityID != activity.ID {
+			continue
+		}
+		for _, milestone := range candidate.Milestones {
+			if milestone.Kind == supervisor.MilestoneResult {
+				if turn != nil {
+					return evaluator.Request{}, "", 0, errors.New("pending turn has more than one worker result")
+				}
+				attempt, turn = candidate, milestone.Result
+			}
+		}
+	}
+	if attempt == nil || turn == nil {
+		return evaluator.Request{}, "", 0, errors.New("pending turn has no worker result")
+	}
+	request := evaluator.Request{Model: workflow.EvaluatorModel, Goal: node.Title, Prompt: activity.Prompt, Turn: *turn}
 	if workflow.Finalizer.Enabled {
-		request.SupervisorContext = "A configured deterministic finalizer can merge only an explicitly supplied existing pull request after an accepted completed Result and exact unchanged-head checks. It does not push branches, create or discover pull requests, or start itself. Do not treat those unfinished steps as already handled."
+		request.SupervisorContext = "The configured follow-up step can merge only an explicitly supplied existing pull request after an accepted completed Result and exact unchanged-head checks. It does not push branches, create or discover pull requests, or start itself. Do not treat those unfinished steps as already handled."
 	} else {
-		request.SupervisorContext = "No Supervisor-owned downstream finalizer is enabled for this workflow."
+		request.SupervisorContext = "No follow-up publication step is enabled for this goal."
 	}
-	if attempt := state.Attempts[claim.AttemptID]; attempt != nil {
+	if attempt != nil {
 		for _, milestone := range attempt.Milestones {
 			switch milestone.Kind {
 			case supervisor.MilestoneEffectStarted:
@@ -244,7 +261,7 @@ func claimEvaluationRequest(state *supervisor.State, claimID supervisor.ClaimID)
 			}
 		}
 	}
-	return request, nil
+	return request, attempt.ID, activity.Generation, nil
 }
 
 func appendBounded(values []string, value string) []string {

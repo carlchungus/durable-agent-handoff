@@ -11,7 +11,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func validatePlatform(file *os.File, _ os.FileInfo, _ bool) error {
+func validatePlatform(file *os.File, _ os.FileInfo, directory bool) error {
 	descriptor, err := windows.GetSecurityInfo(windows.Handle(file.Fd()), windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return fmt.Errorf("read Windows security descriptor: %w", err)
@@ -45,14 +45,16 @@ func validatePlatform(file *os.File, _ os.FileInfo, _ bool) error {
 		if err = windows.GetAce(dacl, index, &ace); err != nil || ace == nil {
 			return fmt.Errorf("read Windows access entry %d: %w", index, err)
 		}
-		if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 || ace.Header.AceType == windows.ACCESS_DENIED_ACE_TYPE {
+		if ace.Header.AceType == windows.ACCESS_DENIED_ACE_TYPE {
 			continue
 		}
 		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
 			return fmt.Errorf("Windows path has unsupported allow entry type %d", ace.Header.AceType)
 		}
 		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
-		if !sidAllowed(sid, allowed) {
+		appliesToPath := ace.Header.AceFlags&windows.INHERIT_ONLY_ACE == 0
+		appliesToChildren := directory && ace.Header.AceFlags&(windows.OBJECT_INHERIT_ACE|windows.CONTAINER_INHERIT_ACE) != 0
+		if (appliesToPath || appliesToChildren) && !sidAllowed(sid, allowed) {
 			return fmt.Errorf("Windows path grants access to untrusted principal %s", sid.String())
 		}
 	}

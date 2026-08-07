@@ -221,8 +221,9 @@ then waits on pure projection reads until the executor records exact terminal
 exit evidence and the later idempotent settle command marks the pause complete.
 An Attempt holding an old fence cannot append a later non-terminal milestone.
 
-`serve` accepts `--environment-json FILE` only when `FILE` is a regular
-mode-0600 file containing one JSON object, and `--trust-mode workspace|full`.
+`serve` accepts `--environment-json FILE` only when `FILE` is a private regular
+file containing one JSON object, and `--trust-mode workspace|full`. POSIX hosts
+require mode `0600`; Windows requires an owner/System/Administrators-only DACL.
 The file is read into transient driver environment values. Prompts and secret
 values are never serialized into a service unit. Drivers apply trust flags
 themselves and execute provider argv directly, without shell wrappers.

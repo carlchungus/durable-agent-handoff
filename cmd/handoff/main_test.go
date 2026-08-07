@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/carlchungus/durable-agent-handoff/supervisor"
 )
@@ -250,6 +251,10 @@ func TestStatusListReplyAndPauseUseSupervisorProjection(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"workflow_id"`) || !strings.Contains(out.String(), `"existing":false`) {
 		t.Fatalf("pause=%s", out.String())
+	}
+	view, err := store.View(response.Execution.ID, time.Now().UTC())
+	if err != nil || view.Status != supervisor.ExecutionPaused || view.Active {
+		t.Fatalf("paused execution remained active: view=%+v err=%v", view, err)
 	}
 	if err := run([]string{"start", "--state", state, "--runtime", "codex", "--prompt", "secret-argv-prompt", "--authorized-by", "human:test", "--idempotency-key", "prompt-argv-rejected"}, &out, &errOut); err == nil || strings.Contains(out.String(), "secret-argv-prompt") {
 		t.Fatal("ordinary start accepted or exposed a prompt body in argv")

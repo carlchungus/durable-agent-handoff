@@ -99,6 +99,24 @@ func TestPublicCLICompletesOneActivityThroughRuntimeProcess(t *testing.T) {
 	if status.Attempts[0].TerminalReason != "" {
 		t.Fatalf("successful runtime result retained a false terminal failure: %+v", status.Attempts[0])
 	}
+	var activeList []struct {
+		ID string `json:"id"`
+	}
+	decodeJSON(t, runCLI(t, environment, "", "list", "--state", state, "--json"), &activeList)
+	if len(activeList) != 0 {
+		t.Fatalf("default list retained terminal workstreams: %+v", activeList)
+	}
+	var allList []struct {
+		ID      string `json:"id"`
+		Title   string `json:"title"`
+		Status  string `json:"status"`
+		Active  bool   `json:"active"`
+		Summary string `json:"summary"`
+	}
+	decodeJSON(t, runCLI(t, environment, "", "list", "--state", state, "--all", "--json"), &allList)
+	if len(allList) != 1 || allList[0].ID != started.Execution.ID || allList[0].Title != "Root execution" || allList[0].Status != "completed" || allList[0].Active || allList[0].Summary == "" {
+		t.Fatalf("all-workstream list omitted useful terminal context: %+v", allList)
+	}
 
 	var activities []struct {
 		Status string `json:"status"`

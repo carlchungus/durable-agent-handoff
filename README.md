@@ -28,7 +28,8 @@ printf '%s' 'audit every active workstream' | handoff goal start \
   --authorized-by human:id --idempotency-key supervisor-01 \
   --wake-interval 10m --json
 handoff status EXECUTION_ID --json
-handoff list --json
+handoff list
+handoff list --watch 30s
 handoff tui --snapshot
 handoff activity list --json
 handoff preference set planner --candidate claude:sonnet:high --candidate codex:gpt-5:xhigh
@@ -76,6 +77,12 @@ cap, not a required budget and not an unattended-operation default.
 future time. `status` and `list` expose `next_wake_at`/`next_wake`; queued human
 replies remain immediately runnable. The service checks persisted deadlines,
 so no sleeping shell or occupied model turn is involved.
+
+`list` is the operator inbox: by default it shows every active workstream,
+including its goal and latest durable progress. `--all` restores terminal
+history. `--watch 30s` prints an
+initial snapshot and then only material changes; with `--json`, each changed
+snapshot is one JSON object suitable for another status bridge.
 
 DeepSeek's forced decision tool is the default because strict
 `response_format` was unreliable against the checked-in real transcripts. The

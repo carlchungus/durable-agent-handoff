@@ -161,7 +161,7 @@ Usage:
   handoff execution start --file - --json [runs as a goal by default; set one_shot=true to opt out]
   handoff execution pause --workflow ID --timeout 30s --json
   handoff status [EXECUTION_ID] [--json]
-  handoff list [--json]
+  handoff list [--all] [--watch 30s] [--json]
   handoff run WORKFLOW_ID [--once]
   handoff serve [--environment-json FILE] [--trust-mode workspace|full]
   handoff preference set ROLE --candidate runtime:model[:effort]

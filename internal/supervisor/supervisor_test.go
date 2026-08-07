@@ -142,9 +142,29 @@ func TestThreadStartedWithoutTurnRemainsStarting(t *testing.T) {
 	if len(view.Attempts) != 1 || view.Attempts[0].Health != HealthStarting || view.Attempts[0].TurnStarted || view.Attempts[0].TaskAttempt != 0 {
 		t.Fatalf("pre-turn process was reported healthy/running: %+v", view.Attempts)
 	}
+	if view.Status != ExecutionStarting || !view.Active {
+		t.Fatalf("starting workstream was not active: status=%s active=%t", view.Status, view.Active)
+	}
 	rendered := RenderText(view)
 	if !strings.Contains(rendered, "health=starting") || strings.Contains(rendered, "output") || strings.Contains(rendered, "health=running") {
 		t.Fatalf("human view invented lifecycle/progress: %s", rendered)
+	}
+}
+
+func TestExecutionSummaryIsDeterministicWhenResultTimesTie(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{Now: func() time.Time { return time.Unix(500, 0).UTC() }})
+	execution := startTestExecution(t, store, worktree, "summary-tie-start", DefaultBudget())
+	state, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Results["result-a"] = &Result{ID: "result-a", WorkflowID: execution.WorkflowID, Summary: "first stable summary", CreatedAt: time.Unix(600, 0).UTC()}
+	state.Results["result-b"] = &Result{ID: "result-b", WorkflowID: execution.WorkflowID, Summary: "second stable summary", CreatedAt: time.Unix(600, 0).UTC()}
+	for iteration := 0; iteration < 100; iteration++ {
+		view, projectErr := ProjectExecution(state, execution.ID, time.Unix(700, 0).UTC())
+		if projectErr != nil || view.Summary != "second stable summary" {
+			t.Fatalf("projection %d summary=%q err=%v", iteration, view.Summary, projectErr)
+		}
 	}
 }
 
@@ -635,6 +655,9 @@ func TestGoalEscalationRequiresTypedWorkflowWideBlocker(t *testing.T) {
 	}
 	if len(view.PendingTurns) != 0 || view.Activities[0].Status != ActivityNeedsHuman || view.Activities[0].BlockerKind != "credential" || view.Activities[0].Question == "" {
 		t.Fatalf("typed blocker was not surfaced in the canonical view: %+v", view.Activities[0])
+	}
+	if view.Status != ExecutionNeedsHuman || !view.Active {
+		t.Fatalf("human-actionable workstream was hidden: status=%s active=%t", view.Status, view.Active)
 	}
 	if rendered := RenderText(view); !strings.Contains(rendered, "blocker=credential") || !strings.Contains(rendered, "Which approved credential") {
 		t.Fatalf("human view hid the escalation: %s", rendered)

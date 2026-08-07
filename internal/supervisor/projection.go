@@ -11,6 +11,7 @@ type ActivityStatus string
 
 const (
 	ActivityQueued     ActivityStatus = "queued"
+	ActivityScheduled  ActivityStatus = "scheduled"
 	ActivityStarting   ActivityStatus = "starting"
 	ActivityRunning    ActivityStatus = "running"
 	ActivityDeciding   ActivityStatus = "deciding"
@@ -72,6 +73,7 @@ type ActivityView struct {
 	ResultSummary      string          `json:"result_summary,omitempty"`
 	BlockerKind        string          `json:"blocker_kind,omitempty"`
 	Question           string          `json:"question,omitempty"`
+	NotBefore          *time.Time      `json:"not_before,omitempty"`
 }
 
 type NodeStatus string
@@ -80,6 +82,7 @@ const (
 	NodeWaitingDependencies NodeStatus = "waiting_dependencies"
 	NodeEligible            NodeStatus = "eligible"
 	NodeQueued              NodeStatus = "queued"
+	NodeScheduled           NodeStatus = "scheduled"
 	NodeStarting            NodeStatus = "starting"
 	NodeRunning             NodeStatus = "running"
 	NodeDeciding            NodeStatus = "deciding"
@@ -103,6 +106,7 @@ type ExecutionView struct {
 	Queue        []ActivityID     `json:"queue"`
 	PendingTurns []ActivityID     `json:"pending_turns,omitempty"`
 	Publication  PublicationState `json:"publication"`
+	NextWakeAt   *time.Time       `json:"next_wake_at,omitempty"`
 	AsOf         time.Time        `json:"as_of"`
 }
 
@@ -124,10 +128,13 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 	workflow := state.Workflows[execution.WorkflowID]
 	view := &ExecutionView{ID: execution.ID, WorkflowID: workflow.ID, AsOf: asOf.UTC()}
 	for _, activity := range orderedActivities(state, workflow.ID) {
-		item := projectActivity(state, activity)
+		item := projectActivity(state, activity, asOf)
 		view.Activities = append(view.Activities, item)
 		if (item.Status == ActivityQueued || item.Status == ActivityRetryable) && fallbackChildForActivity(state, activity.ID) == nil {
 			view.Queue = append(view.Queue, item.ID)
+		}
+		if item.Status == ActivityScheduled && item.NotBefore != nil && (view.NextWakeAt == nil || item.NotBefore.Before(*view.NextWakeAt)) {
+			view.NextWakeAt = item.NotBefore
 		}
 		if item.Status == ActivityDeciding {
 			view.PendingTurns = append(view.PendingTurns, activity.ID)
@@ -179,6 +186,10 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 				if item.Status != NodeRunning && item.Status != NodeStarting {
 					item.Status = NodeQueued
 				}
+			case ActivityScheduled:
+				if item.Status != NodeRunning && item.Status != NodeStarting && item.Status != NodeQueued {
+					item.Status = NodeScheduled
+				}
 			case ActivityCompleted, ActivityNeedsHuman, ActivityBlocked, ActivityPaused:
 				if item.Status != NodeRunning && item.Status != NodeStarting && item.Status != NodeQueued {
 					item.Status = NodeCompleted
@@ -191,12 +202,15 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 	return view, nil
 }
 
-func projectActivity(state *State, activity *Activity) ActivityView {
+func projectActivity(state *State, activity *Activity, asOf time.Time) ActivityView {
 	view := ActivityView{ID: activity.ID, NodeID: activity.NodeID, SessionID: activity.SessionID, Generation: activity.Generation, ParentActivityID: activity.ParentActivityID, Status: ActivityQueued, DependencyBindings: append([]ResultBinding(nil), activity.DependencyBindings...)}
+	if activity.NotBefore != nil && !activity.NotBefore.IsZero() {
+		view.NotBefore = activity.NotBefore
+	}
 	// A provider-unavailable parent is superseded by its durable child Session.
 	// Keep the parent visible for lineage, but never return it to the scheduler.
 	if child := fallbackChildForActivity(state, activity.ID); child != nil {
-		childView := projectActivity(state, child)
+		childView := projectActivity(state, child, asOf)
 		view.Status = childView.Status
 		view.ResultID = childView.ResultID
 		return view
@@ -236,6 +250,10 @@ func projectActivity(state *State, activity *Activity) ActivityView {
 	}
 	if state.Pauses[activity.WorkflowID] != nil {
 		view.Status = ActivityPaused
+		return view
+	}
+	if view.NotBefore != nil && view.NotBefore.After(asOf) {
+		view.Status = ActivityScheduled
 		return view
 	}
 	for _, attempt := range orderedAttemptsForActivity(state, activity.ID) {

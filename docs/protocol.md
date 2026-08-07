@@ -113,10 +113,26 @@ goal, the service reads the worker result from its exact Attempt and asks a
 fresh tool-less model for `accept`, `continue`, or `escalate`. `DecideTurn`
 stores that decision on the normal Result. A reply to any Result creates a new
 Activity; it never changes the Result or predecessor.
+If a reply is already queued while another turn finishes, `DecideTurn` reuses
+that continuation instead of creating an evaluator sibling. Explicit guidance
+therefore cannot be starved by repeated automatic continuations.
 
 Worker Result payloads do not carry publication authority. Independently hosted
 CI and GitHub checks provide verification; handoff does not pretend that
 same-UID workers can authenticate their own Results.
+
+Goals are unbounded when `max_turns` is zero or omitted. A positive value is an
+explicit safety cap. Unattended workers treat missing optional verification or
+external CI as a confidence limit: when publication is authorized, they prefer
+an honest draft PR and continue other independent work. `needs_human` is for an
+indispensable workflow-wide authority or information gap, not a request for
+optional evidence or for someone to watch CI.
+
+`wake_interval_seconds` is an optional durable cadence for automatic goal
+continuations. `DecideTurn` records `not_before` on the continuation in the
+same transaction. Before that instant the projection reports `scheduled` and
+`next_wake_at`, excludes it from the runnable queue, and `PrepareAttempt`
+independently rejects an early launch. Human replies do not inherit the delay.
 
 ## Projection protocol
 
@@ -214,6 +230,12 @@ Service cancellation waits for all active executor goroutines to record their
 terminal milestones and release their exact Leases before returning.
 Failed runtime launches are retried only after the service retry delay; the
 same queued Activity remains durable during that delay.
+
+The installed OS service has a ten-minute liveness watchdog. It issues a start,
+not a restart, so a healthy supervisor and its live Attempts are untouched. If
+the service is inactive after a crash, reboot, or missed wake, systemd or
+launchd starts the same journal-backed scheduler and normal reconciliation
+resumes exact Sessions and Attempts.
 
 ## One-way migration
 

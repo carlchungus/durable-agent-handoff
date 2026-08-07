@@ -34,7 +34,15 @@ func Enable(path string) error {
 	return nil
 }
 
-func EnableV2(path string) error { return Enable(path) }
+func EnableV2(path string) error {
+	if runtime.GOOS != "linux" {
+		return Enable(path)
+	}
+	if err := exec.Command("systemctl", "--user", "daemon-reload").Run(); err != nil {
+		return err
+	}
+	return exec.Command("systemctl", "--user", "enable", "--now", "handoff.service", "handoff-watchdog.timer").Run()
+}
 
 func xml(s string) string {
 	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;", "'", "&apos;").Replace(s)

@@ -14,6 +14,9 @@ func RenderText(view *ExecutionView) string {
 	}
 	var output strings.Builder
 	fmt.Fprintf(&output, "Execution %s\nWorkflow %s\nPublication %s\n", view.ID, view.WorkflowID, view.Publication)
+	if view.NextWakeAt != nil {
+		fmt.Fprintf(&output, "NextWake %s\n", view.NextWakeAt.UTC().Format("2006-01-02T15:04:05Z"))
+	}
 	if len(view.Queue) > 0 {
 		output.WriteString("Queue")
 		for index, activityID := range view.Queue {
@@ -35,6 +38,9 @@ func RenderText(view *ExecutionView) string {
 		fmt.Fprintf(&output, "Activity %s generation=%d status=%s", activity.ID, activity.Generation, activity.Status)
 		if activity.ParentActivityID != "" {
 			fmt.Fprintf(&output, " continuation_of=%s", activity.ParentActivityID)
+		}
+		if activity.NotBefore != nil {
+			fmt.Fprintf(&output, " not_before=%s", activity.NotBefore.UTC().Format("2006-01-02T15:04:05Z"))
 		}
 		if activity.BlockerKind != "" {
 			fmt.Fprintf(&output, " blocker=%s question=%s", singleLine(activity.BlockerKind), singleLine(activity.Question))

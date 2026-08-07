@@ -100,7 +100,7 @@ const completionContract = `
 
 Supervisor completion contract: after performing the requested work, emit exactly one JSON object with this shape and no Markdown or surrounding prose:
 {"status":"completed|continue|needs_human|blocked","summary":"concise outcome","blocker_kind":"","question":""}
-Use continue when this turn or candidate is finished but the objective remains actionable. Use needs_human only for a workflow-wide blocker and fill blocker_kind plus one concrete question. A plan, progress update, or promise is not a terminal result. Continue using tools until the work is actually complete, should continue in another turn, or has a concrete blocker.`
+Use continue when this turn or candidate is finished but the objective remains actionable. Assume the human is unavailable while an unattended goal is running. Use needs_human only when indispensable authority or information blocks the entire workflow and no safe partial result can be published; fill blocker_kind plus one concrete question. Missing optional verification, external CI, or production-browser access must downgrade confidence rather than suppress useful output. When GitHub publication is authorized, publish an honest draft PR with verification limits instead of waiting for optional evidence. Once a PR is handed to repository automation, do not idle waiting for it to merge when independent work remains. A plan, progress update, or promise is not a terminal result. Continue using tools until the work is actually complete, should continue in another turn, or has a concrete workflow-wide blocker.`
 
 func promptForRuntime(_ string, prompt string) string {
 	return strings.TrimRight(prompt, "\n") + completionContract

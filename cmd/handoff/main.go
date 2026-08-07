@@ -156,7 +156,7 @@ func jsonEncoder(out io.Writer) *json.Encoder {
 const usage = `handoff — Supervisor v2 durable execution
 
 Usage:
-  handoff goal start --goal GOAL --runtime codex --file - --idempotency-key KEY --authorized-by HUMAN
+  handoff goal start --goal GOAL --runtime codex --file - --idempotency-key KEY --authorized-by HUMAN [--wake-interval 10m]
   handoff start [--session EXACT_ID] --runtime codex --file - --idempotency-key KEY --authorized-by HUMAN [--finalizer-enabled --required-check NAME --require-human]
   handoff execution start --file - --json [runs as a goal by default; set one_shot=true to opt out]
   handoff execution pause --workflow ID --timeout 30s --json

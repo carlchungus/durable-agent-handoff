@@ -34,6 +34,22 @@ func TestInstallV2UnitContainsNoPromptOrEnvironmentValues(t *testing.T) {
 	if filepath.Base(path) != "handoff.service" || !strings.Contains(text, "Supervisor v2") || !strings.Contains(text, "--trust-mode full") || !strings.Contains(text, "--environment-json /private/env.json") || !strings.Contains(text, filepath.Join(home, ".local", "bin")) || strings.Contains(text, "prompt") {
 		t.Fatalf("unit=%s", text)
 	}
+	watchdogRaw, err := os.ReadFile(filepath.Join(home, ".config", "systemd", "user", "handoff-watchdog.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	watchdog := string(watchdogRaw)
+	if !strings.Contains(watchdog, "systemctl --user start handoff.service") || strings.Contains(watchdog, " restart ") {
+		t.Fatalf("watchdog must start only an inactive service without disrupting live work: %s", watchdog)
+	}
+	timerRaw, err := os.ReadFile(filepath.Join(home, ".config", "systemd", "user", "handoff-watchdog.timer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	timer := string(timerRaw)
+	if !strings.Contains(timer, "OnUnitActiveSec=600s") || !strings.Contains(timer, "Persistent=true") || !strings.Contains(timer, "WantedBy=timers.target") {
+		t.Fatalf("watchdog timer omitted durable ten-minute wake behavior: %s", timer)
+	}
 }
 
 func TestInstallV2LaunchAgentContainsUserWorkerPath(t *testing.T) {
@@ -46,7 +62,7 @@ func TestInstallV2LaunchAgentContainsUserWorkerPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if text := string(raw); !strings.Contains(text, "<key>EnvironmentVariables</key>") || !strings.Contains(text, filepath.Join(home, ".local", "bin")) {
+	if text := string(raw); !strings.Contains(text, "<key>EnvironmentVariables</key>") || !strings.Contains(text, filepath.Join(home, ".local", "bin")) || !strings.Contains(text, "<key>StartInterval</key><integer>600</integer>") {
 		t.Fatalf("launch agent omitted user worker path: %s", text)
 	}
 }

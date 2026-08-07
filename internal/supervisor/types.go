@@ -91,14 +91,15 @@ type Workflow struct {
 	Authority AuthoritySpec `json:"authority"`
 	Finalizer FinalizerSpec `json:"finalizer"`
 	Budget    Budget        `json:"budget"`
-	// EvaluatorModel and MaxTurns make this a goal that keeps running until a
-	// decision says it is done. Empty values preserve one-shot behavior.
-	EvaluatorModel string           `json:"evaluator_model,omitempty"`
-	MaxTurns       int              `json:"max_turns,omitempty"`
-	OldGoal        *oldGoalSettings `json:"autonomy,omitempty"`
-	Nodes          map[NodeID]*Node `json:"nodes"`
-	Order          []NodeID         `json:"order"`
-	CreatedAt      time.Time        `json:"created_at"`
+	// EvaluatorModel makes this a goal that keeps running until a decision says
+	// it is done. MaxTurns is an optional explicit safety cap; zero is unbounded.
+	EvaluatorModel      string           `json:"evaluator_model,omitempty"`
+	MaxTurns            int              `json:"max_turns,omitempty"`
+	WakeIntervalSeconds int64            `json:"wake_interval_seconds,omitempty"`
+	OldGoal             *oldGoalSettings `json:"autonomy,omitempty"`
+	Nodes               map[NodeID]*Node `json:"nodes"`
+	Order               []NodeID         `json:"order"`
+	CreatedAt           time.Time        `json:"created_at"`
 }
 
 // Node is desired work. It intentionally has no attempt, session, process,
@@ -168,6 +169,7 @@ type Activity struct {
 	ParentActivityID   ActivityID      `json:"parent_activity_id,omitempty"`
 	Prompt             string          `json:"prompt"`
 	DependencyBindings []ResultBinding `json:"dependency_bindings,omitempty"`
+	NotBefore          *time.Time      `json:"not_before,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
 }
 

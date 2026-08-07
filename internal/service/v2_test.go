@@ -232,6 +232,54 @@ func TestServeV2BacksOffTransientEvaluatorFailures(t *testing.T) {
 	}
 }
 
+func TestServeV2BacksOffRuntimeFailures(t *testing.T) {
+	stateRoot, worktree, outputRoot := t.TempDir(), t.TempDir(), t.TempDir()
+	for _, path := range []string{stateRoot, worktree, outputRoot} {
+		if err := os.Chmod(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := supervisor.Open(stateRoot, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.StartExecution(context.Background(), supervisor.StartExecutionInput{
+		NativeSession: supervisor.NativeSessionIdentity{Runtime: "test", ID: "runtime-retry-session"},
+		Prompt:        "retry safely", Runtime: supervisor.RuntimeSpec{Name: "test", Sandbox: supervisor.SandboxWorkspaceWrite},
+		Root: worktree, Authority: supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite},
+		Budget: supervisor.DefaultBudget(), IdempotencyKey: "runtime-retry-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := make(chan struct{}, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeV2(ctx, store, ServeOptions{
+			Interval: 100 * time.Millisecond, Workers: 1, OutputRoot: outputRoot, ActivityRetryDelay: time.Second,
+			RunActivity: func(context.Context, supervisor.ActivityID) error {
+				calls <- struct{}{}
+				return errors.New("persistent runtime failure")
+			},
+		}, nil)
+	}()
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime was never called")
+	}
+	select {
+	case <-calls:
+		t.Fatal("runtime failure was retried before its backoff elapsed")
+	case <-time.After(350 * time.Millisecond):
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func pendingGoalTurn(t *testing.T, model string) (*supervisor.Store, string) {
 	t.Helper()
 	stateRoot, worktree, outputRoot := t.TempDir(), t.TempDir(), t.TempDir()

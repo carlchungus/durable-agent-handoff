@@ -217,6 +217,17 @@ func TestCodexThreadStartedBindsSessionButDoesNotStartTurn(t *testing.T) {
 	}
 }
 
+func TestCodexDecoderPreservesRuntimeFailure(t *testing.T) {
+	decoder := Codex{}.NewDecoder()
+	if _, err := decoder.DecodeLine([]byte(`{"type":"turn.started"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := decoder.DecodeLine([]byte(`{"type":"error","message":"invalid response schema"}`))
+	if err == nil || !strings.Contains(err.Error(), "invalid response schema") {
+		t.Fatalf("runtime failure was hidden: %v", err)
+	}
+}
+
 func TestDecodersIgnoreNestedFakeSessionIDs(t *testing.T) {
 	tests := []struct {
 		name    string

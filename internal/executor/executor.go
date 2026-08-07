@@ -219,6 +219,7 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	stopping := false
 	startupFailureRecorded := false
 	var processErr error
+	var decodeFailure error
 
 waitLoop:
 	for {
@@ -226,11 +227,13 @@ waitLoop:
 		case processErr = <-waited:
 			stopDecoder()
 			if decodeErr := <-decodeErrors; decodeErr != nil && !(stopping && errors.Is(decodeErr, supervisor.ErrFenced)) {
+				decodeFailure = decodeErr
 				processErr = errors.Join(processErr, decodeErr)
 			}
 			break waitLoop
 		case decodeErr := <-decodeErrors:
 			if decodeErr != nil {
+				decodeFailure = decodeErr
 				_ = gated.Stop()
 				stopping = true
 				processErr = errors.Join(<-waited, decodeErr)
@@ -318,6 +321,12 @@ waitLoop:
 	code := 0
 	if command.ProcessState != nil {
 		code = command.ProcessState.ExitCode()
+	}
+	// A decoder failure is the runtime's useful terminal fact. The gated
+	// runner is expected to be signaled when we stop its contained process, so
+	// do not replace the provider error with that induced signal.
+	if code == -1 && decodeFailure != nil {
+		processErr = decodeFailure
 	}
 	// The gated runner's containment watchdog terminates its own process group
 	// after the target finishes, so the runner itself is normally observed as
@@ -536,4 +545,4 @@ func activityHasProviderUnavailable(state *supervisor.State, activityID supervis
 	return false
 }
 
-const resultSchema = `{"type":"object","required":["status","summary"],"properties":{"status":{"enum":["completed","continue","needs_human","blocked"]},"summary":{"type":"string"},"blocker_kind":{"type":"string"},"question":{"type":"string"}},"additionalProperties":false}`
+const resultSchema = `{"type":"object","required":["status","summary","blocker_kind","question"],"properties":{"status":{"type":"string","enum":["completed","continue","needs_human","blocked"]},"summary":{"type":"string"},"blocker_kind":{"type":"string"},"question":{"type":"string"}},"additionalProperties":false}`

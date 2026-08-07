@@ -31,6 +31,9 @@ type ServeOptions struct {
 	// DecisionRetryDelay bounds transient model failures. Pending turns remain
 	// durable and are retried after restart.
 	DecisionRetryDelay time.Duration
+	// ActivityRetryDelay prevents a persistent runtime failure from consuming
+	// the complete launch or turn budget in a tight service loop.
+	ActivityRetryDelay time.Duration
 	// RunActivity is a test seam for the service drain contract. Production
 	// callers leave it nil so the durable Executor is used.
 	RunActivity func(context.Context, supervisor.ActivityID) error
@@ -67,6 +70,9 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 	if options.DecisionRetryDelay <= 0 {
 		options.DecisionRetryDelay = 30 * time.Second
 	}
+	if options.ActivityRetryDelay <= 0 {
+		options.ActivityRetryDelay = 30 * time.Second
+	}
 	if err := ctx.Err(); err != nil {
 		return nil
 	}
@@ -77,6 +83,7 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 	var mu sync.Mutex
 	var activeWorkers sync.WaitGroup
 	active := map[supervisor.ActivityID]bool{}
+	activityRetryAt := map[supervisor.ActivityID]time.Time{}
 	activeDecisions := map[supervisor.ActivityID]bool{}
 	decisionRetryAt := map[supervisor.ActivityID]time.Time{}
 	run := func() {
@@ -165,7 +172,7 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 					return
 				}
 				mu.Lock()
-				if active[activityID] {
+				if active[activityID] || time.Now().Before(activityRetryAt[activityID]) {
 					mu.Unlock()
 					continue
 				}
@@ -179,11 +186,17 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 				activeWorkers.Add(1)
 				mu.Unlock()
 				go func(id supervisor.ActivityID) {
+					failed := false
 					defer func() {
 						activeWorkers.Done()
 						<-sem
 						mu.Lock()
 						delete(active, id)
+						if failed {
+							activityRetryAt[id] = time.Now().Add(options.ActivityRetryDelay)
+						} else {
+							delete(activityRetryAt, id)
+						}
 						mu.Unlock()
 					}()
 					var runErr error
@@ -194,7 +207,10 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 						runErr = runner.RunActivity(ctx, id)
 					}
 					if runErr != nil && logf != nil {
+						failed = true
 						logf("activity=%s error=%v", id, runErr)
+					} else if runErr != nil {
+						failed = true
 					}
 				}(activityID)
 			}

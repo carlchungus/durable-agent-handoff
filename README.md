@@ -83,7 +83,10 @@ handoff github merge --execution EXECUTION_ID --repo OWNER/REPO --pr 7 \
 `--environment-json` must be a regular mode-0600 JSON object. Values are read
 only at service startup and passed to drivers without being persisted. Service
 units contain only argv, the private state root, the environment-file path,
-and trust mode.
+and trust mode. On every service start, inherited Attempts are reconciled before
+the queue is scheduled: dead or prepared orphans receive durable terminal exit
+evidence and release their exact writer Lease. An exact live orphan fails
+closed because Supervisor v2 does not guess at runtime adoption.
 
 ## Migration
 

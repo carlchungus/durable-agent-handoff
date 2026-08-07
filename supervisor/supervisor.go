@@ -70,8 +70,6 @@ type (
 	ExecutionView              = internal.ExecutionView
 	NodeView                   = internal.NodeView
 	ActivityView               = internal.ActivityView
-	ActivityWorkView           = internal.ActivityWorkView
-	ActivityControlView        = internal.ActivityControlView
 	AttemptView                = internal.AttemptView
 	ActivityStatus             = internal.ActivityStatus
 	ProcessHealth              = internal.ProcessHealth
@@ -127,4 +125,5 @@ var (
 	ErrFenced              = internal.ErrFenced
 	ErrLeaseHeld           = internal.ErrLeaseHeld
 	ErrPausePending        = internal.ErrPausePending
+	ErrLiveOrphan          = internal.ErrLiveOrphan
 )

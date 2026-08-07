@@ -550,6 +550,9 @@ func (c prepareAttemptCommand) decide(state *State, now time.Time) ([]DomainEven
 	if resultForActivity(state, activity.ID) != nil {
 		return nil, "", errors.New("completed Activity is immutable")
 	}
+	if fallbackChildForActivity(state, activity.ID) != nil {
+		return nil, "", ErrFenced
+	}
 	if strings.TrimSpace(in.CommandDigest) == "" || strings.TrimSpace(in.Outputs.Stdout) == "" || strings.TrimSpace(in.Outputs.Stderr) == "" {
 		return nil, "", errors.New("attempt requires command digest and exact output identities")
 	}
@@ -1071,12 +1074,7 @@ func attemptCounts(state *State, workflowID WorkflowID, nodeID NodeID) (launches
 	return
 }
 func attemptTerminal(attempt *Attempt) bool {
-	for _, m := range attempt.Milestones {
-		if m.Kind == MilestoneExit || m.Kind == MilestoneAdapterStartFailed || m.Kind == MilestoneProviderUnavailable {
-			return true
-		}
-	}
-	return false
+	return attemptHasExit(attempt)
 }
 
 func attemptHasExit(attempt *Attempt) bool {

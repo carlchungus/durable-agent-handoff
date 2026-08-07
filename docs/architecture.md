@@ -109,6 +109,13 @@ including adapter startup failures and provider-unavailable exits. Typed
 fallback candidates remain part of Work and are selected from journaled
 provider-unavailable evidence without widening sandbox authority.
 
+Service startup runs one authority-owned recovery command before scheduling. It
+validates each inherited nonterminal Attempt against its exact PID and process
+start token. A dead or prepared orphan is durably recorded with typed terminal
+milestones and its exact Lease is released; an exact live orphan fails closed
+until a safe adoption protocol exists. Projections never perform this work and
+polling never appends recovery state.
+
 The task-attempt budget counts Attempts containing `turn_started`. Pre-turn
 failures consume only the independent launch budget; there are no refunds.
 

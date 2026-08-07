@@ -1,8 +1,6 @@
 package supervisor
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"os"
 	"sort"
 	"time"
@@ -70,48 +68,16 @@ type AttemptView struct {
 	Overhead            Overhead      `json:"orchestration_overhead"`
 }
 
-// ActivityWorkView is the compatibility-safe activity envelope. It contains
-// routing metadata used by cloud clients, but deliberately omits WorkSpec's
-// prompt and runtime launch details.
-type ActivityWorkView struct {
-	Kind   string `json:"kind,omitempty"`
-	Cwd    string `json:"cwd,omitempty"`
-	Intent string `json:"intent,omitempty"`
-}
-
-type ActivityControlView struct {
-	ID                 ControlID `json:"id"`
-	Kind               string    `json:"kind"`
-	ExpectedGeneration uint64    `json:"expected_generation"`
-	ExpectedAttempt    AttemptID `json:"expected_attempt"`
-	Outcome            string    `json:"outcome"`
-	Reason             string    `json:"reason,omitempty"`
-	CreatedAt          time.Time `json:"created_at"`
-	AppliedAt          time.Time `json:"applied_at,omitempty"`
-}
-
 type ActivityView struct {
-	Version            int                   `json:"version"`
-	ID                 ActivityID            `json:"id"`
-	NodeID             NodeID                `json:"node_id"`
-	SessionID          SessionID             `json:"session_id"`
-	OwnerSessionID     SessionID             `json:"owner_session_id,omitempty"`
-	WorkDigest         string                `json:"work_digest"`
-	Generation         uint64                `json:"generation"`
-	ParentActivityID   ActivityID            `json:"parent_activity_id,omitempty"`
-	Status             ActivityStatus        `json:"status"`
-	State              ActivityStatus        `json:"state"`
-	Revision           uint64                `json:"revision"`
-	Work               ActivityWorkView      `json:"work"`
-	Attempts           []AttemptView         `json:"attempts,omitempty"`
-	Controls           []ActivityControlView `json:"controls,omitempty"`
-	CreatedAt          time.Time             `json:"created_at"`
-	UpdatedAt          time.Time             `json:"updated_at"`
-	DependencyBindings []ResultBinding       `json:"dependency_bindings,omitempty"`
-	AttemptIDs         []AttemptID           `json:"attempt_ids,omitempty"`
-	ResultID           ResultID              `json:"result_id,omitempty"`
-	QueuePosition      int                   `json:"queue_position,omitempty"`
-	Verification       VerificationState     `json:"verification"`
+	ID                 ActivityID        `json:"id"`
+	NodeID             NodeID            `json:"node_id"`
+	SessionID          SessionID         `json:"session_id"`
+	Generation         uint64            `json:"generation"`
+	ParentActivityID   ActivityID        `json:"parent_activity_id,omitempty"`
+	Status             ActivityStatus    `json:"status"`
+	DependencyBindings []ResultBinding   `json:"dependency_bindings,omitempty"`
+	ResultID           ResultID          `json:"result_id,omitempty"`
+	Verification       VerificationState `json:"verification"`
 }
 
 type NodeStatus string
@@ -161,21 +127,11 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 	}
 	workflow := state.Workflows[execution.WorkflowID]
 	view := &ExecutionView{ID: execution.ID, WorkflowID: workflow.ID, AsOf: asOf.UTC()}
-	activityViews := make(map[ActivityID]*ActivityView)
 	for _, activity := range orderedActivities(state, workflow.ID) {
 		item := projectActivity(state, activity)
-		activityViews[activity.ID] = &item
 		view.Activities = append(view.Activities, item)
-		if item.Status == ActivityQueued || item.Status == ActivityRetryable {
+		if (item.Status == ActivityQueued || item.Status == ActivityRetryable) && fallbackChildForActivity(state, activity.ID) == nil {
 			view.Queue = append(view.Queue, item.ID)
-		}
-	}
-	for index, id := range view.Queue {
-		activityViews[id].QueuePosition = index + 1
-		for i := range view.Activities {
-			if view.Activities[i].ID == id {
-				view.Activities[i].QueuePosition = index + 1
-			}
 		}
 	}
 	taskOrdinals := map[NodeID]int{}
@@ -233,38 +189,12 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 }
 
 func projectActivity(state *State, activity *Activity) ActivityView {
-	view := ActivityView{Version: SchemaVersion, ID: activity.ID, NodeID: activity.NodeID, SessionID: activity.SessionID, OwnerSessionID: activity.SessionID, Generation: activity.Generation, ParentActivityID: activity.ParentActivityID, State: legacyActivityState(ActivityQueued), Revision: state.Sequence, CreatedAt: activity.CreatedAt, UpdatedAt: activity.CreatedAt, DependencyBindings: append([]ResultBinding(nil), activity.DependencyBindings...), Verification: VerificationPending}
-	if workflow := state.Workflows[activity.WorkflowID]; workflow != nil {
-		if node := workflow.Nodes[activity.NodeID]; node != nil {
-			view.Work = ActivityWorkView{Kind: node.Work.Kind, Cwd: node.Work.Root, Intent: node.Title}
-			view.WorkDigest = safeWorkDigest(view.Work)
-		}
-	}
-	for _, attempt := range orderedAttemptsForActivity(state, activity.ID) {
-		view.Attempts = append(view.Attempts, projectAttempt(attempt))
-		if latest := attemptViewLatestAt(attempt); latest.After(view.UpdatedAt) {
-			view.UpdatedAt = latest
-		}
-	}
-	for _, control := range state.Controls {
-		if control.ActivityID != activity.ID {
-			continue
-		}
-		outcome := "rejected"
-		if control.Accepted {
-			outcome = "accepted"
-		}
-		if !control.AppliedAt.IsZero() {
-			outcome = "applied"
-		}
-		view.Controls = append(view.Controls, ActivityControlView{ID: control.ID, Kind: control.Kind, ExpectedGeneration: control.ExpectedGeneration, ExpectedAttempt: control.ExpectedAttemptID, Outcome: outcome, Reason: control.Reason, CreatedAt: control.CreatedAt, AppliedAt: control.AppliedAt})
-	}
+	view := ActivityView{ID: activity.ID, NodeID: activity.NodeID, SessionID: activity.SessionID, Generation: activity.Generation, ParentActivityID: activity.ParentActivityID, Status: ActivityQueued, DependencyBindings: append([]ResultBinding(nil), activity.DependencyBindings...), Verification: VerificationPending}
 	// A provider-unavailable parent is superseded by its durable child Session.
 	// Keep the parent visible for lineage, but never return it to the scheduler.
 	if child := fallbackChildForActivity(state, activity.ID); child != nil {
 		childView := projectActivity(state, child)
 		view.Status = childView.Status
-		view.State = childView.State
 		view.ResultID = childView.ResultID
 		view.Verification = childView.Verification
 		return view
@@ -281,23 +211,19 @@ func projectActivity(state *State, activity *Activity) ActivityView {
 		default:
 			view.Status = ActivityCompleted
 		}
-		view.State = legacyActivityState(view.Status)
 		return view
 	}
 	if state.Pauses[activity.WorkflowID] != nil {
 		view.Status = ActivityPaused
-		view.State = legacyActivityState(view.Status)
 		return view
 	}
 	for _, attempt := range orderedAttemptsForActivity(state, activity.ID) {
-		view.AttemptIDs = append(view.AttemptIDs, attempt.ID)
 		if !attemptTerminal(attempt) {
 			if hasMilestone(attempt, MilestoneTurnStarted) {
 				view.Status = ActivityRunning
 			} else {
 				view.Status = ActivityStarting
 			}
-			view.State = legacyActivityState(view.Status)
 			return view
 		}
 	}
@@ -311,7 +237,6 @@ func projectActivity(state *State, activity *Activity) ActivityView {
 	default:
 		view.Status = ActivityFailed
 	}
-	view.State = legacyActivityState(view.Status)
 	return view
 }
 
@@ -356,38 +281,14 @@ func projectAttempt(attempt *Attempt) AttemptView {
 	return view
 }
 
-func legacyActivityState(status ActivityStatus) ActivityStatus {
-	switch status {
-	case ActivityQueued, ActivityRetryable:
-		return ActivityStatus("pending")
-	case ActivityPaused:
-		return ActivityStatus("stopping")
-	case ActivityBlocked, ActivityFailed:
-		return ActivityStatus("failed")
-	default:
-		return status
-	}
-}
-
-func safeWorkDigest(work ActivityWorkView) string {
-	sum := sha256.Sum256([]byte(work.Kind + "\x00" + work.Cwd + "\x00" + work.Intent))
-	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
-func attemptViewLatestAt(attempt *Attempt) time.Time {
-	latest := attempt.CreatedAt
-	for _, milestone := range attempt.Milestones {
-		if milestone.At.After(latest) {
-			latest = milestone.At
-		}
-	}
-	return latest
-}
-
 func fallbackChildForActivity(state *State, parentID ActivityID) *Activity {
+	parent := state.Activities[parentID]
+	if parent == nil {
+		return nil
+	}
 	var child *Activity
 	for _, candidate := range state.Activities {
-		if candidate.ParentActivityID != parentID {
+		if candidate.ParentActivityID != parentID || candidate.SessionID == parent.SessionID {
 			continue
 		}
 		if child == nil || candidate.CreatedAt.Before(child.CreatedAt) || candidate.CreatedAt.Equal(child.CreatedAt) && candidate.ID < child.ID {

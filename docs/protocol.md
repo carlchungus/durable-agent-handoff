@@ -62,6 +62,7 @@ interface:
 | `PauseWorkflow` | records exact controls and enters requested/draining; executor-applied terminal exits release Leases |
 | `SettlePause` | idempotently marks a draining pause completed after every fenced Attempt has exited |
 | `ApplyControl` | records that an executor applied one exact Activity-generation/Attempt control |
+| `ReconcileStartup` | validates inherited exact process identities; terminalizes dead/prepared orphans and releases their exact Leases, or fails closed on an exact live orphan |
 | `ImportV1` | one deterministic one-way legacy import transaction |
 
 Every mutating call requires an idempotency key of 8–256 safe characters.
@@ -71,7 +72,8 @@ runtime field on the original Session: when the selected provider differs, the
 executor records a child Session and child Activity with the parent identity,
 then binds the child's exact native Session ID. The original Session remains
 immutable and exact continuations target whichever bound Session owns the
-predecessor Activity.
+predecessor Activity. Once the child exists, the parent remains visible only as
+lineage and is excluded from Queue and fenced from Attempt preparation.
 
 Publication is an authority-owned durable effect. `PrepareFinalization` records
 the exact PR, head SHA, named gates, approval, and idempotency key. Only after
@@ -114,6 +116,18 @@ Attestation source verdicts use the exact allowlist:
 
 `Store.Projection`, `Store.View`, and `Store.Events` are pure reads. They never
 reconcile, adopt, deliver inbox messages, change health, or append an event.
+
+The typed `ActivityView` is intentionally minimal: clients read lifecycle from
+`Status`, identity/generation, immutable dependency bindings, result identity,
+and verification. Attempt and Control projections live at the execution level;
+legacy aliases and compatibility envelopes are not part of v2.
+
+`ReconcileStartup` is the explicit restart boundary. It runs once before
+`ServeV2` schedules work, under the journal transaction. Prepared-but-never-
+spawned Attempts are inherited orphans. Dead Attempts receive existing typed
+failure/exit facts plus exact Lease release so their immutable Activity can
+retry. An exact live PID/start-token match returns `ErrLiveOrphan` and the
+service refuses to schedule until an explicit adoption protocol is available.
 
 `Store.View(executionID, asOf)` returns one `ExecutionView` containing the Node,
 Activity, Attempt, queue, verification, publication, and overhead projections.
@@ -175,6 +189,8 @@ mode-0600 file containing one JSON object, and `--trust-mode workspace|full`.
 The file is read into transient driver environment values. Prompts and secret
 values are never serialized into a service unit. Drivers apply trust flags
 themselves and execute provider argv directly, without shell wrappers.
+Service cancellation waits for all active executor goroutines to record their
+terminal milestones and release their exact Leases before returning.
 
 ## One-way migration
 

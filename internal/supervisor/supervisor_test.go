@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
+	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 )
 
 func safeDir(t *testing.T) string {
@@ -64,6 +66,18 @@ func milestone(t *testing.T, store *Store, activity *Activity, attempt *Attempt,
 	}
 }
 
+func hasAttemptMilestone(attempt *Attempt, kind MilestoneKind) bool {
+	if attempt == nil {
+		return false
+	}
+	for _, milestone := range attempt.Milestones {
+		if milestone.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
 func completeActivity(t *testing.T, store *Store, activity *Activity, key string) *Result {
 	t.Helper()
 	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, key+"-prepare")
@@ -114,7 +128,7 @@ func TestStartExecutionIsAtomicAndIdempotent(t *testing.T) {
 func TestThreadStartedWithoutTurnRemainsStarting(t *testing.T) {
 	store, _, worktree := openTestStore(t, Options{})
 	execution := startTestExecution(t, store, worktree, "thread-hang-start", DefaultBudget())
-	state, _ := store.Projection()
+	state, err := store.Projection()
 	activity := state.Activities[execution.FirstActivity]
 	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "thread-hang-prepare")
 	milestone(t, store, activity, attempt, "thread-hang-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 9, StartToken: "exact-birth"}})
@@ -130,6 +144,172 @@ func TestThreadStartedWithoutTurnRemainsStarting(t *testing.T) {
 	rendered := RenderText(view)
 	if !strings.Contains(rendered, "health=starting") || strings.Contains(rendered, "output") || strings.Contains(rendered, "health=running") {
 		t.Fatalf("human view invented lifecycle/progress: %s", rendered)
+	}
+}
+
+func TestStartupReconcileDeadOrphanReleasesLeaseAndQueuesRetry(t *testing.T) {
+	store, stateRoot, worktree := openTestStore(t, Options{})
+	execution := startTestExecution(t, store, worktree, "dead-orphan-start", DefaultBudget())
+	state, _ := store.Projection()
+	activity := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "dead-orphan-attempt")
+	milestone(t, store, activity, attempt, "dead-orphan-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: os.Getpid(), StartToken: "stale-process-incarnation"}})
+	restarted, err := Open(stateRoot, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = restarted.ReconcileStartup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, err = restarted.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := state.Attempts[attempt.ID]
+	if !hasAttemptMilestone(recovered, MilestoneExit) || state.Leases[attempt.LeaseID] == nil || state.Leases[attempt.LeaseID].ReleasedAt.IsZero() {
+		t.Fatalf("dead orphan was not terminalized and released: attempt=%+v lease=%+v", recovered, state.Leases[attempt.LeaseID])
+	}
+	view, err := restarted.View(execution.ID, time.Now())
+	if err != nil || len(view.Queue) != 1 || view.Queue[0] != activity.ID {
+		t.Fatalf("dead orphan did not return immutable Activity to queue: view=%+v err=%v", view, err)
+	}
+	sequence := state.Sequence
+	if err = restarted.ReconcileStartup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, _ = restarted.Projection()
+	if state.Sequence != sequence {
+		t.Fatalf("startup reconciliation appended state after all orphans were terminal: before=%d after=%d", sequence, state.Sequence)
+	}
+	if _, _, err = restarted.PrepareAttempt(context.Background(), PrepareAttemptInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, CommandDigest: "retry-after-orphan", Outputs: OutputIdentity{Stdout: "retry-stdout", Stderr: "retry-stderr"}, IdempotencyKey: "dead-orphan-retry"}); err != nil {
+		t.Fatalf("released orphan lease did not permit retry: %v", err)
+	}
+}
+
+func TestStartupReconcilePreparedOrphanIsTerminalizedAndRetryable(t *testing.T) {
+	store, stateRoot, worktree := openTestStore(t, Options{})
+	execution := startTestExecution(t, store, worktree, "prepared-orphan-start", DefaultBudget())
+	state, _ := store.Projection()
+	activity := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "prepared-orphan-attempt")
+	restarted, err := Open(stateRoot, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = restarted.ReconcileStartup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, err = restarted.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := state.Attempts[attempt.ID]
+	if len(recovered.Milestones) != 2 || !hasAttemptMilestone(recovered, MilestoneAdapterStartFailed) || !hasAttemptMilestone(recovered, MilestoneExit) || state.Leases[attempt.LeaseID].ReleasedAt.IsZero() {
+		t.Fatalf("prepared orphan recovery=%+v lease=%+v", recovered, state.Leases[attempt.LeaseID])
+	}
+	view, err := restarted.View(execution.ID, time.Now())
+	if err != nil || len(view.Queue) != 1 || view.Queue[0] != activity.ID {
+		t.Fatalf("prepared orphan did not become retryable: view=%+v err=%v", view, err)
+	}
+}
+
+func TestSupervisorLiveOrphanHelper(t *testing.T) {
+	if !strings.Contains(strings.Join(os.Args, " "), "supervisor-live-orphan-helper") {
+		return
+	}
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
+func TestStartupReconcileFailsClosedForExactLiveOrphan(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestSupervisorLiveOrphanHelper", "--supervisor-live-orphan-helper")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	token := ""
+	for time.Now().Before(deadline) && token == "" {
+		token = runstate.ProcessStartToken(cmd.Process.Pid)
+		if token == "" {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if token == "" {
+		t.Fatal("live orphan helper did not expose a process start token")
+	}
+	store, _, worktree := openTestStore(t, Options{})
+	execution := startTestExecution(t, store, worktree, "live-orphan-start", DefaultBudget())
+	state, err := store.Projection()
+	activity := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "live-orphan-attempt")
+	milestone(t, store, activity, attempt, "live-orphan-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: cmd.Process.Pid, StartToken: token}})
+	state, err = store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := state.Sequence
+	if err := store.ReconcileStartup(context.Background()); !errors.Is(err, ErrLiveOrphan) {
+		t.Fatalf("exact live orphan did not fail closed: %v", err)
+	}
+	state, err = store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Sequence != before || hasAttemptMilestone(state.Attempts[attempt.ID], MilestoneExit) {
+		t.Fatalf("live orphan reconciliation mutated or terminalized an exact live process: before=%d after=%d attempt=%+v", before, state.Sequence, state.Attempts[attempt.ID])
+	}
+	view, err := store.View(execution.ID, time.Now())
+	if err != nil || len(view.Queue) != 0 {
+		t.Fatalf("live orphan was schedulable after fail-closed recovery: view=%+v err=%v", view, err)
+	}
+}
+
+func TestFallbackChildIsOnlyQueueEntryBeforeChildPreparation(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	primary := RuntimeSpec{Name: "primary", Sandbox: SandboxWorkspaceWrite}
+	fallback := RuntimeSpec{Name: "fallback", Sandbox: SandboxWorkspaceWrite}
+	execution, _, err := store.StartExecution(context.Background(), StartExecutionInput{NativeSession: NativeSessionIdentity{Runtime: primary.Name}, Prompt: "fallback", Runtime: primary, Fallbacks: []RuntimeSpec{fallback}, Root: worktree, Authority: AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite}, Budget: DefaultBudget(), IdempotencyKey: "fallback-queue-start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := store.Projection()
+	parent := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, parent.ID, parent.Generation, "fallback-parent-attempt")
+	milestone(t, store, parent, attempt, "fallback-parent-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 42424, StartToken: "fallback-parent"}})
+	milestone(t, store, parent, attempt, "fallback-parent-provider", Milestone{Kind: MilestoneProviderUnavailable, Failure: "primary unavailable"})
+	milestone(t, store, parent, attempt, "fallback-parent-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 1}})
+	child, _, err := store.StartFallbackActivity(context.Background(), StartFallbackActivityInput{ParentActivityID: parent.ID, Runtime: fallback, IdempotencyKey: "fallback-child-create"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.View(execution.ID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Queue) != 1 || view.Queue[0] != child.ID {
+		t.Fatalf("fallback parent and child queue overlap before child preparation: queue=%v activities=%+v", view.Queue, view.Activities)
+	}
+	if _, _, err = store.PrepareAttempt(context.Background(), PrepareAttemptInput{ActivityID: parent.ID, ExpectedGeneration: parent.Generation, Runtime: primary, CommandDigest: "parent-after-fallback", Outputs: OutputIdentity{Stdout: "parent-after-fallback-out", Stderr: "parent-after-fallback-err"}, IdempotencyKey: "fallback-parent-rejected"}); !errors.Is(err, ErrFenced) {
+		t.Fatalf("superseded fallback parent remained launchable: %v", err)
+	}
+	childAttempt, _, err := store.PrepareAttempt(context.Background(), PrepareAttemptInput{ActivityID: child.ID, ExpectedGeneration: child.Generation, Runtime: fallback, CommandDigest: "fallback-child", Outputs: OutputIdentity{Stdout: "fallback-child-out", Stderr: "fallback-child-err"}, IdempotencyKey: "fallback-child-prepare"})
+	if err != nil {
+		t.Fatalf("fallback child could not acquire the released exact writer lease: %v", err)
+	}
+	state, _ = store.Projection()
+	active := 0
+	for _, lease := range state.Leases {
+		if lease.ReleasedAt.IsZero() {
+			active++
+		}
+	}
+	if active != 1 || state.Leases[childAttempt.LeaseID].AttemptID != childAttempt.ID {
+		t.Fatalf("fallback preparation did not leave one child-owned writer lease: active=%d leases=%+v", active, state.Leases)
 	}
 }
 

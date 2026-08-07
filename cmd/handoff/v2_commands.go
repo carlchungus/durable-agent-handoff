@@ -790,7 +790,15 @@ func cmdV2Activity(args []string, out io.Writer) error {
 			return writeJSON(out, activities)
 		}
 		for _, activity := range activities {
-			fmt.Fprintf(out, "%s generation=%d status=%s attempts=%d\n", activity.ID, activity.Generation, activity.Status, len(activity.AttemptIDs))
+			attempts := 0
+			for _, view := range views {
+				for _, attempt := range view.Attempts {
+					if attempt.ActivityID == activity.ID {
+						attempts++
+					}
+				}
+			}
+			fmt.Fprintf(out, "%s generation=%d status=%s attempts=%d\n", activity.ID, activity.Generation, activity.Status, attempts)
 		}
 		return nil
 	}

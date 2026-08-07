@@ -101,8 +101,13 @@ func TestStatusListReplyAndPauseUseSupervisorProjection(t *testing.T) {
 		t.Fatalf("activity projection leaked prompt or failed: output=%s err=%v", out.String(), err)
 	}
 	var activities []supervisor.ActivityView
-	if err := json.Unmarshal(out.Bytes(), &activities); err != nil || len(activities) == 0 || activities[0].State == "" || activities[0].Revision == 0 || activities[0].Work.Cwd == "" {
-		t.Fatalf("cloud activity shape missing active-state fields: activities=%+v err=%v", activities, err)
+	if err := json.Unmarshal(out.Bytes(), &activities); err != nil || len(activities) == 0 || activities[0].Status == "" {
+		t.Fatalf("cloud activity shape missing v2 status: activities=%+v err=%v", activities, err)
+	}
+	for _, legacyField := range []string{`"version"`, `"state"`, `"revision"`, `"work"`, `"work_digest"`, `"attempts"`, `"controls"`, `"created_at"`, `"updated_at"`, `"owner_session_id"`, `"attempt_ids"`} {
+		if strings.Contains(out.String(), legacyField) {
+			t.Fatalf("legacy Activity compatibility field leaked into v2 projection: field=%s output=%s", legacyField, out.String())
+		}
 	}
 }
 

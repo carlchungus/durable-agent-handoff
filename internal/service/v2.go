@@ -20,11 +20,12 @@ import (
 // are read by the CLI from a private mode-0600 file and are passed to Drivers
 // only at launch; they are never persisted in the journal or service unit.
 type ServeOptions struct {
-	Interval    time.Duration
-	Workers     int
-	Environment []string
-	TrustMode   driver.TrustMode
-	OutputRoot  string
+	Interval        time.Duration
+	Workers         int
+	Environment     []string
+	TrustMode       driver.TrustMode
+	OutputRoot      string
+	StartupDeadline time.Duration
 }
 
 // ServeV2 schedules only queued Activities from the Supervisor projection.
@@ -47,6 +48,9 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 	}
 	if options.OutputRoot == "" {
 		return errors.New("output root is required")
+	}
+	if options.StartupDeadline <= 0 {
+		options.StartupDeadline = 30 * time.Second
 	}
 	sem := make(chan struct{}, options.Workers)
 	var mu sync.Mutex
@@ -81,7 +85,7 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 						delete(active, id)
 						mu.Unlock()
 					}()
-					runner := &executor.Executor{Store: store, OutputRoot: options.OutputRoot, Drivers: driver.Lookup, Environment: options.Environment, TrustMode: options.TrustMode}
+					runner := &executor.Executor{Store: store, OutputRoot: options.OutputRoot, Drivers: driver.Lookup, Environment: options.Environment, TrustMode: options.TrustMode, StartupDeadline: options.StartupDeadline}
 					if err := runner.RunActivity(ctx, id); err != nil && logf != nil {
 						logf("activity=%s error=%v", id, err)
 					}

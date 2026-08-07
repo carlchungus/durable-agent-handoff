@@ -125,9 +125,9 @@ func jsonEncoder(out io.Writer) *json.Encoder {
 const usage = `handoff — Supervisor v2 durable execution
 
 Usage:
-  handoff start --session EXACT_ID --runtime codex --prompt TEXT --idempotency-key KEY --authorized-by HUMAN
+  handoff start [--session EXACT_ID] --runtime codex --prompt TEXT --idempotency-key KEY --authorized-by HUMAN
   handoff execution start --file - --json
-  handoff execution pause --workflow ID --json
+  handoff execution pause --workflow ID --timeout 30s --json
   handoff status [EXECUTION_ID] [--json]
   handoff list [--json]
   handoff run WORKFLOW_ID [--once]

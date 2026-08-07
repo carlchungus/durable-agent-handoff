@@ -67,6 +67,16 @@ func (r *processTreeReservation) bind(pid int, _ string) (string, error) {
 
 func (r *processTreeReservation) close() {}
 
+func (r *processTreeReservation) closeWithError() error { return nil }
+
+func (r *processTreeReservation) stop(pid int) error {
+	err := syscall.Kill(-pid, syscall.SIGKILL)
+	if err == syscall.ESRCH {
+		return nil
+	}
+	return err
+}
+
 func ConfigureBackgroundProcess(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }

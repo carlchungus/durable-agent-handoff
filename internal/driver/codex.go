@@ -31,7 +31,11 @@ func (Codex) Build(request LaunchRequest) (Launch, error) {
 	if request.ResultPath != "" {
 		args = append(args, "-o", request.ResultPath)
 	}
-	args = append(args, "resume", request.Session.ID, "-")
+	if strings.TrimSpace(request.Session.ID) != "" {
+		args = append(args, "resume", request.Session.ID, "-")
+	} else {
+		args = append(args, "-")
+	}
 	return Launch{Executable: fallback(request.Runtime.Executable, "codex"), Args: args, PromptOnStdin: true}, nil
 }
 

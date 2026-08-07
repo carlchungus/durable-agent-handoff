@@ -282,4 +282,5 @@ var (
 	ErrIdempotencyConflict = errors.New("idempotency conflict")
 	ErrFenced              = errors.New("command fenced by newer supervisor state")
 	ErrLeaseHeld           = errors.New("canonical worktree writer lease is held")
+	ErrPausePending        = errors.New("pause is still draining")
 )

@@ -25,9 +25,10 @@ human / scheduler / runtime Driver / finalizer
 ```
 
 The public Go seam is `github.com/carlchungus/durable-agent-handoff/supervisor`.
-Its `Store.StartExecution` method accepts the exact native Session identity,
+Its `Store.StartExecution` method accepts an optional native Session identity,
 prompt, RuntimeSpec, root, authority and finalizer configuration, budget, and
-idempotency key. This is the seam arca-cloud promotion calls.
+idempotency key. Ordinary starts create an unbound Session; the arca-cloud
+promotion seam supplies the exact resume identity and requires it.
 
 ## One journal, distinct identities
 
@@ -36,8 +37,9 @@ observation are different resources.
 
 - **Workflow** owns desired Nodes, dependency declarations, root, budgets, and
   authority/finalizer configuration.
-- **Session** owns the exact opaque native runtime identity, lineage, and root.
-  It never owns a PID, output pipe, or process state.
+- **Session** owns the exact opaque native runtime identity once bound, lineage,
+  and root. Ordinary new-session starts persist an unbound identity first; it
+  never owns a PID, output pipe, or process state.
 - **Activity** owns one immutable logical result generation, prompt, Session,
   and exact dependency Result bindings.
 - **Attempt** owns one immutable OS launch plus its ordered typed milestones,
@@ -103,7 +105,9 @@ bound the predecessor Result keeps that binding.
 
 Preparing an Attempt records its immutable launch identity and exact output
 identities before an OS process is allowed to run. Every launch is retained,
-including adapter startup failures and provider-unavailable exits.
+including adapter startup failures and provider-unavailable exits. Typed
+fallback candidates remain part of Work and are selected from journaled
+provider-unavailable evidence without widening sandbox authority.
 
 The task-attempt budget counts Attempts containing `turn_started`. Pre-turn
 failures consume only the independent launch budget; there are no refunds.
@@ -168,9 +172,10 @@ Activity ID + Activity generation + Attempt ID
 
 At most one unreleased writer Lease may exist for a canonical path across all
 workflows, schedulers, and symlink aliases. A stale generation, Attempt, or
-Lease cannot record milestones or apply a Control. The exact terminal Attempt
-releases its Lease. A queued continuation waits instead of overlapping an
-already-running successor.
+Lease cannot record milestones or apply a Control. Pause controls enter a
+draining phase; only an executor-applied terminal `exit` releases a Lease,
+after which a separate idempotent settle command marks the pause complete. A
+queued continuation waits instead of overlapping an already-running successor.
 
 ## Pure projections
 

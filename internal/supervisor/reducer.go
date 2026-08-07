@@ -23,7 +23,9 @@ const (
 	eventMessageSettled      = "message.settled"
 	eventLeaseReleased       = "lease.released"
 	eventControlRecorded     = "control.recorded"
+	eventControlApplied      = "control.applied"
 	eventWorkflowPaused      = "workflow.paused"
+	eventPauseSettled        = "workflow.pause_settled"
 	eventLegacyImported      = "legacy.imported"
 )
 
@@ -96,8 +98,18 @@ type controlRecordedEvent struct {
 	Control *Control `json:"control"`
 }
 
+type controlAppliedEvent struct {
+	ControlID ControlID `json:"control_id"`
+	At        time.Time `json:"at"`
+}
+
 type workflowPausedEvent struct {
 	Pause *Pause `json:"pause"`
+}
+
+type pauseSettledEvent struct {
+	WorkflowID  WorkflowID `json:"workflow_id"`
+	CompletedAt time.Time  `json:"completed_at"`
 }
 
 type legacyImportedEvent struct {
@@ -220,6 +232,20 @@ func applyDomainEvent(state *State, domain DomainEvent) error {
 			process := *data.Milestone.Process
 			attempt.Process = &process
 		}
+		if data.Milestone.Kind == MilestoneSessionBound {
+			activity := state.Activities[attempt.ActivityID]
+			if activity == nil || data.Milestone.Session == nil {
+				return errors.New("session binding targets an invalid activity")
+			}
+			session := state.Sessions[activity.SessionID]
+			if session == nil {
+				return errors.New("session binding targets an unknown session")
+			}
+			if session.Native.ID != "" && session.Native != *data.Milestone.Session {
+				return errors.New("session binding changes an immutable native identity")
+			}
+			session.Native = *data.Milestone.Session
+		}
 	case eventResultCreated:
 		var data resultCreatedEvent
 		if err := json.Unmarshal(domain.Data, &data); err != nil {
@@ -285,6 +311,13 @@ func applyDomainEvent(state *State, domain DomainEvent) error {
 			return errors.New("lease release targets an inactive lease")
 		}
 		lease.ReleasedAt = data.At
+		for _, pause := range state.Pauses {
+			for _, attemptID := range pause.FencedAttemptIDs {
+				if attemptID == lease.AttemptID && !containsLease(pause.ReleasedLeaseIDs, lease.ID) {
+					pause.ReleasedLeaseIDs = append(pause.ReleasedLeaseIDs, lease.ID)
+				}
+			}
+		}
 	case eventControlRecorded:
 		var data controlRecordedEvent
 		if err := json.Unmarshal(domain.Data, &data); err != nil {
@@ -294,15 +327,46 @@ func applyDomainEvent(state *State, domain DomainEvent) error {
 			return errors.New("control event is incomplete or duplicate")
 		}
 		state.Controls[data.Control.ID] = cloneControl(data.Control)
+	case eventControlApplied:
+		var data controlAppliedEvent
+		if err := json.Unmarshal(domain.Data, &data); err != nil {
+			return err
+		}
+		control := state.Controls[data.ControlID]
+		if control == nil || !control.Accepted || !control.AppliedAt.IsZero() || data.At.IsZero() {
+			return errors.New("control application targets an invalid control")
+		}
+		control.AppliedAt = data.At
 	case eventWorkflowPaused:
 		var data workflowPausedEvent
 		if err := json.Unmarshal(domain.Data, &data); err != nil {
 			return err
 		}
-		if data.Pause == nil || data.Pause.WorkflowID == "" || data.Pause.CompletedAt.IsZero() || state.Workflows[data.Pause.WorkflowID] == nil || state.Pauses[data.Pause.WorkflowID] != nil {
+		// V2 journals written before draining pauses had no Phase field and
+		// released leases in this event. Preserve replay readability by treating
+		// their completed timestamp as the old terminal pause state.
+		if data.Pause != nil && data.Pause.Phase == "" {
+			if data.Pause.CompletedAt.IsZero() {
+				data.Pause.Phase = PauseDraining
+			} else {
+				data.Pause.Phase = PauseCompleted
+			}
+		}
+		if data.Pause == nil || data.Pause.WorkflowID == "" || data.Pause.Phase == "" || state.Workflows[data.Pause.WorkflowID] == nil || state.Pauses[data.Pause.WorkflowID] != nil {
 			return errors.New("pause event is incomplete, unknown, or duplicate")
 		}
 		state.Pauses[data.Pause.WorkflowID] = clonePause(data.Pause)
+	case eventPauseSettled:
+		var data pauseSettledEvent
+		if err := json.Unmarshal(domain.Data, &data); err != nil {
+			return err
+		}
+		pause := state.Pauses[data.WorkflowID]
+		if pause == nil || pause.Phase == PauseCompleted || data.CompletedAt.IsZero() {
+			return errors.New("pause settlement targets an invalid pause")
+		}
+		pause.Phase = PauseCompleted
+		pause.CompletedAt = data.CompletedAt
 	case eventLegacyImported:
 		var data legacyImportedEvent
 		if err := json.Unmarshal(domain.Data, &data); err != nil {
@@ -382,7 +446,7 @@ func validateState(state *State) error {
 		}
 	}
 	for id, pause := range state.Pauses {
-		if state.Workflows[id] == nil || pause.WorkflowID != id || pause.CompletedAt.IsZero() {
+		if state.Workflows[id] == nil || pause.WorkflowID != id || (pause.Phase != PauseRequested && pause.Phase != PauseDraining && pause.Phase != PauseCompleted) || pause.Phase == PauseCompleted && pause.CompletedAt.IsZero() || pause.Phase != PauseCompleted && !pause.CompletedAt.IsZero() {
 			return fmt.Errorf("pause %s has broken workflow identity", id)
 		}
 		for _, attemptID := range pause.FencedAttemptIDs {
@@ -473,6 +537,7 @@ func cloneExecution(v *Execution) *Execution { c := *v; return &c }
 func cloneNode(v *Node) *Node {
 	c := *v
 	c.Dependencies = append([]NodeID(nil), v.Dependencies...)
+	c.Work.Fallbacks = append([]RuntimeSpec(nil), v.Work.Fallbacks...)
 	return &c
 }
 func cloneWorkflow(v *Workflow) *Workflow {
@@ -540,4 +605,13 @@ func clonePause(v *Pause) *Pause {
 	c.FencedAttemptIDs = append([]AttemptID(nil), v.FencedAttemptIDs...)
 	c.ReleasedLeaseIDs = append([]LeaseID(nil), v.ReleasedLeaseIDs...)
 	return &c
+}
+
+func containsLease(values []LeaseID, wanted LeaseID) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }

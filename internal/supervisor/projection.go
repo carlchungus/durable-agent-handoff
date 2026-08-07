@@ -149,7 +149,7 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 	for _, attempt := range orderedAttempts(state, workflow.ID) {
 		item := projectAttempt(attempt)
 		activity := state.Activities[attempt.ActivityID]
-		if item.TurnStarted {
+		if item.TurnStarted && !hasProviderUnavailable(state.Attempts[item.ID]) {
 			taskOrdinals[activity.NodeID]++
 			item.TaskAttempt = taskOrdinals[activity.NodeID]
 		}
@@ -310,15 +310,32 @@ func projectPublication(workflow *Workflow, state *State) PublicationState {
 	}
 	var latest *Result
 	for nodeID := range workflow.Nodes {
-		if result := latestResultForNode(state, workflow.ID, nodeID); result != nil && (latest == nil || result.CreatedAt.After(latest.CreatedAt)) {
+		node := workflow.Nodes[nodeID]
+		if node != nil && !node.SupersededAt.IsZero() {
+			continue
+		}
+		result := latestResultForNode(state, workflow.ID, nodeID)
+		if result == nil {
+			return PublicationAwaitingResult
+		}
+		if result != nil && (latest == nil || result.CreatedAt.After(latest.CreatedAt)) {
 			latest = result
 		}
 	}
 	if latest == nil {
 		return PublicationAwaitingResult
 	}
-	if workflow.Finalizer.RequireVerifier && verificationFor(state, latest.ID) != VerificationPass {
-		return PublicationAwaitingVerifier
+	if workflow.Finalizer.RequireVerifier {
+		for nodeID := range workflow.Nodes {
+			node := workflow.Nodes[nodeID]
+			if node != nil && !node.SupersededAt.IsZero() {
+				continue
+			}
+			result := latestResultForNode(state, workflow.ID, nodeID)
+			if result == nil || verificationFor(state, result.ID) != VerificationPass {
+				return PublicationAwaitingVerifier
+			}
+		}
 	}
 	if workflow.Finalizer.RequireHuman {
 		return PublicationAwaitingHuman

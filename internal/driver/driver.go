@@ -95,8 +95,8 @@ func validateLaunch(request LaunchRequest, runtime string) error {
 	if request.Runtime.Name != runtime || request.Session.Runtime != runtime {
 		return fmt.Errorf("%s Driver requires matching RuntimeSpec and exact native Session", runtime)
 	}
-	if strings.TrimSpace(request.Session.ID) == "" || strings.TrimSpace(request.Worktree) == "" || strings.TrimSpace(request.Prompt) == "" {
-		return errors.New("launch requires worktree, prompt, and exact native Session identity")
+	if strings.TrimSpace(request.Worktree) == "" || strings.TrimSpace(request.Prompt) == "" {
+		return errors.New("launch requires worktree and prompt")
 	}
 	if request.Runtime.Sandbox != supervisor.SandboxReadOnly && request.Runtime.Sandbox != supervisor.SandboxWorkspaceWrite {
 		return fmt.Errorf("unsupported sandbox %q", request.Runtime.Sandbox)

@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -15,7 +17,7 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 	if err := os.Chmod(state, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	request := `{"native_session":{"runtime":"codex","id":"exact-thread"},"prompt":"secret stdin prompt","runtime":{"name":"codex","sandbox":"read-only"},"root":"` + root + `","authority":{"requested_by":"human:arca","human_authorized":true,"sandbox":"read-only"},"finalizer":{"enabled":false},"budget":{"max_task_attempts":3,"max_launches":12},"idempotency_key":"arca-file-start-01"}`
+	request := `{"idempotency_key":"arca-file-start-01","goal":"promote work","prompt":"secret stdin prompt","remote_root":"` + root + `","runtime":"codex","resume_id":"exact-thread","sandbox":"read-only","role":"arca-cloud"}`
 	read, write, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -35,13 +37,17 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 		t.Fatalf("start: %v stderr=%s", err, errOut.String())
 	}
 	var response struct {
-		Execution supervisor.Execution `json:"execution"`
-		Receipt   supervisor.Receipt   `json:"receipt"`
+		WorkflowID supervisor.WorkflowID `json:"workflow_id"`
+		NodeID     supervisor.NodeID     `json:"node_id"`
 	}
 	if err = json.Unmarshal(out.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if response.Execution.ID == "" || response.Receipt.Existing || strings.Contains(out.String(), "secret stdin prompt") {
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(out.Bytes(), &fields); err != nil || len(fields) != 2 {
+		t.Fatalf("promotion response was not the exact flat envelope: %s err=%v", out.String(), err)
+	}
+	if response.WorkflowID == "" || response.NodeID == "" || strings.Contains(out.String(), "secret stdin prompt") {
 		t.Fatalf("unexpected response=%s", out.String())
 	}
 	if err = run([]string{"execution", "start", "--state", state, "--file", "-", "--json"}, &out, &errOut); err == nil {
@@ -81,5 +87,54 @@ func TestStatusListReplyAndPauseUseSupervisorProjection(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"workflow_id"`) || !strings.Contains(out.String(), `"existing":false`) {
 		t.Fatalf("pause=%s", out.String())
+	}
+}
+
+func TestPauseCLIWaitsForDurableExitWithoutMutatingWhilePolling(t *testing.T) {
+	stateRoot, worktree, output := t.TempDir(), t.TempDir(), new(bytes.Buffer)
+	if err := os.Chmod(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var startOut, errOut bytes.Buffer
+	if err := run([]string{"start", "--state", stateRoot, "--root", worktree, "--runtime", "claude", "--prompt", "work", "--sandbox", "workspace-write", "--authorized-by", "human:test", "--idempotency-key", "pause-cli-start", "--json"}, &startOut, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	var started struct {
+		Execution supervisor.Execution `json:"execution"`
+	}
+	if err := json.Unmarshal(startOut.Bytes(), &started); err != nil {
+		t.Fatal(err)
+	}
+	store, err := supervisor.Open(stateRoot, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	activity := state.Activities[started.Execution.FirstActivity]
+	attempt, _, err := store.PrepareAttempt(context.Background(), supervisor.PrepareAttemptInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, CommandDigest: "pause-cli", Outputs: supervisor.OutputIdentity{Stdout: "pause-cli-out", Stderr: "pause-cli-err"}, IdempotencyKey: "pause-cli-attempt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.RecordMilestone(context.Background(), supervisor.RecordMilestoneInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, AttemptID: attempt.ID, LeaseID: attempt.LeaseID, Milestone: supervisor.Milestone{Kind: supervisor.MilestoneProcessSpawned, Process: &supervisor.ProcessIdentity{PID: 55, StartToken: "pause-cli-birth"}}, IdempotencyKey: "pause-cli-spawn"}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Events(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = run([]string{"execution", "pause", "--state", stateRoot, "--workflow", string(started.Execution.WorkflowID), "--timeout", "100ms", "--json"}, output, &errOut)
+	if !errors.Is(err, supervisor.ErrPausePending) {
+		t.Fatalf("pause returned wrong error=%v", err)
+	}
+	after, err := store.Events(0)
+	if err != nil || len(after) != len(before)+1 {
+		t.Fatalf("projection polling mutated journal: before=%d after=%d err=%v", len(before), len(after), err)
+	}
+	state, _ = store.Projection()
+	if state.Leases[attempt.LeaseID] == nil || !state.Leases[attempt.LeaseID].ReleasedAt.IsZero() {
+		t.Fatal("CLI polling released the writer lease before terminal exit")
 	}
 }

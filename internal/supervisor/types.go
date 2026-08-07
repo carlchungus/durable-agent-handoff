@@ -69,10 +69,11 @@ type Budget struct {
 func DefaultBudget() Budget { return Budget{MaxTaskAttempts: 3, MaxLaunches: 12} }
 
 type WorkSpec struct {
-	Kind    string      `json:"kind"`
-	Prompt  string      `json:"prompt"`
-	Root    string      `json:"root"`
-	Runtime RuntimeSpec `json:"runtime"`
+	Kind      string        `json:"kind"`
+	Prompt    string        `json:"prompt"`
+	Root      string        `json:"root"`
+	Runtime   RuntimeSpec   `json:"runtime"`
+	Fallbacks []RuntimeSpec `json:"fallbacks,omitempty"`
 }
 
 type Execution struct {
@@ -229,12 +230,21 @@ type Result struct {
 
 type Pause struct {
 	WorkflowID       WorkflowID  `json:"workflow_id"`
+	Phase            PausePhase  `json:"phase"`
 	RequestedBy      string      `json:"requested_by"`
 	FencedAttemptIDs []AttemptID `json:"fenced_attempt_ids,omitempty"`
 	ReleasedLeaseIDs []LeaseID   `json:"released_lease_ids,omitempty"`
 	RequestedAt      time.Time   `json:"requested_at"`
 	CompletedAt      time.Time   `json:"completed_at,omitempty"`
 }
+
+type PausePhase string
+
+const (
+	PauseRequested PausePhase = "requested"
+	PauseDraining  PausePhase = "draining"
+	PauseCompleted PausePhase = "completed"
+)
 
 type MessageState string
 
@@ -275,6 +285,7 @@ type Control struct {
 	ExpectedAttemptID  AttemptID  `json:"expected_attempt_id"`
 	Accepted           bool       `json:"accepted"`
 	Reason             string     `json:"reason,omitempty"`
+	AppliedAt          time.Time  `json:"applied_at,omitempty"`
 	CreatedAt          time.Time  `json:"created_at"`
 }
 

@@ -141,6 +141,7 @@ func TestPreTurnAdapterDeathsPreserveLaunchesWithoutTaskBudget(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, fmt.Sprintf("startup-%d-prepare", i))
 		milestone(t, store, activity, attempt, fmt.Sprintf("startup-%d-failed", i), Milestone{Kind: MilestoneAdapterStartFailed, Failure: "claude adapter died before turn"})
+		milestone(t, store, activity, attempt, fmt.Sprintf("startup-%d-exit", i), Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 127}})
 	}
 	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "startup-live-prepare")
 	milestone(t, store, activity, attempt, "startup-live-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 10, StartToken: "live-birth"}})
@@ -160,6 +161,73 @@ func TestPreTurnAdapterDeathsPreserveLaunchesWithoutTaskBudget(t *testing.T) {
 	}
 	if consumed != 1 || view.Attempts[3].TaskAttempt != 1 {
 		t.Fatalf("pre-turn deaths consumed task budget: %+v", view.Attempts)
+	}
+}
+
+func TestLaunchEligibilityFencesTaskBudgetAndCanonicalWritersAcrossWorkflows(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	old := startTestExecution(t, store, worktree, "old-live-workflow", Budget{MaxTaskAttempts: 3, MaxLaunches: 6})
+	newWorkflow := startTestExecution(t, store, worktree, "new-live-workflow", DefaultBudget())
+	state, _ := store.Projection()
+	oldActivity := state.Activities[old.FirstActivity]
+	newActivity := state.Activities[newWorkflow.FirstActivity]
+
+	first := prepareTestAttempt(t, store, oldActivity.ID, oldActivity.Generation, "old-live-attempt-1")
+	milestone(t, store, oldActivity, first, "old-live-spawn-1", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 9101, StartToken: "old-live-birth-1"}})
+	milestone(t, store, oldActivity, first, "old-live-turn-1", Milestone{Kind: MilestoneTurnStarted})
+	if _, _, err := store.PrepareAttempt(context.Background(), PrepareAttemptInput{ActivityID: newActivity.ID, ExpectedGeneration: newActivity.Generation, CommandDigest: "new-live", Outputs: OutputIdentity{Stdout: "new-live-out", Stderr: "new-live-err"}, IdempotencyKey: "new-live-attempt-1"}); !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("second workflow acquired a live canonical writer: %v", err)
+	}
+	milestone(t, store, oldActivity, first, "old-live-exit-1", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 0}})
+
+	for ordinal := 2; ordinal <= 3; ordinal++ {
+		attempt := prepareTestAttempt(t, store, oldActivity.ID, oldActivity.Generation, fmt.Sprintf("old-live-attempt-%d", ordinal))
+		milestone(t, store, oldActivity, attempt, fmt.Sprintf("old-live-spawn-%d", ordinal), Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 9100 + ordinal, StartToken: fmt.Sprintf("old-live-birth-%d", ordinal)}})
+		milestone(t, store, oldActivity, attempt, fmt.Sprintf("old-live-turn-%d", ordinal), Milestone{Kind: MilestoneTurnStarted})
+		milestone(t, store, oldActivity, attempt, fmt.Sprintf("old-live-exit-%d", ordinal), Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 0}})
+	}
+	state, _ = store.Projection()
+	before := len(state.Attempts)
+	if _, _, err := store.PrepareAttempt(context.Background(), PrepareAttemptInput{ActivityID: oldActivity.ID, ExpectedGeneration: oldActivity.Generation, CommandDigest: "old-live-attempt-4", Outputs: OutputIdentity{Stdout: "old-live-out-4", Stderr: "old-live-err-4"}, IdempotencyKey: "old-live-attempt-4"}); err == nil {
+		t.Fatal("task-attempt budget allowed a fourth turn attempt")
+	}
+	state, _ = store.Projection()
+	if len(state.Attempts) != before {
+		t.Fatalf("rejected fourth attempt mutated projection: before=%d after=%d", before, len(state.Attempts))
+	}
+	if _, _, err := store.PrepareAttempt(context.Background(), PrepareAttemptInput{ActivityID: newActivity.ID, ExpectedGeneration: newActivity.Generation, CommandDigest: "new-live", Outputs: OutputIdentity{Stdout: "new-live-out", Stderr: "new-live-err"}, IdempotencyKey: "new-live-attempt-2"}); err != nil {
+		t.Fatalf("canonical writer was not released by exact terminal exit: %v", err)
+	}
+}
+
+func TestNewSessionBindsOnceAndContinuationRequiresExactBoundIdentity(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	execution, _, err := store.StartExecution(context.Background(), StartExecutionInput{NativeSession: NativeSessionIdentity{Runtime: "claude"}, Prompt: "new session", Runtime: RuntimeSpec{Name: "claude", Sandbox: SandboxWorkspaceWrite}, Root: worktree, Authority: AuthoritySpec{RequestedBy: "human:test", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite}, Budget: DefaultBudget(), IdempotencyKey: "unbound-session-start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := store.Projection()
+	activity := state.Activities[execution.FirstActivity]
+	if state.Sessions[execution.SessionID].Native.ID != "" {
+		t.Fatal("ordinary start unexpectedly invented a native session identity")
+	}
+	if _, _, err := store.ContinueSession(context.Background(), ContinueSessionInput{ExecutionID: execution.ID, SessionID: execution.SessionID, PredecessorActivityID: activity.ID, From: "human", Message: "before bind", IdempotencyKey: "unbound-reply-01"}); err == nil {
+		t.Fatal("continuation was allowed before native Session binding")
+	}
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "unbound-attempt-01")
+	milestone(t, store, activity, attempt, "unbound-spawn-01", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 8080, StartToken: "unbound-birth"}})
+	identity := NativeSessionIdentity{Runtime: "claude", ID: "new-native-session"}
+	milestone(t, store, activity, attempt, "unbound-bind-01", Milestone{Kind: MilestoneSessionBound, Session: &identity})
+	milestone(t, store, activity, attempt, "unbound-turn-01", Milestone{Kind: MilestoneTurnStarted})
+	milestone(t, store, activity, attempt, "unbound-result-01", Milestone{Kind: MilestoneResult, Result: &WorkerResult{Status: "completed", Summary: "bound"}})
+	milestone(t, store, activity, attempt, "unbound-exit-01", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 0}})
+	state, _ = store.Projection()
+	if state.Sessions[execution.SessionID].Native != identity {
+		t.Fatalf("session binding was not durably persisted: %+v", state.Sessions[execution.SessionID])
+	}
+	continuation, _, err := store.ContinueSession(context.Background(), ContinueSessionInput{ExecutionID: execution.ID, SessionID: execution.SessionID, PredecessorActivityID: activity.ID, From: "human", Message: "after bind", IdempotencyKey: "bound-reply-01"})
+	if err != nil || continuation.ParentActivityID != activity.ID {
+		t.Fatalf("bound continuation failed: activity=%+v err=%v", continuation, err)
 	}
 }
 
@@ -204,6 +272,7 @@ func TestStaleLeaseAndAttemptAreFenced(t *testing.T) {
 	activity := state.Activities[execution.FirstActivity]
 	old := prepareTestAttempt(t, store, activity.ID, activity.Generation, "old-attempt-prep")
 	milestone(t, store, activity, old, "old-attempt-fail", Milestone{Kind: MilestoneAdapterStartFailed, Failure: "dead"})
+	milestone(t, store, activity, old, "old-attempt-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 127}})
 	current := prepareTestAttempt(t, store, activity.ID, activity.Generation, "new-attempt-prep")
 	_, err := store.RecordMilestone(context.Background(), RecordMilestoneInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, AttemptID: old.ID, LeaseID: old.LeaseID, Milestone: Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 1, StartToken: "stale"}}, IdempotencyKey: "stale-event-0001"})
 	if !errors.Is(err, ErrFenced) {
@@ -226,18 +295,23 @@ func TestPauseFencesActiveAttemptsReleasesOwnershipAndIsIdempotent(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Existing || len(pause.FencedAttemptIDs) != 1 || len(pause.ReleasedLeaseIDs) != 1 || pause.CompletedAt.IsZero() {
+	if first.Existing || pause.Phase != PauseDraining || len(pause.FencedAttemptIDs) != 1 || len(pause.ReleasedLeaseIDs) != 0 || !pause.CompletedAt.IsZero() {
 		t.Fatalf("pause=%+v receipt=%+v", pause, first)
 	}
 	state, err = store.Projection()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Leases[attempt.LeaseID] == nil || state.Leases[attempt.LeaseID].ReleasedAt.IsZero() {
-		t.Fatal("pause returned before cloud writer ownership was released")
+	if state.Leases[attempt.LeaseID] == nil || !state.Leases[attempt.LeaseID].ReleasedAt.IsZero() {
+		t.Fatal("pause released cloud writer ownership before terminal exit")
 	}
 	if _, err = store.RecordMilestone(context.Background(), RecordMilestoneInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, AttemptID: attempt.ID, LeaseID: attempt.LeaseID, Milestone: Milestone{Kind: MilestoneTurnStarted}, IdempotencyKey: "pause-stale-turn"}); !errors.Is(err, ErrFenced) {
 		t.Fatalf("paused attempt accepted a stale milestone: %v", err)
+	}
+	milestone(t, store, activity, attempt, "pause-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 143}})
+	settled, _, err := store.SettlePause(context.Background(), SettlePauseInput{WorkflowID: execution.WorkflowID, IdempotencyKey: "pause-settle-command"})
+	if err != nil || settled.Phase != PauseCompleted || settled.CompletedAt.IsZero() || len(settled.ReleasedLeaseIDs) != 1 {
+		t.Fatalf("pause was not settled after exact exit: pause=%+v err=%v", settled, err)
 	}
 	_, second, err := store.PauseWorkflow(context.Background(), PauseWorkflowInput{WorkflowID: execution.WorkflowID, RequestedBy: "cloud", IdempotencyKey: "pause-fence-command"})
 	if err != nil || !second.Existing || second.Sequence != first.Sequence {

@@ -19,7 +19,15 @@ func (Pi) Build(request LaunchRequest) (Launch, error) {
 	if request.Runtime.Sandbox == supervisor.SandboxReadOnly {
 		return Launch{}, errors.New("Pi cannot enforce read-only execution without an external OS sandbox")
 	}
-	args := []string{"--mode", "json", "--model", fallback(request.Runtime.Model, "openrouter/deepseek/deepseek-v4-flash"), "--thinking", fallback(request.Runtime.Effort, "xhigh"), "--session", request.Session.ID}
+	args := []string{"--print", "--mode", "json", "--model", fallback(request.Runtime.Model, "openrouter/deepseek/deepseek-v4-flash"), "--thinking", fallback(request.Runtime.Effort, "xhigh")}
+	if strings.TrimSpace(request.Session.ID) != "" {
+		args = append(args, "--session", request.Session.ID)
+	}
+	if request.TrustMode == TrustFull {
+		args = append(args, "--approve")
+	} else {
+		args = append(args, "--no-approve")
+	}
 	return Launch{Executable: fallback(request.Runtime.Executable, "pi"), Args: args, PromptOnStdin: true}, nil
 }
 

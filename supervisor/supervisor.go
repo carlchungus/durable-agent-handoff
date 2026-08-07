@@ -51,6 +51,7 @@ type (
 	Lease                  = internal.Lease
 	Control                = internal.Control
 	Pause                  = internal.Pause
+	PausePhase             = internal.PausePhase
 	State                  = internal.State
 	StartExecutionInput    = internal.StartExecutionInput
 	AddNodeInput           = internal.AddNodeInput
@@ -60,6 +61,8 @@ type (
 	RecordMilestoneInput   = internal.RecordMilestoneInput
 	RequestControlInput    = internal.RequestControlInput
 	PauseWorkflowInput     = internal.PauseWorkflowInput
+	SettlePauseInput       = internal.SettlePauseInput
+	ApplyControlInput      = internal.ApplyControlInput
 	RecordAttestationInput = internal.RecordAttestationInput
 	ImportV1Input          = internal.ImportV1Input
 	ExecutionView          = internal.ExecutionView
@@ -70,6 +73,9 @@ type (
 	ProcessHealth          = internal.ProcessHealth
 	VerificationState      = internal.VerificationState
 	PublicationState       = internal.PublicationState
+	FinalizationRequest    = internal.FinalizationRequest
+	FinalizationResult     = internal.FinalizationResult
+	GateRunner             = internal.GateRunner
 )
 
 const (
@@ -96,6 +102,10 @@ const (
 	HealthStarting    = internal.HealthStarting
 	HealthRunning     = internal.HealthRunning
 	HealthExited      = internal.HealthExited
+
+	PauseRequested = internal.PauseRequested
+	PauseDraining  = internal.PauseDraining
+	PauseCompleted = internal.PauseCompleted
 )
 
 var (
@@ -106,4 +116,5 @@ var (
 	ErrIdempotencyConflict = internal.ErrIdempotencyConflict
 	ErrFenced              = internal.ErrFenced
 	ErrLeaseHeld           = internal.ErrLeaseHeld
+	ErrPausePending        = internal.ErrPausePending
 )

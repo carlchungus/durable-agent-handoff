@@ -17,6 +17,7 @@ import (
 type StartExecutionInput struct {
 	NativeSession  NativeSessionIdentity `json:"native_session"`
 	Prompt         string                `json:"prompt"`
+	Goal           string                `json:"goal,omitempty"`
 	Runtime        RuntimeSpec           `json:"runtime"`
 	Root           string                `json:"root"`
 	Authority      AuthoritySpec         `json:"authority"`
@@ -90,7 +91,11 @@ func (c startExecutionCommand) decide(state *State, now time.Time) ([]DomainEven
 		ID: workflowID, Root: in.Root, Authority: in.Authority, Finalizer: in.Finalizer, Budget: in.Budget,
 		Nodes: map[NodeID]*Node{}, CreatedAt: now,
 	}
-	node := &Node{ID: nodeID, WorkflowID: workflowID, Title: "Root execution", Work: WorkSpec{Kind: "agent", Prompt: in.Prompt, Root: in.Root, Runtime: in.Runtime}, CreatedAt: now}
+	title := in.Goal
+	if strings.TrimSpace(title) == "" {
+		title = "Root execution"
+	}
+	node := &Node{ID: nodeID, WorkflowID: workflowID, Title: title, Work: WorkSpec{Kind: "agent", Prompt: in.Prompt, Root: in.Root, Runtime: in.Runtime}, CreatedAt: now}
 	session := &Session{ID: sessionID, WorkflowID: workflowID, Native: in.NativeSession, Root: in.Root, CreatedAt: now}
 	activity := &Activity{ID: activityID, WorkflowID: workflowID, NodeID: nodeID, SessionID: sessionID, Generation: 1, Prompt: in.Prompt, CreatedAt: now}
 	execution := &Execution{ID: executionID, WorkflowID: workflowID, RootNodeID: nodeID, SessionID: sessionID, FirstActivity: activityID, IdempotencyKey: in.IdempotencyKey, InputDigest: digest, CreatedAt: now}
@@ -101,8 +106,8 @@ func validateStartInput(in StartExecutionInput) error {
 	if strings.TrimSpace(in.IdempotencyKey) == "" || strings.TrimSpace(in.Prompt) == "" {
 		return errors.New("idempotency key and prompt are required")
 	}
-	if strings.TrimSpace(in.NativeSession.Runtime) == "" || strings.TrimSpace(in.NativeSession.ID) == "" {
-		return errors.New("exact native session runtime and identity are required")
+	if strings.TrimSpace(in.NativeSession.Runtime) == "" {
+		return errors.New("native session runtime is required")
 	}
 	if in.NativeSession.Runtime != in.Runtime.Name {
 		return errors.New("native session runtime must match RuntimeSpec")
@@ -209,6 +214,14 @@ func (c addNodeCommand) decide(state *State, now time.Time) ([]DomainEvent, stri
 	if err = validateRuntime(in.Work.Runtime); err != nil {
 		return nil, "", err
 	}
+	for _, fallback := range in.Work.Fallbacks {
+		if err = validateRuntime(fallback); err != nil {
+			return nil, "", fmt.Errorf("fallback runtime: %w", err)
+		}
+		if workflow.Authority.Sandbox == SandboxReadOnly && fallback.Sandbox != SandboxReadOnly {
+			return nil, "", errors.New("read-only workflow cannot add write-capable fallback")
+		}
+	}
 	if workflow.Authority.Sandbox == SandboxReadOnly && in.Work.Runtime.Sandbox != SandboxReadOnly {
 		return nil, "", errors.New("read-only workflow cannot add write-capable work")
 	}
@@ -309,6 +322,9 @@ func (c continueSessionCommand) decide(state *State, now time.Time) ([]DomainEve
 	if execution == nil || session == nil || predecessor == nil || execution.SessionID != in.SessionID || predecessor.SessionID != in.SessionID {
 		return nil, "", errors.New("continuation must name the execution's exact session and predecessor")
 	}
+	if session.ImportedUnresolved || strings.TrimSpace(session.Native.ID) == "" {
+		return nil, "", errors.New("continuation requires a previously bound exact native Session")
+	}
 	if strings.TrimSpace(in.From) == "" || strings.TrimSpace(in.Message) == "" {
 		return nil, "", errors.New("reply sender and message are required")
 	}
@@ -331,6 +347,7 @@ func (c continueSessionCommand) decide(state *State, now time.Time) ([]DomainEve
 type PrepareAttemptInput struct {
 	ActivityID         ActivityID     `json:"activity_id"`
 	ExpectedGeneration uint64         `json:"expected_generation"`
+	Runtime            RuntimeSpec    `json:"runtime,omitempty"`
 	CommandDigest      string         `json:"command_digest"`
 	Outputs            OutputIdentity `json:"outputs"`
 	IdempotencyKey     string         `json:"-"`
@@ -376,11 +393,21 @@ func (c prepareAttemptCommand) decide(state *State, now time.Time) ([]DomainEven
 	if state.Pauses[activity.WorkflowID] != nil {
 		return nil, "", ErrFenced
 	}
-	if !workflow.Authority.HumanAuthorized || session == nil || session.ImportedUnresolved || strings.TrimSpace(session.Native.ID) == "" {
-		return nil, "", errors.New("Activity lacks human-authorized exact-Session execution authority")
+	if !workflow.Authority.HumanAuthorized || session == nil || session.ImportedUnresolved {
+		return nil, "", errors.New("Activity lacks human-authorized execution authority")
 	}
 	if workflow.Authority.Sandbox == SandboxReadOnly && node.Work.Runtime.Sandbox != SandboxReadOnly {
 		return nil, "", errors.New("Activity runtime exceeds Workflow authority")
+	}
+	runtimeSpec := node.Work.Runtime
+	if in.Runtime.Name != "" {
+		runtimeSpec = in.Runtime
+	}
+	if !runtimeAllowed(node.Work, runtimeSpec) {
+		return nil, "", errors.New("Attempt runtime is not an authorized primary or fallback candidate")
+	}
+	if workflow.Authority.Sandbox == SandboxReadOnly && runtimeSpec.Sandbox != SandboxReadOnly {
+		return nil, "", errors.New("Attempt fallback exceeds Workflow authority")
 	}
 	launches, turns := attemptCounts(state, activity.WorkflowID, activity.NodeID)
 	if launches >= workflow.Budget.MaxLaunches {
@@ -407,7 +434,7 @@ func (c prepareAttemptCommand) decide(state *State, now time.Time) ([]DomainEven
 	}
 	attemptID := AttemptID(stableID("attempt", in.IdempotencyKey))
 	leaseID := LeaseID(stableID("lease", in.IdempotencyKey))
-	attempt := &Attempt{ID: attemptID, ActivityID: activity.ID, ActivityGeneration: activity.Generation, Ordinal: ordinal, Runtime: node.Work.Runtime, CommandDigest: in.CommandDigest, Outputs: in.Outputs, LeaseID: leaseID, CreatedAt: now}
+	attempt := &Attempt{ID: attemptID, ActivityID: activity.ID, ActivityGeneration: activity.Generation, Ordinal: ordinal, Runtime: runtimeSpec, CommandDigest: in.CommandDigest, Outputs: in.Outputs, LeaseID: leaseID, CreatedAt: now}
 	lease := &Lease{ID: leaseID, CanonicalWorktree: node.Work.Root, ActivityID: activity.ID, ActivityGeneration: activity.Generation, AttemptID: attemptID, AcquiredAt: now}
 	events := []DomainEvent{mustEvent(eventAttemptPrepared, attemptPreparedEvent{Attempt: attempt, Lease: lease})}
 	generation := nextDeliveryGeneration(state, activity.SessionID)
@@ -445,7 +472,7 @@ func (c recordMilestoneCommand) decide(state *State, now time.Time) ([]DomainEve
 	if attempt == nil || activity == nil || lease == nil || activity.Generation != in.ExpectedGeneration || attempt.ActivityID != activity.ID || attempt.ActivityGeneration != activity.Generation || attempt.LeaseID != lease.ID || lease.AttemptID != attempt.ID || !lease.ReleasedAt.IsZero() {
 		return nil, "", ErrFenced
 	}
-	if state.Pauses[activity.WorkflowID] != nil {
+	if state.Pauses[activity.WorkflowID] != nil && in.Milestone.Kind != MilestoneExit {
 		return nil, "", ErrFenced
 	}
 	m := cloneMilestone(in.Milestone)
@@ -466,7 +493,9 @@ func (c recordMilestoneCommand) decide(state *State, now time.Time) ([]DomainEve
 		if m.Kind != MilestoneExit || resultForActivity(state, activity.ID) == nil {
 			events = append(events, settleMessages(state, activity.ID, attempt.ID, false, now)...)
 		}
-		events = append(events, mustEvent(eventLeaseReleased, leaseReleasedEvent{LeaseID: lease.ID, At: now}))
+		if m.Kind == MilestoneExit {
+			events = append(events, mustEvent(eventLeaseReleased, leaseReleasedEvent{LeaseID: lease.ID, At: now}))
+		}
 	}
 	return events, string(attempt.ID), nil
 }
@@ -475,14 +504,18 @@ func validateMilestone(state *State, attempt *Attempt, activity *Activity, m Mil
 	if !validMilestoneKind(m.Kind) {
 		return fmt.Errorf("unknown milestone %q", m.Kind)
 	}
-	turnStarted, resultSeen, terminal := false, false, false
+	turnStarted, resultSeen, exitSeen, failedBeforeExit := false, false, false, false
 	for _, prior := range attempt.Milestones {
 		turnStarted = turnStarted || prior.Kind == MilestoneTurnStarted
 		resultSeen = resultSeen || prior.Kind == MilestoneResult
-		terminal = terminal || prior.Kind == MilestoneExit || prior.Kind == MilestoneAdapterStartFailed || prior.Kind == MilestoneProviderUnavailable
+		exitSeen = exitSeen || prior.Kind == MilestoneExit
+		failedBeforeExit = failedBeforeExit || prior.Kind == MilestoneAdapterStartFailed || prior.Kind == MilestoneProviderUnavailable
 	}
-	if terminal {
+	if exitSeen {
 		return errors.New("Attempt is terminal")
+	}
+	if failedBeforeExit && m.Kind != MilestoneExit {
+		return errors.New("only exit may follow a pre-exit failure")
 	}
 	if m.At.Before(attempt.CreatedAt) || len(attempt.Milestones) > 0 && m.At.Before(attempt.Milestones[len(attempt.Milestones)-1].At) {
 		return errors.New("milestone timestamp precedes immutable Attempt history")
@@ -500,7 +533,7 @@ func validateMilestone(state *State, attempt *Attempt, activity *Activity, m Mil
 			return errors.New("session_bound requires exact native identity")
 		}
 		session := state.Sessions[activity.SessionID]
-		if session == nil || *m.Session != session.Native {
+		if session == nil || m.Session.Runtime != session.Native.Runtime || (session.Native.ID != "" && *m.Session != session.Native) {
 			return errors.New("runtime bound a different native session identity")
 		}
 	case MilestoneTurnStarted:
@@ -616,9 +649,9 @@ func (c recordAttestationCommand) decide(state *State, now time.Time) ([]DomainE
 }
 
 // PauseWorkflowInput is the durable control-plane request used by cloud
-// callers and the CLI. The command fences every active Attempt in one
-// journal transaction and releases every corresponding writer Lease before
-// returning. A later runtime milestone therefore fails closed.
+// callers and the CLI. The command records exact stop controls in one journal
+// transaction. The executor applies those controls; only terminal exit
+// evidence releases the writer Lease.
 type PauseWorkflowInput struct {
 	WorkflowID     WorkflowID `json:"workflow_id"`
 	RequestedBy    string     `json:"requested_by"`
@@ -663,10 +696,11 @@ func (c pauseWorkflowCommand) decide(state *State, now time.Time) ([]DomainEvent
 	if state.Pauses[in.WorkflowID] != nil {
 		return nil, "", errors.New("workflow is already paused; retry the original idempotency key")
 	}
-	pause := &Pause{WorkflowID: in.WorkflowID, RequestedBy: in.RequestedBy, RequestedAt: now, CompletedAt: now}
+	pause := &Pause{WorkflowID: in.WorkflowID, RequestedBy: in.RequestedBy, RequestedAt: now, Phase: PauseRequested}
 	var events []DomainEvent
 	for _, attempt := range orderedAttempts(state, in.WorkflowID) {
-		if attemptTerminal(attempt) {
+		lease := state.Leases[attempt.LeaseID]
+		if lease == nil || !lease.ReleasedAt.IsZero() || attemptHasExit(attempt) {
 			continue
 		}
 		activity := state.Activities[attempt.ActivityID]
@@ -677,14 +711,108 @@ func (c pauseWorkflowCommand) decide(state *State, now time.Time) ([]DomainEvent
 		events = append(events, mustEvent(eventControlRecorded, controlRecordedEvent{Control: control}))
 		events = append(events, settleMessages(state, activity.ID, attempt.ID, false, now)...)
 		pause.FencedAttemptIDs = append(pause.FencedAttemptIDs, attempt.ID)
-		lease := state.Leases[attempt.LeaseID]
-		if lease != nil && lease.ReleasedAt.IsZero() {
-			events = append(events, mustEvent(eventLeaseReleased, leaseReleasedEvent{LeaseID: lease.ID, At: now}))
-			pause.ReleasedLeaseIDs = append(pause.ReleasedLeaseIDs, lease.ID)
-		}
+	}
+	if len(pause.FencedAttemptIDs) == 0 {
+		pause.Phase = PauseCompleted
+		pause.CompletedAt = now
+	} else {
+		pause.Phase = PauseDraining
 	}
 	events = append(events, mustEvent(eventWorkflowPaused, workflowPausedEvent{Pause: pause}))
 	return events, string(in.WorkflowID), nil
+}
+
+type SettlePauseInput struct {
+	WorkflowID     WorkflowID `json:"workflow_id"`
+	IdempotencyKey string     `json:"-"`
+}
+
+type settlePauseCommand struct{ Input SettlePauseInput }
+
+func (c settlePauseCommand) commandType() string    { return "SettlePause" }
+func (c settlePauseCommand) idempotencyKey() string { return c.Input.IdempotencyKey }
+func (c settlePauseCommand) digest() (string, error) {
+	return digestValue(c.Input, "IdempotencyKey")
+}
+
+func (s *Store) SettlePause(ctx context.Context, input SettlePauseInput) (*Pause, Receipt, error) {
+	receipt, err := s.Execute(ctx, settlePauseCommand{Input: input})
+	if err != nil {
+		return nil, receipt, err
+	}
+	state, err := s.Projection()
+	if err != nil {
+		return nil, receipt, err
+	}
+	pause := state.Pauses[input.WorkflowID]
+	if pause == nil {
+		return nil, receipt, errors.New("committed pause is absent from projection")
+	}
+	return clonePause(pause), receipt, nil
+}
+
+func (c settlePauseCommand) decide(state *State, now time.Time) ([]DomainEvent, string, error) {
+	pause := state.Pauses[c.Input.WorkflowID]
+	if pause == nil {
+		return nil, "", errors.New("workflow is not paused")
+	}
+	if pause.Phase == PauseCompleted {
+		return nil, "", errors.New("pause is already settled; retry the original idempotency key")
+	}
+	for _, attemptID := range pause.FencedAttemptIDs {
+		attempt := state.Attempts[attemptID]
+		if attempt == nil || !attemptHasExit(attempt) {
+			return nil, "", ErrPausePending
+		}
+		lease := state.Leases[attempt.LeaseID]
+		if lease == nil || lease.ReleasedAt.IsZero() {
+			return nil, "", ErrPausePending
+		}
+	}
+	return []DomainEvent{mustEvent(eventPauseSettled, pauseSettledEvent{WorkflowID: c.Input.WorkflowID, CompletedAt: now})}, string(c.Input.WorkflowID), nil
+}
+
+type ApplyControlInput struct {
+	ControlID          ControlID  `json:"control_id"`
+	ActivityID         ActivityID `json:"activity_id"`
+	ExpectedGeneration uint64     `json:"expected_generation"`
+	AttemptID          AttemptID  `json:"attempt_id"`
+	IdempotencyKey     string     `json:"-"`
+}
+
+type applyControlCommand struct{ Input ApplyControlInput }
+
+func (c applyControlCommand) commandType() string    { return "ApplyControl" }
+func (c applyControlCommand) idempotencyKey() string { return c.Input.IdempotencyKey }
+func (c applyControlCommand) digest() (string, error) {
+	return digestValue(c.Input, "IdempotencyKey")
+}
+
+func (s *Store) ApplyControl(ctx context.Context, input ApplyControlInput) (*Control, Receipt, error) {
+	receipt, err := s.Execute(ctx, applyControlCommand{Input: input})
+	if err != nil {
+		return nil, receipt, err
+	}
+	state, err := s.Projection()
+	if err != nil {
+		return nil, receipt, err
+	}
+	control := state.Controls[input.ControlID]
+	if control == nil {
+		return nil, receipt, errors.New("committed control is absent from projection")
+	}
+	return cloneControl(control), receipt, nil
+}
+
+func (c applyControlCommand) decide(state *State, now time.Time) ([]DomainEvent, string, error) {
+	in := c.Input
+	control := state.Controls[in.ControlID]
+	activity := state.Activities[in.ActivityID]
+	attempt := state.Attempts[in.AttemptID]
+	if control == nil || !control.Accepted || !control.AppliedAt.IsZero() || activity == nil || attempt == nil || control.ActivityID != activity.ID || control.ExpectedGeneration != in.ExpectedGeneration || control.ExpectedAttemptID != attempt.ID || attempt.ActivityID != activity.ID || attempt.ActivityGeneration != activity.Generation {
+		return nil, "", ErrFenced
+	}
+	return []DomainEvent{mustEvent(eventControlApplied, controlAppliedEvent{ControlID: control.ID, At: now})}, string(control.ID), nil
 }
 
 type RequestControlInput struct {
@@ -768,7 +896,7 @@ func attemptCounts(state *State, workflowID WorkflowID, nodeID NodeID) (launches
 		}
 		launches++
 		for _, m := range attempt.Milestones {
-			if m.Kind == MilestoneTurnStarted {
+			if m.Kind == MilestoneTurnStarted && !hasProviderUnavailable(attempt) {
 				turns++
 				break
 			}
@@ -784,6 +912,41 @@ func attemptTerminal(attempt *Attempt) bool {
 	}
 	return false
 }
+
+func attemptHasExit(attempt *Attempt) bool {
+	for _, m := range attempt.Milestones {
+		if m.Kind == MilestoneExit {
+			return true
+		}
+	}
+	return false
+}
+
+func runtimeAllowed(work WorkSpec, wanted RuntimeSpec) bool {
+	if sameRuntime(work.Runtime, wanted) {
+		return true
+	}
+	for _, candidate := range work.Fallbacks {
+		if sameRuntime(candidate, wanted) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameRuntime(a, b RuntimeSpec) bool {
+	return a.Name == b.Name && a.Executable == b.Executable && a.Model == b.Model && a.Effort == b.Effort && a.Sandbox == b.Sandbox
+}
+
+func hasProviderUnavailable(attempt *Attempt) bool {
+	for _, milestone := range attempt.Milestones {
+		if milestone.Kind == MilestoneProviderUnavailable {
+			return true
+		}
+	}
+	return false
+}
+
 func validMilestoneKind(kind MilestoneKind) bool {
 	switch kind {
 	case MilestoneProcessSpawned, MilestoneSessionBound, MilestoneTurnStarted, MilestoneEffectStarted, MilestoneMeaningfulProgress, MilestoneResult, MilestoneProviderUnavailable, MilestoneAdapterStartFailed, MilestoneExit:

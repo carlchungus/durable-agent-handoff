@@ -94,6 +94,19 @@ func (g *GatedCommand) Abort() {
 	})
 }
 
+// Stop kills the exact contained process tree identified by the command's
+// durable process identity. It does not mutate Supervisor state.
+func (g *GatedCommand) Stop() error {
+	if g == nil || g.Command == nil || g.Command.Process == nil {
+		return errors.New("gated activity command is not running")
+	}
+	err := g.tree.stop(g.Command.Process.Pid)
+	if closeErr := g.tree.closeWithError(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
 func init() {
 	if os.Getenv(watchdogEnvironment) == "1" {
 		runProcessTreeWatchdog(os.Stdin)

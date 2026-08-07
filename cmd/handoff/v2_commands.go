@@ -24,17 +24,24 @@ import (
 )
 
 type executionStartRequest struct {
-	NativeSession  supervisor.NativeSessionIdentity `json:"native_session"`
-	Prompt         string                           `json:"prompt"`
-	Runtime        supervisor.RuntimeSpec           `json:"runtime"`
-	Root           string                           `json:"root"`
-	Authority      supervisor.AuthoritySpec         `json:"authority"`
-	Finalizer      supervisor.FinalizerSpec         `json:"finalizer"`
-	Budget         supervisor.Budget                `json:"budget"`
-	IdempotencyKey string                           `json:"idempotency_key"`
+	IdempotencyKey string             `json:"idempotency_key"`
+	Goal           string             `json:"goal"`
+	Prompt         string             `json:"prompt"`
+	RemoteRoot     string             `json:"remote_root"`
+	Runtime        string             `json:"runtime"`
+	ResumeID       string             `json:"resume_id"`
+	Model          string             `json:"model,omitempty"`
+	Effort         string             `json:"effort,omitempty"`
+	Sandbox        supervisor.Sandbox `json:"sandbox"`
+	Role           string             `json:"role"`
 }
 
 type executionStartResponse struct {
+	WorkflowID supervisor.WorkflowID `json:"workflow_id"`
+	NodeID     supervisor.NodeID     `json:"node_id"`
+}
+
+type ordinaryStartResponse struct {
 	Execution *supervisor.Execution `json:"execution"`
 	Receipt   supervisor.Receipt    `json:"receipt"`
 }
@@ -75,6 +82,7 @@ func cmdV2Start(args []string, out io.Writer) error {
 	state := common(fs)
 	file := fs.String("file", "", "strict JSON request file; use - for stdin")
 	root := fs.String("root", ".", "canonical execution root")
+	goal := fs.String("goal", "", "desired work title")
 	prompt := fs.String("prompt", "", "exact execution prompt")
 	runtimeName := fs.String("runtime", "", "codex, claude, or pi")
 	nativeSession := fs.String("session", "", "exact native runtime Session identity")
@@ -84,7 +92,7 @@ func cmdV2Start(args []string, out io.Writer) error {
 	authorizedBy := fs.String("authorized-by", "", "human identity authorizing execution")
 	key := fs.String("idempotency-key", "", "stable request identity")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--file": true, "--root": true, "--prompt": true, "--runtime": true, "--session": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--json": false})); err != nil {
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--prompt": true, "--runtime": true, "--session": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--json": false})); err != nil {
 		return err
 	}
 	var input supervisor.StartExecutionInput
@@ -114,10 +122,16 @@ func cmdV2Start(args []string, out io.Writer) error {
 			}
 			return fmt.Errorf("decode execution start request trailer: %w", err)
 		}
+		if strings.TrimSpace(request.ResumeID) == "" || strings.TrimSpace(request.Role) == "" || strings.TrimSpace(request.Goal) == "" {
+			return errors.New("promotion request requires goal, resume_id, and role")
+		}
 		input = supervisor.StartExecutionInput{
-			NativeSession: request.NativeSession, Prompt: request.Prompt, Runtime: request.Runtime,
-			Root: request.Root, Authority: request.Authority, Finalizer: request.Finalizer,
-			Budget: request.Budget, IdempotencyKey: request.IdempotencyKey,
+			NativeSession: supervisor.NativeSessionIdentity{Runtime: request.Runtime, ID: request.ResumeID},
+			Prompt:        request.Prompt, Goal: request.Goal,
+			Runtime:   supervisor.RuntimeSpec{Name: request.Runtime, Model: request.Model, Effort: request.Effort, Sandbox: request.Sandbox},
+			Root:      request.RemoteRoot,
+			Authority: supervisor.AuthoritySpec{RequestedBy: request.Role, HumanAuthorized: true, Sandbox: request.Sandbox},
+			Budget:    supervisor.DefaultBudget(), IdempotencyKey: request.IdempotencyKey,
 		}
 	} else {
 		if fs.NArg() != 0 {
@@ -125,11 +139,11 @@ func cmdV2Start(args []string, out io.Writer) error {
 		}
 		input = supervisor.StartExecutionInput{
 			NativeSession: supervisor.NativeSessionIdentity{Runtime: *runtimeName, ID: *nativeSession},
-			Prompt:        *prompt,
-			Runtime:       supervisor.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort, Sandbox: supervisor.Sandbox(*sandbox)},
-			Root:          *root,
-			Authority:     supervisor.AuthoritySpec{RequestedBy: *authorizedBy, HumanAuthorized: *authorizedBy != "", Sandbox: supervisor.Sandbox(*sandbox)},
-			Budget:        supervisor.DefaultBudget(), IdempotencyKey: *key,
+			Goal:          *goal, Prompt: *prompt,
+			Runtime:   supervisor.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort, Sandbox: supervisor.Sandbox(*sandbox)},
+			Root:      *root,
+			Authority: supervisor.AuthoritySpec{RequestedBy: *authorizedBy, HumanAuthorized: *authorizedBy != "", Sandbox: supervisor.Sandbox(*sandbox)},
+			Budget:    supervisor.DefaultBudget(), IdempotencyKey: *key,
 		}
 	}
 	store, err := supervisor.Open(stateDir(*state), supervisor.Options{})
@@ -141,7 +155,10 @@ func cmdV2Start(args []string, out io.Writer) error {
 		return err
 	}
 	if *jsonOut {
-		return writeJSON(out, executionStartResponse{Execution: execution, Receipt: receipt})
+		if *file != "" {
+			return writeJSON(out, executionStartResponse{WorkflowID: execution.WorkflowID, NodeID: execution.RootNodeID})
+		}
+		return writeJSON(out, ordinaryStartResponse{Execution: execution, Receipt: receipt})
 	}
 	fmt.Fprintf(out, "execution=%s workflow=%s session=%s sequence=%d existing=%t\n", execution.ID, execution.WorkflowID, execution.SessionID, receipt.Sequence, receipt.Existing)
 	return nil
@@ -230,8 +247,9 @@ func cmdV2Pause(args []string, out io.Writer) error {
 	workflow := fs.String("workflow", "", "Workflow ID")
 	requestedBy := fs.String("requested-by", "human:cli", "requesting identity")
 	key := fs.String("idempotency-key", "", "stable request identity")
+	timeout := fs.Duration("timeout", 30*time.Second, "maximum wait for exact process exits")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--workflow": true, "--requested-by": true, "--idempotency-key": true, "--json": false})); err != nil {
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--workflow": true, "--requested-by": true, "--idempotency-key": true, "--timeout": true, "--json": false})); err != nil {
 		return err
 	}
 	if strings.TrimSpace(*workflow) == "" || fs.NArg() != 0 {
@@ -248,11 +266,46 @@ func cmdV2Pause(args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if *timeout <= 0 {
+		return errors.New("pause timeout must be positive")
+	}
+	if pause.CompletedAt.IsZero() {
+		pause, err = waitForPauseCompletion(store, supervisor.WorkflowID(*workflow), *timeout)
+		if err != nil {
+			return err
+		}
+	}
 	if *jsonOut {
 		return writeJSON(out, pauseResponse{Pause: pause, Receipt: receipt})
 	}
 	fmt.Fprintf(out, "workflow=%s paused fenced=%d released=%d sequence=%d existing=%t\n", pause.WorkflowID, len(pause.FencedAttemptIDs), len(pause.ReleasedLeaseIDs), receipt.Sequence, receipt.Existing)
 	return nil
+}
+
+func waitForPauseCompletion(store *supervisor.Store, workflowID supervisor.WorkflowID, timeout time.Duration) (*supervisor.Pause, error) {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		state, err := store.Projection()
+		if err != nil {
+			return nil, err
+		}
+		pause := state.Pauses[workflowID]
+		if pause == nil {
+			return nil, os.ErrNotExist
+		}
+		if !pause.CompletedAt.IsZero() && pause.Phase == supervisor.PauseCompleted {
+			copy := *pause
+			copy.FencedAttemptIDs = append([]supervisor.AttemptID(nil), pause.FencedAttemptIDs...)
+			copy.ReleasedLeaseIDs = append([]supervisor.LeaseID(nil), pause.ReleasedLeaseIDs...)
+			return &copy, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, supervisor.ErrPausePending
+		}
+		<-ticker.C
+	}
 }
 
 func cmdV2Events(args []string, out io.Writer) error {
@@ -290,7 +343,8 @@ func cmdV2Run(args []string, out io.Writer) error {
 	state := common(fs)
 	once := fs.Bool("once", false, "run at most one queued Activity")
 	trust := fs.String("trust-mode", string(driver.TrustWorkspace), "workspace or full")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--once": false, "--trust-mode": true})); err != nil {
+	startupTimeout := fs.Duration("startup-timeout", 30*time.Second, "pre-turn startup deadline")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--once": false, "--trust-mode": true, "--startup-timeout": true})); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -318,7 +372,7 @@ func cmdV2Run(args []string, out io.Writer) error {
 	if *trust != string(driver.TrustWorkspace) && *trust != string(driver.TrustFull) {
 		return fmt.Errorf("invalid trust mode %q", *trust)
 	}
-	runner := &executor.Executor{Store: store, OutputRoot: outputRoot, Drivers: driver.Lookup, TrustMode: driver.TrustMode(*trust)}
+	runner := &executor.Executor{Store: store, OutputRoot: outputRoot, Drivers: driver.Lookup, TrustMode: driver.TrustMode(*trust), StartupDeadline: *startupTimeout}
 	for _, activityID := range selected.Queue {
 		if err := runner.RunActivity(context.Background(), activityID); err != nil {
 			return err
@@ -336,9 +390,10 @@ func cmdV2Serve(args []string, out io.Writer) error {
 	state := common(fs)
 	interval := fs.Duration("interval", 2*time.Second, "scheduler scan interval")
 	workers := fs.Int("workers", 2, "maximum concurrent Activities")
+	startupTimeout := fs.Duration("startup-timeout", 30*time.Second, "pre-turn startup deadline")
 	environmentJSON := fs.String("environment-json", "", "mode-0600 JSON object of driver environment values")
 	trustMode := fs.String("trust-mode", string(driver.TrustWorkspace), "workspace or full")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--interval": true, "--workers": true, "--environment-json": true, "--trust-mode": true})); err != nil {
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--interval": true, "--workers": true, "--startup-timeout": true, "--environment-json": true, "--trust-mode": true})); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
@@ -358,7 +413,7 @@ func cmdV2Serve(args []string, out io.Writer) error {
 	fmt.Fprintf(out, "handoff supervisor-v2 · state=%s · workers=%d · trust=%s\n", stateDir(*state), *workers, *trustMode)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return service.ServeV2(ctx, store, service.ServeOptions{Interval: *interval, Workers: *workers, Environment: environment, TrustMode: driver.TrustMode(*trustMode), OutputRoot: filepath.Join(stateDir(*state), "supervisor-v2", "outputs")}, func(format string, values ...any) { fmt.Fprintf(out, format+"\n", values...) })
+	return service.ServeV2(ctx, store, service.ServeOptions{Interval: *interval, Workers: *workers, StartupDeadline: *startupTimeout, Environment: environment, TrustMode: driver.TrustMode(*trustMode), OutputRoot: filepath.Join(stateDir(*state), "supervisor-v2", "outputs")}, func(format string, values ...any) { fmt.Fprintf(out, format+"\n", values...) })
 }
 
 func cmdV2Service(args []string, out io.Writer) error {

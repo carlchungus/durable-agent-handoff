@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/carlchungus/durable-agent-handoff/supervisor"
 )
@@ -31,6 +32,18 @@ func cmdExecution(args []string, out io.Writer) error {
 }
 
 func cmdExecutionStart(args []string, out io.Writer) error {
+	file := ""
+	for index, arg := range args {
+		if arg == "--file" && index+1 < len(args) {
+			file = args[index+1]
+		}
+		if strings.HasPrefix(arg, "--file=") {
+			file = strings.TrimPrefix(arg, "--file=")
+		}
+	}
+	if file != "-" {
+		return errors.New("execution start requires --file - --json; prompt input is stdin-only")
+	}
 	return cmdV2Start(args, out)
 }
 

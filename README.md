@@ -10,11 +10,12 @@ root. Set `HANDOFF_HOME` or pass `--state` to select it.
 
 ## Start and observe
 
-Start requires the exact native runtime Session identity; there is no global
-"last session" selector:
+Ordinary `start` and `create` may launch a new native Session; passing
+`--session` resumes only that exact identity. There is no global "last session"
+selector:
 
 ```sh
-handoff start --runtime codex --session THREAD_ID --prompt 'work' \
+handoff start --runtime codex --prompt 'work' \
   --root /repo --authorized-by human:id --idempotency-key request-01 --json
 handoff status EXECUTION_ID --json
 handoff list --json
@@ -27,23 +28,25 @@ The arca-cloud promotion seam accepts one strict JSON object on stdin:
 ```sh
 handoff execution start --file - --json <<'JSON'
 {
-  "native_session": {"runtime": "codex", "id": "THREAD_ID"},
+  "idempotency_key": "request-01",
+  "goal": "work",
   "prompt": "work",
-  "runtime": {"name": "codex", "sandbox": "workspace-write"},
-  "root": "/repo",
-  "authority": {"requested_by": "human:id", "human_authorized": true, "sandbox": "workspace-write"},
-  "finalizer": {"enabled": false},
-  "budget": {"max_task_attempts": 3, "max_launches": 12},
-  "idempotency_key": "request-01"
+  "remote_root": "/repo",
+  "runtime": "codex",
+  "resume_id": "THREAD_ID",
+  "sandbox": "workspace-write",
+  "role": "human:id"
 }
 JSON
 ```
 
-The response is exactly `{"execution": ..., "receipt": ...}`. Reusing a key
-with different canonical input fails closed.
+The promotion response is exactly `{"workflow_id":"...","node_id":"..."}`.
+Reusing a key with different canonical input fails closed.
 
-Pause is synchronous and idempotent. It fences active Attempts, releases all
-writer Leases, and only then returns:
+Pause is synchronous and idempotent. It records exact stop controls, waits for
+the executor to apply them and record terminal exits, releases writer Leases
+only after those exits, and returns a completed pure projection or a bounded
+timeout:
 
 ```sh
 handoff execution pause --workflow WORKFLOW_ID --json
@@ -88,7 +91,7 @@ and writes use the Supervisor journal.
 Required checks before handoff:
 
 ```sh
-gofmt -w cmd internal supervisor
+gofmt all Go files before running the checks below.
 go test ./...
 go test -race ./...
 go vet ./...

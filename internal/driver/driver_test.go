@@ -35,6 +35,30 @@ func TestDriversOwnExactResumeLaunches(t *testing.T) {
 	}
 }
 
+func TestDriversLaunchNewSessionsWithoutResumeSelectors(t *testing.T) {
+	for _, runtimeName := range []string{"codex", "claude", "pi"} {
+		t.Run(runtimeName, func(t *testing.T) {
+			request := launchRequest(runtimeName)
+			request.Session.ID = ""
+			built, err := Lookup(runtimeName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			launch, err := built.Build(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			joined := strings.Join(launch.Args, " ")
+			if strings.Contains(joined, "resume") || strings.Contains(joined, "--session") {
+				t.Fatalf("new session launch selected exact resume: %s", joined)
+			}
+			if runtimeName == "pi" && !strings.Contains(joined, "--print") {
+				t.Fatalf("Pi new session launch is not noninteractive: %s", joined)
+			}
+		})
+	}
+}
+
 func TestDriversNeverPlacePromptInArgvOrServiceData(t *testing.T) {
 	secret := "prompt-secret-that-must-stay-on-stdin"
 	for _, runtimeName := range []string{"codex", "claude", "pi"} {
@@ -57,7 +81,7 @@ func TestDriversNeverPlacePromptInArgvOrServiceData(t *testing.T) {
 }
 
 func TestTrustModeIsAppliedByNativeDrivers(t *testing.T) {
-	for _, runtimeName := range []string{"codex", "claude"} {
+	for _, runtimeName := range []string{"codex", "claude", "pi"} {
 		t.Run(runtimeName, func(t *testing.T) {
 			request := launchRequest(runtimeName)
 			request.TrustMode = TrustFull
@@ -76,7 +100,22 @@ func TestTrustModeIsAppliedByNativeDrivers(t *testing.T) {
 			if runtimeName == "claude" && !strings.Contains(joined, "--dangerously-skip-permissions") {
 				t.Fatalf("Claude full trust flag missing: %s", joined)
 			}
+			if runtimeName == "pi" && !strings.Contains(joined, "--approve") {
+				t.Fatalf("Pi full trust flag missing: %s", joined)
+			}
 		})
+	}
+}
+
+func TestPiWorkspaceTrustDisablesApproval(t *testing.T) {
+	request := launchRequest("pi")
+	launch, err := (Pi{}).Build(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(launch.Args, " ")
+	if !strings.Contains(joined, "--print") || !strings.Contains(joined, "--no-approve") || strings.Contains(joined, "--approve") {
+		t.Fatalf("Pi workspace launch has wrong noninteractive trust flags: %s", joined)
 	}
 }
 

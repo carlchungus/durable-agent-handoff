@@ -39,9 +39,12 @@ execution, receipt, err := store.StartExecution(ctx, supervisor.StartExecutionIn
 })
 ```
 
-`StartExecution` requires an exact native Session identity. It never selects a
-global last Session. The same idempotency key and canonical request returns the
-same Execution and `receipt.Existing=true`; divergent input returns
+`StartExecution` accepts an optional native Session ID for ordinary new-session
+launches. A missing ID creates a Supervisor-owned unbound Session; the first
+typed `session_bound` milestone binds it immutably. Continuations and the
+promotion seam require an exact bound identity. It never selects a global last
+Session. The same idempotency key and canonical request returns the same
+Execution and `receipt.Existing=true`; divergent input returns
 `ErrIdempotencyConflict`.
 
 All mutations use typed Store methods backed by the one transactional Command
@@ -54,9 +57,11 @@ interface:
 | `QueueActivity` | derived immutable dependency Result bindings + Activity |
 | `ContinueSession` | human Message + exact-Session continuation Activity generation |
 | `PrepareAttempt` | immutable Attempt + canonical-worktree writer Lease + inbox dispatch |
-| `RecordMilestone` | typed milestone plus any Result, inbox settlement, or Lease release |
+| `RecordMilestone` | typed milestone plus any Result, inbox settlement, or terminal-exit Lease release |
 | `RequestControl` | accepted/rejected exact Activity-generation and Attempt fence |
-| `PauseWorkflow` | fences every active Attempt and releases all writer Leases before returning |
+| `PauseWorkflow` | records exact controls and enters requested/draining; executor-applied terminal exits release Leases |
+| `SettlePause` | idempotently marks a draining pause completed after every fenced Attempt has exited |
+| `ApplyControl` | records that an executor applied one exact Activity-generation/Attempt control |
 | `ImportV1` | one deterministic one-way legacy import transaction |
 
 Every mutating call requires an idempotency key of 8–256 safe characters.
@@ -136,19 +141,20 @@ input. They must not synthesize a new Activity, Attempt, or Session identity.
 
 ## CLI promotion and service boundary
 
-`handoff execution start --file - --json` accepts exactly one JSON object with
-the `StartExecutionInput` fields `native_session`, `prompt`, `runtime`, `root`,
-`authority`, `finalizer`, `budget`, and `idempotency_key`. Unknown fields and a
+`handoff execution start --file - --json` accepts exactly one flat JSON object
+with `idempotency_key`, `goal`, `prompt`, `remote_root`, `runtime`, `resume_id`,
+`sandbox`, and `role`, plus optional `model` and `effort`. Unknown fields and a
 second JSON value are rejected. Its only JSON response shape is:
 
 ```json
-{"execution": {"id": "..."}, "receipt": {"sequence": 1, "existing": false}}
+{"workflow_id":"...","node_id":"..."}
 ```
 
 `handoff execution pause --workflow ID --json` uses a deterministic default
-idempotency key when one is not supplied. The command commits pause controls
-and Lease releases together; an Attempt holding an old fence cannot append a
-later milestone.
+idempotency key when one is not supplied. The command commits pause controls,
+then waits on pure projection reads until the executor records exact terminal
+exit evidence and the later idempotent settle command marks the pause complete.
+An Attempt holding an old fence cannot append a later non-terminal milestone.
 
 `serve` accepts `--environment-json FILE` only when `FILE` is a regular
 mode-0600 file containing one JSON object, and `--trust-mode workspace|full`.

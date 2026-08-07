@@ -61,6 +61,16 @@ func (r *processTreeReservation) close() {
 	}
 }
 
+func (r *processTreeReservation) closeWithError() error {
+	r.close()
+	return nil
+}
+
+func (r *processTreeReservation) stop(_ int) error {
+	r.close()
+	return nil
+}
+
 func ConfigureBackgroundProcess(command *exec.Cmd) {
 	if command.SysProcAttr == nil {
 		command.SysProcAttr = &syscall.SysProcAttr{}

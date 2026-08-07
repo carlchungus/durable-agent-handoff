@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/activity"
@@ -22,11 +23,12 @@ import (
 )
 
 type Executor struct {
-	Store       *supervisor.Store
-	OutputRoot  string
-	Drivers     func(string) (driver.Driver, error)
-	Environment []string
-	TrustMode   driver.TrustMode
+	Store           *supervisor.Store
+	OutputRoot      string
+	Drivers         func(string) (driver.Driver, error)
+	Environment     []string
+	TrustMode       driver.TrustMode
+	StartupDeadline time.Duration
 }
 
 func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.ActivityID) error {
@@ -53,7 +55,11 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	if node == nil || session == nil {
 		return errors.New("Activity projection has broken Node or Session identity")
 	}
-	runtimeDriver, err := e.Drivers(node.Work.Runtime.Name)
+	runtimeSpec, err := selectRuntime(node.Work, state, logical.ID)
+	if err != nil {
+		return err
+	}
+	runtimeDriver, err := e.Drivers(runtimeSpec.Name)
 	if err != nil {
 		return err
 	}
@@ -73,13 +79,14 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	if trustMode == "" {
 		trustMode = driver.TrustWorkspace
 	}
-	launch, err := runtimeDriver.Build(driver.LaunchRequest{Runtime: node.Work.Runtime, Worktree: node.Work.Root, Prompt: logical.Prompt, Session: session.Native, SchemaPath: schemaPath, ResultPath: resultPath, TrustMode: trustMode})
+	launch, err := runtimeDriver.Build(driver.LaunchRequest{Runtime: runtimeSpec, Worktree: node.Work.Root, Prompt: logical.Prompt, Session: session.Native, SchemaPath: schemaPath, ResultPath: resultPath, TrustMode: trustMode})
 	if err != nil {
 		return err
 	}
 	argv := append([]string{launch.Executable}, launch.Args...)
 	attempt, receipt, err := e.Store.PrepareAttempt(ctx, supervisor.PrepareAttemptInput{
 		ActivityID: logical.ID, ExpectedGeneration: logical.Generation,
+		Runtime:        runtimeSpec,
 		CommandDigest:  runstate.CommandDigest(launch.Executable, launch.Args),
 		Outputs:        supervisor.OutputIdentity{Stdout: "output_" + shortDigest(stdoutPath), Stderr: "output_" + shortDigest(stderrPath), Result: "output_" + shortDigest(resultPath)},
 		IdempotencyKey: keyPrefix + "/prepare",
@@ -155,26 +162,110 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	}()
 	waited := make(chan error, 1)
 	go func() { waited <- command.Wait() }()
+	closeDecoder := sync.Once{}
+	stopDecoder := func() { closeDecoder.Do(func() { close(stopDecode) }) }
+	startupDeadline := e.StartupDeadline
+	if startupDeadline <= 0 {
+		startupDeadline = 30 * time.Second
+	}
+	startupAt := time.Now().Add(startupDeadline)
+	poll := time.NewTicker(50 * time.Millisecond)
+	defer poll.Stop()
+	stopping := false
+	startupFailureRecorded := false
 	var processErr error
-	select {
-	case processErr = <-waited:
-		close(stopDecode)
-		if decodeErr := <-decodeErrors; decodeErr != nil {
-			processErr = errors.Join(processErr, decodeErr)
-		}
-	case decodeErr := <-decodeErrors:
-		if decodeErr != nil {
-			_ = command.Process.Kill()
-			processErr = errors.Join(<-waited, decodeErr)
-		} else {
+
+waitLoop:
+	for {
+		select {
+		case processErr = <-waited:
+			stopDecoder()
+			if decodeErr := <-decodeErrors; decodeErr != nil && !(stopping && errors.Is(decodeErr, supervisor.ErrFenced)) {
+				processErr = errors.Join(processErr, decodeErr)
+			}
+			break waitLoop
+		case decodeErr := <-decodeErrors:
+			if decodeErr != nil {
+				_ = gated.Stop()
+				stopping = true
+				processErr = errors.Join(<-waited, decodeErr)
+				break waitLoop
+			}
 			processErr = <-waited
-		}
-	case <-ctx.Done():
-		_ = command.Process.Kill()
-		processErr = errors.Join(<-waited, ctx.Err())
-		close(stopDecode)
-		if decodeErr := <-decodeErrors; decodeErr != nil {
-			processErr = errors.Join(processErr, decodeErr)
+			break waitLoop
+		case <-ctx.Done():
+			_ = gated.Stop()
+			stopping = true
+			processErr = errors.Join(<-waited, ctx.Err())
+			stopDecoder()
+			if decodeErr := <-decodeErrors; decodeErr != nil && !errors.Is(decodeErr, supervisor.ErrFenced) {
+				processErr = errors.Join(processErr, decodeErr)
+			}
+			break waitLoop
+		case <-poll.C:
+			control, turnStarted, observeErr := pendingControl(e.Store, logical.ID, attempt.ID)
+			if observeErr != nil {
+				_ = gated.Stop()
+				stopping = true
+				processErr = errors.Join(<-waited, observeErr)
+				stopDecoder()
+				if decodeErr := <-decodeErrors; decodeErr != nil && !errors.Is(decodeErr, supervisor.ErrFenced) {
+					processErr = errors.Join(processErr, decodeErr)
+				}
+				break waitLoop
+			}
+			if control != nil && !stopping {
+				if err := gated.Stop(); err != nil {
+					processErr = errors.Join(<-waited, err)
+					stopDecoder()
+					if decodeErr := <-decodeErrors; decodeErr != nil && !errors.Is(decodeErr, supervisor.ErrFenced) {
+						processErr = errors.Join(processErr, decodeErr)
+					}
+					break waitLoop
+				}
+				stopping = true
+				if _, _, applyErr := e.Store.ApplyControl(context.Background(), supervisor.ApplyControlInput{ControlID: control.ID, ActivityID: logical.ID, ExpectedGeneration: logical.Generation, AttemptID: attempt.ID, IdempotencyKey: keyPrefix + "/control-applied/" + string(control.ID)}); applyErr != nil && !errors.Is(applyErr, supervisor.ErrFenced) {
+					processErr = errors.Join(<-waited, applyErr)
+					stopDecoder()
+					if decodeErr := <-decodeErrors; decodeErr != nil && !errors.Is(decodeErr, supervisor.ErrFenced) {
+						processErr = errors.Join(processErr, decodeErr)
+					}
+					break waitLoop
+				}
+			}
+			if !turnStarted && !startupFailureRecorded && time.Now().After(startupAt) {
+				control, _, controlErr := e.Store.RequestControl(context.Background(), supervisor.RequestControlInput{ActivityID: logical.ID, ExpectedGeneration: logical.Generation, ExpectedAttemptID: attempt.ID, Kind: "stop", Actor: "supervisor:startup-deadline", IdempotencyKey: keyPrefix + "/startup-control"})
+				if controlErr != nil && !errors.Is(controlErr, supervisor.ErrFenced) {
+					processErr = errors.Join(<-waited, controlErr)
+					stopDecoder()
+					if decodeErr := <-decodeErrors; decodeErr != nil && !errors.Is(decodeErr, supervisor.ErrFenced) {
+						processErr = errors.Join(processErr, decodeErr)
+					}
+					break waitLoop
+				}
+				if control != nil && control.Accepted {
+					if _, recordErr := e.record(context.Background(), logical, attempt, keyPrefix+"/startup-failed", runtimeDriver.StartFailed(errors.New("pre-turn startup deadline exceeded"))); recordErr != nil && !errors.Is(recordErr, supervisor.ErrFenced) {
+						_ = gated.Stop()
+						processErr = errors.Join(<-waited, recordErr)
+						stopDecoder()
+						if decodeErr := <-decodeErrors; decodeErr != nil && !errors.Is(decodeErr, supervisor.ErrFenced) {
+							processErr = errors.Join(processErr, decodeErr)
+						}
+						break waitLoop
+					}
+					if err := gated.Stop(); err != nil {
+						processErr = errors.Join(<-waited, err)
+						stopDecoder()
+						if decodeErr := <-decodeErrors; decodeErr != nil && !errors.Is(decodeErr, supervisor.ErrFenced) {
+							processErr = errors.Join(processErr, decodeErr)
+						}
+						break waitLoop
+					}
+					stopping = true
+					_, _, _ = e.Store.ApplyControl(context.Background(), supervisor.ApplyControlInput{ControlID: control.ID, ActivityID: logical.ID, ExpectedGeneration: logical.Generation, AttemptID: attempt.ID, IdempotencyKey: keyPrefix + "/startup-control-applied"})
+				}
+				startupFailureRecorded = true
+			}
 		}
 	}
 	code := 0
@@ -191,10 +282,69 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 		}
 	}
 	_, exitErr := e.record(context.Background(), logical, attempt, keyPrefix+"/exit", runtimeDriver.Exited(code, processErr))
+	e.settlePause(logical, keyPrefix)
 	if processErr != nil {
 		return errors.Join(processErr, exitErr)
 	}
 	return exitErr
+}
+
+func pendingControl(store *supervisor.Store, activityID supervisor.ActivityID, attemptID supervisor.AttemptID) (*supervisor.Control, bool, error) {
+	state, err := store.Projection()
+	if err != nil {
+		return nil, false, err
+	}
+	attempt := state.Attempts[attemptID]
+	activity := state.Activities[activityID]
+	if attempt == nil || activity == nil || attempt.ActivityID != activity.ID || attempt.ActivityGeneration != activity.Generation {
+		return nil, false, supervisor.ErrFenced
+	}
+	turnStarted := false
+	for _, milestone := range attempt.Milestones {
+		if milestone.Kind == supervisor.MilestoneTurnStarted {
+			turnStarted = true
+		}
+	}
+	for _, control := range state.Controls {
+		if control.Accepted && control.ActivityID == activity.ID && control.ExpectedGeneration == activity.Generation && control.ExpectedAttemptID == attempt.ID && control.AppliedAt.IsZero() {
+			return control, turnStarted, nil
+		}
+	}
+	return nil, turnStarted, nil
+}
+
+func selectRuntime(work supervisor.WorkSpec, state *supervisor.State, activityID supervisor.ActivityID) (supervisor.RuntimeSpec, error) {
+	candidates := append([]supervisor.RuntimeSpec{work.Runtime}, work.Fallbacks...)
+	usedUnavailable := make(map[string]bool)
+	for _, attempt := range state.Attempts {
+		if attempt.ActivityID != activityID {
+			continue
+		}
+		for _, milestone := range attempt.Milestones {
+			if milestone.Kind == supervisor.MilestoneProviderUnavailable {
+				usedUnavailable[runtimeKey(attempt.Runtime)] = true
+				break
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		if !usedUnavailable[runtimeKey(candidate)] {
+			return candidate, nil
+		}
+	}
+	return supervisor.RuntimeSpec{}, errors.New("all runtime fallback candidates are provider-unavailable")
+}
+
+func runtimeKey(runtime supervisor.RuntimeSpec) string {
+	return runtime.Name + "\x00" + runtime.Executable + "\x00" + runtime.Model + "\x00" + runtime.Effort + "\x00" + string(runtime.Sandbox)
+}
+
+func (e *Executor) settlePause(logical *supervisor.Activity, keyPrefix string) {
+	state, err := e.Store.Projection()
+	if err != nil || state.Pauses[logical.WorkflowID] == nil {
+		return
+	}
+	_, _, _ = e.Store.SettlePause(context.Background(), supervisor.SettlePauseInput{WorkflowID: logical.WorkflowID, IdempotencyKey: keyPrefix + "/pause-settle"})
 }
 
 func (e *Executor) decodeFile(ctx context.Context, logical *supervisor.Activity, attempt *supervisor.Attempt, keyPrefix, path string, decoder driver.Decoder, stop <-chan struct{}) error {
@@ -246,7 +396,8 @@ func (e *Executor) record(ctx context.Context, logical *supervisor.Activity, att
 
 func (e *Executor) failStart(ctx context.Context, logical *supervisor.Activity, attempt *supervisor.Attempt, keyPrefix string, runtimeDriver driver.Driver, failure error) error {
 	_, recordErr := e.record(ctx, logical, attempt, keyPrefix+"/start-failed", runtimeDriver.StartFailed(failure))
-	return errors.Join(failure, recordErr)
+	_, exitErr := e.record(context.Background(), logical, attempt, keyPrefix+"/exit", runtimeDriver.Exited(127, failure))
+	return errors.Join(failure, recordErr, exitErr)
 }
 
 func (e *Executor) failAfterSpawn(ctx context.Context, logical *supervisor.Activity, attempt *supervisor.Attempt, keyPrefix string, runtimeDriver driver.Driver, failure error) error {

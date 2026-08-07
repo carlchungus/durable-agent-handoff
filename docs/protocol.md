@@ -99,6 +99,10 @@ Drivers may emit only:
 | `adapter_start_failed` | reason | terminal pre-turn startup failure |
 | `exit` | exit code and optional error | terminal OS process fact |
 
+For Codex, `item.completed` agent messages are non-terminal even when they
+match the worker result schema. The latest structured candidate becomes the
+worker Result only after the documented `turn.completed` event.
+
 `process_spawned` and `session_bound` do not imply `turn_started`. Duplicate
 turns/results, milestones after a Result other than `exit`, non-monotonic event
 times, and stale Lease/Attempt fences are rejected.

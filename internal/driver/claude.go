@@ -20,7 +20,7 @@ func (Claude) Build(request LaunchRequest) (Launch, error) {
 	if request.Runtime.Sandbox == supervisor.SandboxReadOnly {
 		tools = "Read,Glob,Grep"
 	}
-	args := []string{"--print", "--output-format", "stream-json", "--verbose", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`, "--model", fallback(request.Runtime.Model, "sonnet"), "--effort", fallback(request.Runtime.Effort, "high"), "--permission-mode", "dontAsk", "--tools", tools}
+	args := []string{"--print", "--output-format", "stream-json", "--verbose", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`, "--model", fallback(request.Runtime.Model, "sonnet"), "--effort", fallback(request.Runtime.Effort, "max"), "--permission-mode", "dontAsk", "--tools", tools}
 	if strings.TrimSpace(request.Session.ID) != "" {
 		args = append(args, "--resume", request.Session.ID)
 	}

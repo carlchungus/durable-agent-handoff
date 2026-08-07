@@ -84,8 +84,9 @@ func TestPublicCLICompletesOneActivityThroughRuntimeProcess(t *testing.T) {
 			Status string `json:"status"`
 		} `json:"activities"`
 		Attempts []struct {
-			Health       string `json:"health"`
-			ResultStatus string `json:"result_status"`
+			Health         string `json:"health"`
+			ResultStatus   string `json:"result_status"`
+			TerminalReason string `json:"terminal_reason"`
 		} `json:"attempts"`
 	}
 	decodeJSON(t, statusJSON, &status)
@@ -94,6 +95,9 @@ func TestPublicCLICompletesOneActivityThroughRuntimeProcess(t *testing.T) {
 	}
 	if len(status.Attempts) != 1 || status.Attempts[0].Health != "exited" || status.Attempts[0].ResultStatus != "completed" {
 		t.Fatalf("terminal Attempt not visible through status: %+v", status.Attempts)
+	}
+	if status.Attempts[0].TerminalReason != "" {
+		t.Fatalf("successful runtime result retained a false terminal failure: %+v", status.Attempts[0])
 	}
 
 	var activities []struct {
@@ -204,12 +208,20 @@ func TestPublicCLIGoalRejectsPlanAndContinuesExactSession(t *testing.T) {
 				Generation uint64 `json:"generation"`
 				Status     string `json:"status"`
 			} `json:"activities"`
+			Attempts []struct {
+				TerminalReason string `json:"terminal_reason"`
+			} `json:"attempts"`
 			PendingTurns []string `json:"pending_turns"`
 		}
 		decodeJSON(t, runCLI(t, environment, "", "status", started.Execution.ID, "--state", state, "--json"), &status)
 		if len(status.Activities) == 2 && status.Activities[1].Status == "completed" && len(status.PendingTurns) == 0 {
 			if status.Activities[0].Generation != 1 || status.Activities[1].Generation != 2 || status.Activities[0].SessionID != status.Activities[1].SessionID || decisions.Load() != 2 {
 				t.Fatalf("goal exact-session lifecycle=%+v decisions=%d", status.Activities, decisions.Load())
+			}
+			for _, attempt := range status.Attempts {
+				if attempt.TerminalReason != "" {
+					t.Fatalf("successful goal turn retained a false terminal failure: %+v", status.Attempts)
+				}
 			}
 			break
 		}

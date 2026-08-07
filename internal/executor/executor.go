@@ -528,6 +528,20 @@ func activityHasResult(state *supervisor.State, activityID supervisor.ActivityID
 			return true
 		}
 	}
+	// Goal workers persist their typed turn output as an Attempt milestone while
+	// the evaluator is still deciding it. That output is enough to prove the
+	// contained runtime finished normally even though the immutable supervisor
+	// Result is intentionally not committed yet.
+	for _, attempt := range state.Attempts {
+		if attempt.ActivityID != activityID {
+			continue
+		}
+		for _, milestone := range attempt.Milestones {
+			if milestone.Kind == supervisor.MilestoneResult && milestone.Result != nil {
+				return true
+			}
+		}
+	}
 	return false
 }
 

@@ -190,6 +190,34 @@ func TestTrustModeIsAppliedByNativeDrivers(t *testing.T) {
 	}
 }
 
+func TestDefaultWorkerEffortUsesEachHarnessMaximum(t *testing.T) {
+	tests := []struct {
+		runtime string
+		want    string
+	}{
+		{runtime: "codex", want: `model_reasoning_effort="xhigh"`},
+		{runtime: "claude", want: "--effort max"},
+		{runtime: "pi", want: "--thinking xhigh"},
+	}
+	for _, test := range tests {
+		t.Run(test.runtime, func(t *testing.T) {
+			request := launchRequest(test.runtime)
+			request.Runtime.Effort = ""
+			runtimeDriver, err := Lookup(test.runtime)
+			if err != nil {
+				t.Fatal(err)
+			}
+			launch, err := runtimeDriver.Build(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if joined := strings.Join(launch.Args, " "); !strings.Contains(joined, test.want) {
+				t.Fatalf("default worker did not use maximum supported effort: %s", joined)
+			}
+		})
+	}
+}
+
 func TestPiWorkspaceTrustDisablesApproval(t *testing.T) {
 	request := launchRequest("pi")
 	launch, err := (Pi{}).Build(request)
@@ -225,6 +253,68 @@ func TestCodexDecoderPreservesRuntimeFailure(t *testing.T) {
 	_, err := decoder.DecodeLine([]byte(`{"type":"error","message":"invalid response schema"}`))
 	if err == nil || !strings.Contains(err.Error(), "invalid response schema") {
 		t.Fatalf("runtime failure was hidden: %v", err)
+	}
+}
+
+func TestCodexProviderFailureFixturePreservesExactError(t *testing.T) {
+	file, err := os.Open(filepath.Join("testdata", "codex-invalid-schema.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	decoder := Codex{}.NewDecoder()
+	var decoded error
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		if _, decoded = decoder.DecodeLine(scanner.Bytes()); decoded != nil {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if decoded == nil || !strings.Contains(decoded.Error(), "Missing 'blocker_kind'") {
+		t.Fatalf("provider error fixture was not preserved: %v", decoded)
+	}
+}
+
+func TestCodexDecoderIgnoresTransportMessagesAfterResult(t *testing.T) {
+	decoder := Codex{}.NewDecoder()
+	lines := []string{
+		`{"type":"turn.started"}`,
+		`{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"continue\",\"summary\":\"starting\",\"blocker_kind\":\"\",\"question\":\"\"}"}}`,
+		`{"type":"item.started","item":{"id":"command-1","type":"command_execution"}}`,
+		`{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"completed\",\"summary\":\"done\",\"blocker_kind\":\"\",\"question\":\"\"}"}}`,
+		`{"type":"turn.completed"}`,
+		`{"type":"item.completed","item":{"type":"agent_message","text":"late transport summary"}}`,
+	}
+	var results, later int
+	for _, line := range lines {
+		milestones, err := decoder.DecodeLine([]byte(line))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, milestone := range milestones {
+			if milestone.Kind == supervisor.MilestoneResult {
+				results++
+			} else if results > 0 {
+				later++
+			}
+		}
+	}
+	if results != 1 || later != 0 {
+		t.Fatalf("post-result events escaped decoder: results=%d later=%d", results, later)
+	}
+}
+
+func TestCodexDecoderRejectsTurnCompletionWithoutContract(t *testing.T) {
+	decoder := Codex{}.NewDecoder()
+	if _, err := decoder.DecodeLine([]byte(`{"type":"turn.started"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := decoder.DecodeLine([]byte(`{"type":"turn.completed"}`))
+	if err == nil || !strings.Contains(err.Error(), "omitted the structured completion result") {
+		t.Fatalf("missing completion contract was accepted: %v", err)
 	}
 }
 

@@ -71,6 +71,9 @@ on the exact Session, and `escalate` requires a typed workflow-wide blocker plus
 one concrete question. DeepSeek's forced evaluation tool is the default extraction mode;
 strict `response_format` remains available for compatibility probes because it
 was unreliable against the checked-in real-transcript corpus.
+Evaluator context describes only capabilities the Supervisor actually owns: a
+configured finalizer can merge an explicitly supplied PR, but cannot push,
+create or discover PRs, or start itself.
 
 Pause is synchronous and idempotent. It records exact stop controls, waits for
 the executor to apply them and record terminal exits, releases writer Leases

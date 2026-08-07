@@ -116,6 +116,7 @@ func TestServeV2EvaluatesRealTerminalClaimBeforeSchedulingContinuation(t *testin
 		Runtime:        supervisor.RuntimeSpec{Name: "test", Sandbox: supervisor.SandboxWorkspaceWrite},
 		Root:           worktree,
 		Authority:      supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite},
+		Finalizer:      supervisor.FinalizerSpec{Enabled: true, RequiredChecks: []string{"approve"}},
 		Budget:         supervisor.Budget{MaxTaskAttempts: 10, MaxLaunches: 20},
 		Autonomy:       supervisor.AutonomySpec{Enabled: true, EvaluatorModel: "fake/evaluator", MaxTurns: 100},
 		IdempotencyKey: "serve-evaluation-start",
@@ -149,7 +150,7 @@ func TestServeV2EvaluatesRealTerminalClaimBeforeSchedulingContinuation(t *testin
 			Workers:    1,
 			OutputRoot: outputRoot,
 			Evaluator: evaluatorFunc(func(_ context.Context, request evaluator.Request) (supervisor.EvaluationDecision, error) {
-				if request.Goal == "" || request.Prompt == "" || request.Claim.Summary != "This candidate is unsafe" {
+				if request.Goal == "" || request.Prompt == "" || request.Claim.Summary != "This candidate is unsafe" || !strings.Contains(request.SupervisorContext, "does not push branches") {
 					return supervisor.EvaluationDecision{}, errors.New("evaluator request lost durable context")
 				}
 				return supervisor.EvaluationDecision{Outcome: "continue", Reason: "The local candidate is unsuitable; select another safe candidate.", Model: "fake/evaluator"}, nil

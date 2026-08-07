@@ -230,7 +230,7 @@ func claimEvaluationRequest(state *supervisor.State, claimID supervisor.ClaimID)
 	}
 	request := evaluator.Request{Model: workflow.Autonomy.EvaluatorModel, Goal: node.Title, Prompt: activity.Prompt, Claim: claim.Result}
 	if workflow.Finalizer.Enabled {
-		request.SupervisorContext = "An enabled deterministic finalizer is already human-authorized to publish only after the worker result is accepted and the exact configured external checks pass on an unchanged head. Publication is intentionally not worker authority."
+		request.SupervisorContext = "A configured deterministic finalizer can merge only an explicitly supplied existing pull request after an accepted completed Result and exact unchanged-head checks. It does not push branches, create or discover pull requests, or start itself. Do not treat those unfinished steps as already handled."
 	} else {
 		request.SupervisorContext = "No Supervisor-owned downstream finalizer is enabled for this workflow."
 	}

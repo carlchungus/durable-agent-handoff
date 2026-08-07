@@ -189,6 +189,10 @@ restrictions and `full` selects its native full-trust flag. This policy is
 translated inside each Driver and is never implemented with a shell command or
 by placing prompt/environment data in a unit file.
 
+Installed services use an explicit executable search path containing the
+user-local binary directory so Codex, Claude, and Pi resolve identically under
+systemd or launchd and an interactive shell.
+
 ## Canonical-worktree writer Lease
 
 Workspace-writing Attempt creation and Lease acquisition share one journal

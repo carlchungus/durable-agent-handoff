@@ -45,15 +45,27 @@ func prepareProcessTree(command *exec.Cmd) (*processTreeReservation, error) {
 		windows.CloseHandle(job)
 		return nil, fmt.Errorf("configure Windows Job Object: %w", err)
 	}
-	if err = windows.SetHandleInformation(job, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
-		windows.CloseHandle(job)
-		return nil, err
-	}
-	command.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP, AdditionalInheritedHandles: []syscall.Handle{syscall.Handle(job)}}
+	command.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
 	return &processTreeReservation{name: name, handle: job}, nil
 }
 
-func (r *processTreeReservation) bind(_ int, _ string) (string, error) { return r.name, nil }
+func (r *processTreeReservation) bind(pid int, _ string) (string, error) {
+	if r == nil || r.handle == 0 {
+		return "", fmt.Errorf("Windows process tree is not initialized")
+	}
+	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(pid))
+	if err != nil {
+		return "", fmt.Errorf("open gated runner for Job Object assignment: %w", err)
+	}
+	defer windows.CloseHandle(process)
+	if err = windows.AssignProcessToJobObject(r.handle, process); err != nil {
+		return "", fmt.Errorf("assign gated runner to Job Object: %w", err)
+	}
+	return r.name, nil
+}
+
+func (r *processTreeReservation) release() {}
+
 func (r *processTreeReservation) close() {
 	if r != nil && r.handle != 0 {
 		_ = windows.CloseHandle(r.handle)
@@ -62,13 +74,24 @@ func (r *processTreeReservation) close() {
 }
 
 func (r *processTreeReservation) closeWithError() error {
-	r.close()
-	return nil
+	if r == nil || r.handle == 0 {
+		return nil
+	}
+	err := windows.CloseHandle(r.handle)
+	r.handle = 0
+	return err
 }
 
 func (r *processTreeReservation) stop(_ int) error {
-	r.close()
-	return nil
+	if r == nil || r.handle == 0 {
+		return nil
+	}
+	terminateErr := windows.TerminateJobObject(r.handle, 1)
+	closeErr := r.closeWithError()
+	if terminateErr != nil {
+		return fmt.Errorf("terminate Windows Job Object: %w", terminateErr)
+	}
+	return closeErr
 }
 
 func ConfigureBackgroundProcess(command *exec.Cmd) {

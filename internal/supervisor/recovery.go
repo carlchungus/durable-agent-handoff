@@ -86,8 +86,17 @@ func (c reconcileStartupCommand) decide(state *State, now time.Time) ([]DomainEv
 		if !sameProcessIdentity(attempt.Process, recovery.Process) {
 			return nil, "", ErrFenced
 		}
-		if attempt.Process != nil && exactProcessLive(attempt.Process) {
-			return nil, "", fmt.Errorf("%w: Attempt %s pid=%d", ErrLiveOrphan, attempt.ID, attempt.Process.PID)
+		if attempt.Process != nil {
+			match, inspectErr := exactProcessMatch(attempt.Process)
+			if inspectErr != nil {
+				return nil, "", fmt.Errorf("inspect orphaned Attempt %s without releasing its lease: %w", attempt.ID, inspectErr)
+			}
+			if match == processidentity.MatchUnknown {
+				return nil, "", fmt.Errorf("inspect orphaned Attempt %s without releasing its lease: identity status is unknown", attempt.ID)
+			}
+			if match == processidentity.MatchExact {
+				return nil, "", fmt.Errorf("%w: Attempt %s pid=%d", ErrLiveOrphan, attempt.ID, attempt.Process.PID)
+			}
 		}
 
 		if attempt.Process == nil && len(attempt.Milestones) == 0 {
@@ -112,11 +121,11 @@ func (c reconcileStartupCommand) decide(state *State, now time.Time) ([]DomainEv
 	return events, "startup-reconcile", nil
 }
 
-func exactProcessLive(process *ProcessIdentity) bool {
+func exactProcessMatch(process *ProcessIdentity) (processidentity.MatchStatus, error) {
 	if process == nil || process.PID <= 0 || strings.TrimSpace(process.StartToken) == "" {
-		return false
+		return processidentity.MatchUnknown, errors.New("durable process identity is incomplete")
 	}
-	return processidentity.ProcessMatches(process.PID, process.StartToken)
+	return processidentity.InspectMatch(process.PID, process.StartToken)
 }
 
 func sameProcessIdentity(left, right *ProcessIdentity) bool {

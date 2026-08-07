@@ -79,9 +79,20 @@ func (g *GatedCommand) Release() error {
 		if err := g.gate.Close(); result == nil {
 			result = err
 		}
-		g.tree.close()
+		g.tree.release()
 	})
 	return result
+}
+
+// CloseContainment releases the supervisor's process-tree reservation after
+// the contained runner has exited. On Windows the retained Job Object handle
+// is also the crash boundary: if the supervisor disappears first, the OS
+// closes the handle and kills the still-running tree.
+func (g *GatedCommand) CloseContainment() error {
+	if g == nil || g.tree == nil {
+		return nil
+	}
+	return g.tree.closeWithError()
 }
 
 func (g *GatedCommand) Abort() {

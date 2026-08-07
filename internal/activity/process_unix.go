@@ -67,6 +67,8 @@ func (r *processTreeReservation) bind(pid int, _ string) (string, error) {
 
 func (r *processTreeReservation) close() {}
 
+func (r *processTreeReservation) release() {}
+
 func (r *processTreeReservation) closeWithError() error { return nil }
 
 func (r *processTreeReservation) stop(pid int) error {

@@ -249,8 +249,15 @@ func TestStartupReconcilePreparedOrphanIsTerminalizedAndRetryable(t *testing.T) 
 }
 
 func TestSupervisorLiveOrphanHelper(t *testing.T) {
-	if !strings.Contains(strings.Join(os.Args, " "), "supervisor-live-orphan-helper") {
+	if os.Getenv("HANDOFF_TEST_LIVE_ORPHAN_HELPER") != "1" {
 		return
+	}
+	ready := os.Getenv("HANDOFF_TEST_LIVE_ORPHAN_READY")
+	if ready == "" {
+		t.Fatal("live orphan helper readiness path is missing")
+	}
+	if err := os.WriteFile(ready, []byte("ready"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	for {
 		time.Sleep(time.Hour)
@@ -258,7 +265,9 @@ func TestSupervisorLiveOrphanHelper(t *testing.T) {
 }
 
 func TestStartupReconcileFailsClosedForExactLiveOrphan(t *testing.T) {
-	cmd := exec.Command(os.Args[0], "-test.run=TestSupervisorLiveOrphanHelper", "--supervisor-live-orphan-helper")
+	ready := filepath.Join(t.TempDir(), "live-orphan-ready")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestSupervisorLiveOrphanHelper$")
+	cmd.Env = append(os.Environ(), "HANDOFF_TEST_LIVE_ORPHAN_HELPER=1", "HANDOFF_TEST_LIVE_ORPHAN_READY="+ready)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +278,9 @@ func TestStartupReconcileFailsClosedForExactLiveOrphan(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	token := ""
 	for time.Now().Before(deadline) && token == "" {
-		token = processidentity.ProcessStartToken(cmd.Process.Pid)
+		if _, readyErr := os.Stat(ready); readyErr == nil {
+			token = processidentity.ProcessStartToken(cmd.Process.Pid)
+		}
 		if token == "" {
 			time.Sleep(5 * time.Millisecond)
 		}
@@ -288,6 +299,9 @@ func TestStartupReconcileFailsClosedForExactLiveOrphan(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := state.Sequence
+	if !processidentity.ProcessMatches(cmd.Process.Pid, token) {
+		t.Fatal("live orphan helper lost its exact identity before reconciliation")
+	}
 	if err := store.ReconcileStartup(context.Background()); !errors.Is(err, ErrLiveOrphan) {
 		t.Fatalf("exact live orphan did not fail closed: %v", err)
 	}

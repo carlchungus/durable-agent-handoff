@@ -19,6 +19,7 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/activity"
 	"github.com/carlchungus/durable-agent-handoff/internal/commanddigest"
 	"github.com/carlchungus/durable-agent-handoff/internal/driver"
+	"github.com/carlchungus/durable-agent-handoff/internal/privatepath"
 	"github.com/carlchungus/durable-agent-handoff/internal/processidentity"
 	"github.com/carlchungus/durable-agent-handoff/internal/supervisor"
 )
@@ -193,10 +194,12 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 		return e.failAfterSpawn(ctx, logical, attempt, keyPrefix, runtimeDriver, err)
 	}
 	if err = gated.Release(); err != nil {
+		_ = gated.CloseContainment()
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		return e.failAfterSpawn(ctx, logical, attempt, keyPrefix, runtimeDriver, err)
 	}
+	defer gated.CloseContainment()
 	stopDecode := make(chan struct{})
 	decodeErrors := make(chan error, 1)
 	go func() {
@@ -472,12 +475,8 @@ func ensurePrivateOutputRoot(path string) error {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return err
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
-		return errors.New("executor output root must be a private directory")
+	if err := privatepath.ValidateDirectory(path); err != nil {
+		return fmt.Errorf("executor output root must be an OS-private directory: %w", err)
 	}
 	return nil
 }

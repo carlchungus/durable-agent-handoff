@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/carlchungus/durable-agent-handoff/internal/privatepath"
 	"github.com/carlchungus/durable-agent-handoff/internal/processidentity"
 )
 
@@ -425,6 +426,10 @@ func (l *Ledger) openRoot() (*os.Root, error) {
 		_ = root.Close()
 		return nil, err
 	}
+	if err = validatePrivateRoot(root); err != nil {
+		_ = root.Close()
+		return nil, fmt.Errorf("unsafe secure ledger root %q: %w", l.rootPath, err)
+	}
 	openedIdentity, openedErr := identifyRoot(root)
 	afterIdentity, afterErr := identifyRootPath(l.rootPath)
 	if openedErr != nil || afterErr != nil || !sameStorageIdentity(beforeIdentity, openedIdentity) || !sameStorageIdentity(beforeIdentity, afterIdentity) {
@@ -510,6 +515,10 @@ func (l *Ledger) openChildRoot(parent *os.Root, name string, create bool) (*os.R
 		_ = child.Close()
 		return nil, err
 	}
+	if err = validatePrivateRoot(child); err != nil {
+		_ = child.Close()
+		return nil, fmt.Errorf("unsafe secure ledger component %q: %w", name, err)
+	}
 	openedIdentity, openedErr := identifyRoot(child)
 	afterIdentity, afterErr := identifyChildRoot(parent, name)
 	if openedErr != nil || afterErr != nil || !sameStorageIdentity(beforeIdentity, openedIdentity) || !sameStorageIdentity(beforeIdentity, afterIdentity) {
@@ -552,6 +561,15 @@ func identifyRoot(root *os.Root) (storageIdentity, error) {
 	}
 	defer file.Close()
 	return identifyStorageFile(file)
+}
+
+func validatePrivateRoot(root *os.Root) error {
+	file, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return privatepath.ValidateOpenedDirectory(file)
 }
 
 func identifyRegularPath(root *os.Root, name string) (storageIdentity, error) {
@@ -598,7 +616,7 @@ func (l *Ledger) openRegular(root *os.Root, name string, flag int, perm os.FileM
 			return nil, err
 		}
 		after, pathErr := root.Lstat(name)
-		safetyErr := validateRegularFile(file)
+		safetyErr := errors.Join(validateRegularFile(file), privatepath.ValidateOpenedFile(file))
 		if pathErr != nil || safetyErr != nil || !after.Mode().IsRegular() {
 			_ = file.Close()
 			if pathErr != nil {

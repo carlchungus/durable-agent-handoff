@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -18,12 +19,15 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 	if err := os.Chmod(state, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	request := `{"idempotency_key":"arca-file-start-01","goal":"promote work","prompt":"secret stdin prompt","remote_root":"` + root + `","runtime":"codex","resume_id":"exact-thread","sandbox":"read-only","role":"arca-cloud","finalizer_enabled":true,"finalizer_required_checks":["verify"],"finalizer_require_human":true}`
+	request, err := json.Marshal(executionStartRequest{IdempotencyKey: "arca-file-start-01", Goal: "promote work", Prompt: "secret stdin prompt", RemoteRoot: root, Runtime: "codex", ResumeID: "exact-thread", Sandbox: supervisor.SandboxReadOnly, Role: "arca-cloud", FinalizerEnabled: true, FinalizerRequiredChecks: []string{"verify"}, FinalizerRequireHuman: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	read, write, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = write.WriteString(request); err != nil {
+	if _, err = write.Write(request); err != nil {
 		t.Fatal(err)
 	}
 	_ = write.Close()
@@ -62,7 +66,7 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 	if finalizer := projection.Workflows[response.WorkflowID].Finalizer; !finalizer.Enabled || !finalizer.RequireHuman || len(finalizer.RequiredChecks) != 1 || finalizer.RequiredChecks[0] != "verify" {
 		t.Fatalf("promotion finalizer was not persisted immutably: %+v", finalizer)
 	}
-	divergent := strings.Replace(request, `"promote work"`, `"different work"`, 1)
+	divergent := strings.Replace(string(request), `"promote work"`, `"different work"`, 1)
 	out.Reset()
 	if err = runWithPrompt(t, []string{"execution", "start", "--state", state, "--file", "-", "--json"}, divergent, &out, &errOut); !errors.Is(err, supervisor.ErrIdempotencyConflict) {
 		t.Fatalf("divergent strict idempotency reuse was not rejected: %v", err)
@@ -310,11 +314,13 @@ func TestEnvironmentJSONRequiresPrivateFileAndReturnsSortedTransientValues(t *te
 	if err != nil || strings.Join(values, ",") != "ALPHA=first,ZED=last" {
 		t.Fatalf("environment=%v err=%v", values, err)
 	}
-	if err = os.Chmod(path, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = readEnvironmentJSON(path); err == nil {
-		t.Fatal("world-readable environment file was accepted")
+	if runtime.GOOS != "windows" {
+		if err = os.Chmod(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = readEnvironmentJSON(path); err == nil {
+			t.Fatal("world-readable environment file was accepted")
+		}
 	}
 }
 

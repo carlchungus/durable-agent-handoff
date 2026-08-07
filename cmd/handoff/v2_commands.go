@@ -21,6 +21,7 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/driver"
 	"github.com/carlchungus/durable-agent-handoff/internal/executor"
 	"github.com/carlchungus/durable-agent-handoff/internal/githubgate"
+	"github.com/carlchungus/durable-agent-handoff/internal/privatepath"
 	"github.com/carlchungus/durable-agent-handoff/internal/service"
 	v2tui "github.com/carlchungus/durable-agent-handoff/internal/tui"
 	"github.com/carlchungus/durable-agent-handoff/supervisor"
@@ -673,16 +674,9 @@ func readEnvironmentJSON(path string) ([]string, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, nil
 	}
-	info, err := os.Lstat(path)
+	file, err := privatepath.OpenFile(path)
 	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		return nil, errors.New("--environment-json must be a regular mode-0600 file")
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("--environment-json must be an OS-private regular file: %w", err)
 	}
 	defer file.Close()
 	var values map[string]string

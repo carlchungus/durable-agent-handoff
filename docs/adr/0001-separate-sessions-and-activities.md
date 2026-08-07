@@ -31,7 +31,7 @@ generation and exact Attempt process identity. The event ledger is canonical;
 snapshots and indexes are rebuildable projections.
 
 Workflow nodes may reference Sessions and Activities but are not their storage
-or lifecycle boundary. Checklist tasks remain a separate UI/domain concept.
+or completion signal. Checklist tasks remain a separate UI/domain concept.
 
 ## Consequences
 

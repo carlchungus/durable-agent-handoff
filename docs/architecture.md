@@ -24,11 +24,11 @@ human / scheduler / runtime Driver / finalizer
    scheduler     JSON / TUI      policy gates
 ```
 
-The public Go seam is `github.com/carlchungus/durable-agent-handoff/supervisor`.
+The public Go package is `github.com/carlchungus/durable-agent-handoff/supervisor`.
 Its `Store.StartExecution` method accepts an optional native Session identity,
 prompt, RuntimeSpec, root, authority and finalizer configuration, budget, and
 idempotency key. Ordinary starts create an unbound Session; the arca-cloud
-promotion seam supplies the exact resume identity and requires it.
+arca-cloud supplies the exact resume identity and requires it.
 
 ## One journal, distinct identities
 
@@ -83,7 +83,7 @@ same key returns the same resource and sequence. Reusing a key for divergent
 input fails without mutation.
 
 Rejected commands never partially mutate live State. Crash-injection tests cover
-every transaction boundary, replay without a snapshot, and concurrent writers.
+every point where a write can fail, replay without a snapshot, and concurrent writers.
 
 ## Desired work and immutable dependency binding
 
@@ -150,7 +150,7 @@ Meaningful progress exists only after a Driver emits `meaningful_progress`.
 
 ## Runtime Drivers
 
-Codex, Claude, and Pi implement a deep Driver contract. Each Driver owns:
+Codex, Claude, and Pi implement the Driver interface. Each Driver handles:
 
 - non-shell argv construction;
 - explicit worktree, sandbox, model, and effort selection;
@@ -161,7 +161,7 @@ Codex, Claude, and Pi implement a deep Driver contract. Each Driver owns:
 Codex output schemas also constrain intermediate agent messages. Its Driver
 therefore buffers structured message candidates and emits one durable `result`
 only when the provider sends `turn.completed`; message text alone is never a
-lifecycle boundary.
+completion signal.
 
 The normalized milestone vocabulary is:
 
@@ -243,11 +243,11 @@ the finalizer then rechecks the independently hosted GitHub checks on that
 unchanged head. `SettleFinalization` records merged or blocked outcome so
 retries after a crash remain idempotent and changed heads fail closed.
 
-## Policy and trust boundaries
+## Permissions and trust
 
 - The Supervisor root is private and outside worker-writable sandboxes.
 - Paths are canonicalized before authority checks or Lease keys are created.
-- An authority envelope may narrow but never widen a runtime sandbox.
+- Requested permissions may narrow but never widen a runtime sandbox.
 - Enabled finalization requires a nonempty canonical exact set of external
   GitHub checks; human approval is independently optional.
 - Independently hosted CI and GitHub checks are the verification authority.
@@ -267,7 +267,7 @@ not replayed. Legacy bytes remain unchanged, and exact native Session/Activity
 recovery is explicitly unsupported and unresolved instead of scraped or
 guessed. See ADR 0003.
 
-## Extension boundaries
+## Adding features
 
 Coordination contracts such as dynamic JavaScript workflows, teams, goals, and
 schedules remain distinct state machines, but their durable changes must be

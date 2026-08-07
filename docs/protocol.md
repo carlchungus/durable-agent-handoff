@@ -1,6 +1,6 @@
 # Supervisor v2 protocol
 
-## Public Go interface
+## Go API
 
 Import:
 
@@ -41,13 +41,12 @@ execution, receipt, err := store.StartExecution(ctx, supervisor.StartExecutionIn
 `StartExecution` accepts an optional native Session ID for ordinary new-session
 launches. A missing ID creates an unbound Session; the first
 typed `session_bound` milestone binds it immutably. Continuations and the
-promotion seam require an exact bound identity. It never selects a global last
+arca-cloud continuations require an exact bound identity. It never selects a global last
 Session. The same idempotency key and canonical request returns the same
 Execution and `receipt.Existing=true`; divergent input returns
 `ErrIdempotencyConflict`.
 
-All mutations use typed Store methods backed by the one transactional Command
-interface:
+All changes use typed Store methods and are written as one command:
 
 | Method | Atomic effect |
 | --- | --- |
@@ -144,7 +143,7 @@ The typed `ActivityView` is intentionally minimal: clients read lifecycle from
 identity. Attempt and Control projections live at the execution level;
 legacy aliases and compatibility envelopes are not part of v2.
 
-`ReconcileStartup` is the explicit restart boundary. It runs once before
+`ReconcileStartup` runs once after a restart and before
 `ServeV2` schedules work, under the journal transaction. Prepared-but-never-
 spawned Attempts are inherited orphans. Dead Attempts receive existing typed
 failure/exit facts plus exact Lease release so their immutable Activity can
@@ -185,7 +184,7 @@ never valid.
 
 ## Crash and retry contract
 
-One command equals one aggregate journal append.
+One command writes one journal record.
 
 - Error at `after_validation`: no state committed.
 - Error at `after_append`: the full command committed; replay recovers it.
@@ -194,7 +193,7 @@ One command equals one aggregate journal append.
 Callers must retry ambiguous responses with the identical idempotency key and
 input. They must not synthesize a new Activity, Attempt, or Session identity.
 
-## CLI promotion and service boundary
+## Starting a resumed session and running the service
 
 Ordinary `start`/`create` prompts and `reply` bodies are stdin-only: callers
 must pass `--file -`. Arbitrary prompt paths, `--prompt`, `--prompt-file`, and

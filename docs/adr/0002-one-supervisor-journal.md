@@ -1,11 +1,11 @@
-# ADR 0002: One Supervisor journal and transactional command boundary
+# ADR 0002: Store Supervisor changes in one journal
 
 - Status: accepted
 - Date: 2026-08-07
 
 ## Context
 
-The v1 control plane persisted Workflow, Session, Activity, Attempt, inbox,
+Version 1 stored Workflow, Session, Activity, Attempt, inbox,
 provider health, and process lifecycle through independently locked ledgers and
 files. The engine then coordinated ordered writes across those stores and used
 reconciliation to repair crash windows. Three failures followed from the model:
@@ -21,8 +21,8 @@ therefore less valuable than removing the competing mutation authorities.
 
 ## Decision
 
-`internal/supervisor` is the sole durable state mutation boundary. The public
-promotion seam is the top-level `supervisor` package.
+`internal/supervisor` is the only code that changes durable state. The public
+Go package is the top-level `supervisor` package.
 
 The Supervisor stores one append-only journal record with a global sequence.
 Every accepted command:
@@ -30,7 +30,7 @@ Every accepted command:
 1. replays the journal to one projection;
 2. decides all domain events for the command;
 3. applies them to a cloned projection and validates the complete result;
-4. appends one aggregate journal entry and fsyncs it; and
+4. appends one journal entry and fsyncs it; and
 5. replaces a disposable snapshot.
 
 A snapshot failure cannot hide an appended command because reads replay the
@@ -59,9 +59,9 @@ from one commit order, not independently writable stores.
 - A process is `starting` after `process_spawned` or `session_bound`. It becomes
   running only after `turn_started`.
 
-### Runtime boundary
+### Runtimes
 
-`internal/driver` provides deep Codex, Claude, and Pi Drivers. Each owns argv
+`internal/driver` provides Codex, Claude, and Pi Drivers. Each handles argv
 construction, exact-session resume, and provider-specific decoding. The only
 milestones are `process_spawned`, `session_bound`, `turn_started`,
 `effect_started`, `meaningful_progress`, `result`, `provider_unavailable`,
@@ -71,7 +71,7 @@ they do not recursively search arbitrary JSON for a session or result.
 Runtime Drivers never receive GitHub merge authority. Publication remains an
 authority-owned effect gated by the Supervisor projection.
 
-### Query boundary
+### Read-only queries
 
 Status, list, queue, health, meaningful progress, external-check publication,
 and orchestration overhead are pure functions of the same projection. Queries
@@ -85,7 +85,7 @@ because a client polled.
 - Output bytes are transport cursors, never health or meaningful progress.
 - Exact writer exclusion works across workflows and symlink aliases because the
   Lease key is a canonical filesystem path.
-- Commands are somewhat larger aggregate events, but crash behavior is local:
+- Commands write somewhat larger events, but crash behavior is simple:
   before append nothing committed; after append the whole command committed.
 - The v1 engine and stores are import sources only while migration is staged;
   new execution must not dual-write them.

@@ -104,7 +104,7 @@ A surface is conformant only when:
 
 ## Suites
 
-[`manifest.json`](manifest.json) is the source index and suite catalog. Fixtures are split by semantic boundary rather than implementation package:
+[`manifest.json`](manifest.json) is the source index and suite catalog. Fixtures are grouped by behavior rather than implementation package:
 
 - [`sessions-agent-view.json`](sessions-agent-view.json)
 - [`coordination.json`](coordination.json)

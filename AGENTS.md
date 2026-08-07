@@ -7,5 +7,5 @@ Read `docs/architecture.md` and `docs/protocol.md` before changing workflow sema
 - Never grant runtime adapters GitHub merge authority.
 - Preserve exact runtime session IDs; never resume a global last session.
 - Use argv execution, not a shell, for privileged Git/GitHub paths.
-- Add adversarial tests for rejected mutations, path boundaries, budgets, and merge gates.
+- Add adversarial tests for rejected mutations, path validation, budgets, and merge gates.
 - Run `go test -race ./...` and `go vet ./...` before handing off.

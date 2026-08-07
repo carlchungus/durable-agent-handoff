@@ -35,7 +35,8 @@ handoff activity list --json
 handoff preference set planner --candidate claude:sonnet:high --candidate codex:gpt-5:xhigh
 ```
 
-The arca-cloud promotion seam accepts one strict JSON object on stdin:
+arca-cloud starts a resumed cloud execution by sending one strict JSON object
+on stdin:
 
 ```sh
 handoff execution start --file - --json <<'JSON'
@@ -59,11 +60,11 @@ JSON
 
 The promotion response is exactly `{"workflow_id":"...","node_id":"..."}`.
 Finalizer fields are flat and immutable once the execution starts; an enabled
-finalizer requires a nonempty canonical exact set of external GitHub checks.
+finalizer requires a nonempty fixed list of external GitHub checks.
 Human approval is independently optional. Independently hosted CI and GitHub
-checks are the verification authority; handoff does not pretend that same-UID
+checks decide whether a change may merge; handoff does not pretend that same-UID
 workers can authenticate their own Results. Reusing a key with different
-canonical input fails closed.
+request fails closed.
 
 A goal has a simple loop: run one worker turn, ask a small tool-less model to
 choose `accept`, `continue`, or `escalate`, then act on that choice. The worker
@@ -92,7 +93,7 @@ create or discover a PR, or start itself.
 
 Pause is synchronous and idempotent. It records exact stop controls, waits for
 the executor to apply them and record terminal exits, releases writer Leases
-only after those exits, and returns a completed pure projection or a bounded
+only after those exits, and returns the recorded state or a bounded
 timeout:
 
 ```sh
@@ -109,12 +110,12 @@ continue
 TEXT
 ```
 
-The immutable worker Result is not a publication authority. The finalizer
+The immutable worker Result cannot authorize a merge. The finalizer
 rechecks the exact configured external GitHub checks on the prepared PR head;
 human approval, when configured, is a separate gate. Same-UID handoff workers
 cannot self-authenticate through their Result payload.
 
-## Runtime and service boundary
+## Runtimes and the background service
 
 Codex, Claude, and Pi drivers construct argv, resume only the supplied exact
 Session, decode typed provider milestones, and receive prompts on stdin. A
@@ -123,7 +124,7 @@ service unit. Full trust uses provider-native flags and still launches through
 argv; no shell wrapper is used. Pi fails closed for read-only work because it
 does not provide a native OS sandbox.
 
-Run or serve queued Activities through the Supervisor projection:
+Run queued Activities directly or through the background service:
 
 ```sh
 handoff run WORKFLOW_ID --trust-mode workspace
@@ -140,7 +141,7 @@ healthy service or interrupts a live worker. systemd timers are persistent
 across missed wakeups, and launchd uses the equivalent `StartInterval` fallback.
 
 `--environment-json` must be a private regular JSON file: POSIX hosts require
-mode `0600`; Windows requires an owner/System/Administrators-only DACL. Values are read
+mode `0600`; Windows allows only the owner, SYSTEM, and Administrators. Values are read
 only at service startup and passed to drivers without being persisted. Service
 units contain only argv, the private state root, the environment-file path,
 and trust mode. On every service start, inherited Attempts are reconciled before

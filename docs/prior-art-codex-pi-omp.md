@@ -42,7 +42,7 @@ or connection disappears ([Unified Exec](https://github.com/openai/codex/tree/9d
   ([agent loop](https://github.com/earendil-works/pi/blob/17f720489fab02413c549c73bb407b8d6ef500c4/packages/agent/src/agent-loop.ts)).
 
 Pi's live runtime registry and ordinary JSONL writer are not a crash-safe
-Activity store: the registry is memory-only and the file boundary does not
+Activity store: the registry is memory-only and its file handling does not
 provide the acknowledgement semantics this harness promises.
 
 ### Oh My Pi
@@ -79,7 +79,7 @@ Attachment ── reads Activity projection/output at revision + byte cursor
 Control    ── mutates only with expected Activity generation + Attempt identity
 ```
 
-Canonical ledgers are append-only and fsynced at acknowledged boundaries.
+The primary event logs are append-only and fsynced before confirming writes.
 Snapshots and query indexes may lag but never lead the ledger. On restart, the
 supervisor rebuilds projections, validates the exact process identity, adopts
 when safe, otherwise records `lost`, and lets policy decide whether to create a
@@ -97,7 +97,7 @@ new Attempt.
 5. Only then connect agent turns, model ladders, the animated TUI, and remote
    executors to this resource.
 
-## License boundary
+## Licensing
 
 Substantial copied Pi or Oh My Pi code must retain their MIT notices. Derived
 Codex code must satisfy Apache-2.0 and NOTICE obligations and mark changes. The

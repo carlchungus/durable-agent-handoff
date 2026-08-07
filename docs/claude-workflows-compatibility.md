@@ -1,6 +1,6 @@
 # Whole-system Claude Code workflow compatibility
 
-`handoff` targets the **entire observable Claude Code workflow system**, not only process durability. The target is a clean-room behavioral clone over runtime-neutral internals: the same user-visible states, commands, identities, limits, precedence rules, failure modes, and recovery boundaries documented by Anthropic, with explicit portable extensions where Claude stops short.
+`handoff` targets the **entire observable Claude Code workflow system**, not only process durability. The target is a clean-room implementation with the same user-visible states, commands, identities, limits, precedence rules, failure modes, and recovery behavior documented by Anthropic, plus documented portable features where Claude stops short.
 
 The source snapshot is **2026-08-05**. Claude Code research-preview behavior is version-sensitive. Every differential capture must record the installed Claude Code version; new oracle output never replaces an expectation without a reviewed source and fixture change.
 
@@ -8,7 +8,7 @@ The current repository is a useful durable kernel, not yet a whole-system clone.
 
 ## Supervisor v2 shipping contract
 
-The released `handoff` binary is a breaking Supervisor v2 control plane. Its
+The released `handoff` binary uses the breaking Supervisor v2 state format. Its
 normal start, run, serve, status, list, reply, TUI, and activity paths read and
 write one Supervisor journal. The supported command surface is documented in
 [`README.md`](../README.md) and the protocol in [`protocol.md`](protocol.md):
@@ -40,7 +40,7 @@ The initial named divergences are durable fenced team claims and restore (`TEAM-
 
 “Runtime status” describes the implementation today, not the completeness of the contract. `partial` means some kernel or CLI behavior exists but the differential cases do not all pass. `planned` means the contract is defined but the runtime surface is materially absent.
 
-| Surface | Claude-current acceptance boundary | Portable extension | Cases | Runtime status |
+| Feature | Claude behavior | Portable addition | Cases | Runtime status |
 | --- | --- | --- | ---: | --- |
 | Sessions | continuously saved transcript; exact-ID resume; continue; rename; picker scoping; fork with a new identity; clear, compact, export, and retention | explicit lineage, transcript locator, retention and normalized runtime identity | 5 | partial: SES-001 passes; SES-002–005 are gaps |
 | Agent View | dispatch independent background sessions; needs-input/working/completed grouping; pin/filter; peek/reply; attach/detach/stop/delete; restart exited work on reply | durable inbox and separate logical/process state exposed in JSON and TUI | 5 | partial: VIEW-001 and VIEW-002 pass; VIEW-003–005 are gaps |
@@ -91,7 +91,7 @@ Shared infrastructure is intentionally smaller than the product surface:
 
 ## Recovery and identity contract
 
-Before useful work starts, every attempt durably records workflow/node/parent/team/task identity, runtime/model/effort, exact runtime session ID when emitted, PID plus process start token, lease owner and generation, worktree, capability envelope, argv digest, output locations and last stream cursor.
+Before useful work starts, every attempt durably records workflow/node/parent/team/task identity, runtime/model/effort, exact runtime session ID when emitted, PID plus process start token, lease owner and generation, worktree, permissions, argv digest, output locations and last stream cursor.
 
 At supervisor start:
 
@@ -129,7 +129,7 @@ Creating a branch, commit, push or PR is normal agent work only when the task au
 
 Any head change invalidates prior gates. Claude Code’s Code Review remains advisory/neutral in the `claude-current` profile; the stricter merge gate is not misrepresented as native Claude behavior.
 
-Runtime adapters never receive GitHub merge authority. They may propose work and report evidence; the policy-owned GitHub control plane performs the unchanged-head gate and merge with argument-vector execution.
+Runtime drivers cannot merge on GitHub. They may propose work and report evidence; the supervisor checks the unchanged head and required checks before running `gh` directly without a shell.
 
 ## Configuration and distribution
 
@@ -149,7 +149,7 @@ Implementation proceeds as a dynamic evidence loop, not mandatory product phases
 6. Keep, revise or replace the approach based on evidence; record any plan mutation as an event.
 7. Never relax an expectation as an implementation shortcut. Oracle changes require source review and an explicit compatibility decision.
 
-Slices can run in parallel when they do not share a mutable seam. Likely early slices are event/identity normalization, exact session resume, Agent View controls, JS workflow execution/replay, runtime ladders, and machine/human view parity, because many later surfaces depend on them. This is prioritization, not a gate that prevents a planner from adapting.
+Parts can be built in parallel when they do not change the same state. Useful early work includes event and identity normalization, exact session resume, Agent View controls, JS workflow execution and replay, runtime fallbacks, and consistent machine and human views. Many later features depend on these, but the order can change when needed.
 
 ## Differential suite and release gate
 

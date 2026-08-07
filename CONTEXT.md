@@ -1,8 +1,8 @@
 # Domain context
 
-This repository is a durable control plane for long-running agent work. Its
-domain language deliberately separates conversation, execution, observation,
-and authority.
+This repository keeps long-running agent work alive and recoverable. It records
+conversations, work, processes, and permissions separately because they have
+different lifetimes.
 
 ## Session
 
@@ -10,7 +10,7 @@ A Session is a durable conversation identity. It owns:
 
 - the exact opaque runtime session ID or session file needed to resume it;
 - transcript lineage, parent/fork relationships, and queued messages;
-- the workspace and capability envelope in which future turns may run; and
+- the workspace and permissions for future turns; and
 - references to activities launched for the session.
 
 A Session does not own an operating-system process, PID, output pipe, or stop
@@ -22,7 +22,7 @@ An Activity is independently controllable work: an agent turn, background
 command, release-check, or monitor. It owns:
 
 - a stable harness ID and immutable logical work specification;
-- its owner Session, selected runtime/model, and lifecycle event ledger;
+- its owner Session, selected runtime/model, and recorded lifecycle events;
 - durable stdout/stderr streams and terminal result; and
 - the ordered Attempts made to complete the work.
 
@@ -51,8 +51,8 @@ It names the expected Activity generation and exact Attempt process identity.
 The supervisor acknowledges or rejects it in the event ledger. A stale client,
 PID reuse, or old supervisor generation therefore cannot control newer work.
 
-## Projection
+## Current state
 
-The canonical ledgers reduce to one versioned projection. The human TUI,
-machine JSON/JSONL, RPC surface, and PR gates consume that same projection; no
-view scrapes processes or independently invents lifecycle state.
+The event journal rebuilds one versioned view of current state. The TUI,
+JSON/JSONL commands, RPC calls, and PR checks read that same view; none of them
+guess state by scraping processes.

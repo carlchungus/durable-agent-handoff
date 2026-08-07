@@ -1,12 +1,12 @@
 ---
 name: durable-agent-handoff
-description: Recover interrupted Claude Code, Codex, Pi, or other agent work through Supervisor v2's journaled sessions, activities, attempts, leases, controls, runtime fallbacks, replies, and guarded publication effects.
+description: Recover and supervise interrupted Claude Code, Codex, Pi, or other agent work with durable state, exact session resume, safe retries, replies, and checked GitHub merging.
 ---
 
 # Durable Agent Handoff (Supervisor v2)
 
-Use `handoff` as the one durable control plane. Read live Supervisor
-projections, journal events, process evidence, tests, and repository policy;
+Use `handoff` as the one source of state for supervised work. Read its current
+state, recorded events, process evidence, tests, and repository policy;
 do not infer lifecycle state from a transcript or a legacy store.
 
 ## Supported v2 surface
@@ -21,15 +21,15 @@ do not infer lifecycle state from a transcript or a legacy store.
   `--wake-interval 10m`; the next automatic continuation is scheduled in the
   journal without occupying a model turn. Do not emulate cadence with polling
   prompts or shell sleeps. Human replies remain immediately runnable.
-- Configure an autonomous merge-capable execution at its start boundary with
+- Configure an autonomous merge-capable execution when it starts with
   `--finalizer-enabled`, one or more externally hosted `--required-check NAME`,
   and optional `--require-human`. Promotion uses the equivalent flat
   `finalizer_*` JSON fields. The immutable workflow configuration, not a later
-  caller override, owns the canonical exact external check set.
-- Use the arca-cloud promotion envelope with
+  caller override, owns the fixed external check list.
+- Start an arca-cloud continuation with
   `handoff execution start --file - --json`. It accepts one strict flat JSON
   object and returns only `workflow_id` and `node_id`.
-- Observe one journal projection with `handoff status`, `handoff list`,
+- Read the same recorded state with `handoff status`, `handoff list`,
   `handoff activity list|read`, `handoff tui --snapshot`, or `handoff events`.
   JSON activity records retain the cloud-compatible active-state fields while
   omitting prompts.
@@ -46,18 +46,18 @@ do not infer lifecycle state from a transcript or a legacy store.
   records exact generation/Attempt fences, then the executor applies controls;
   leases are released only after terminal exit evidence and a durable settle.
 - Continue a bound exact Session with `handoff reply`.
-- Treat independently hosted CI and GitHub checks as the verification
-  authority. Worker Result payloads are evidence of immutable work only;
+- Treat independently hosted CI and GitHub checks as the merge requirement.
+  Worker Result payloads are evidence of work only;
   handoff does not pretend that same-UID workers can authenticate their own
   Results.
-- For unattended work with publication authority, missing optional evidence,
+- For unattended work allowed to publish, missing optional evidence,
   external CI, or browser authentication lowers confidence but does not erase
   useful work. Publish an honest draft PR with the verification limits and
   continue independent work. Once a PR is handed to repository automation,
   do not spend turns waiting for it to merge. Use `needs_human` only when
-  indispensable authority or information blocks the entire workflow and no
+  indispensable permission or information blocks the entire workflow and no
   safe partial result can be published.
-- Use `handoff github merge` only for authority-owned finalization. It journals
+- Use `handoff github merge` only when merging was authorized at startup. It records
   the prepared exact PR head, named gates, approval, and idempotency key before
   an argv-only `gh` effect, then journals merged or blocked outcome.
 - Import old state only with deterministic one-way `handoff execution import-v1`.
@@ -73,20 +73,20 @@ do not infer lifecycle state from a transcript or a legacy store.
   binds its immutable identity. Promotion and continuation require an exact
   bound identity. Never resume a global last session.
 - An Activity is immutable logical work. An Attempt is one OS launch with an
-  exact process start token, output identities, runtime, and canonical-worktree
+  exact process start token, output identities, runtime, and resolved-worktree
   writer Lease. A `turn_started` milestone consumes task budget; pre-turn
   adapter/provider failures consume launch budget only.
 - Controls name the exact Activity generation and Attempt. Stale controls and
   stale milestones fail closed, and each live exact Activity-generation plus
   Attempt can have at most one accepted control. Competing controls are
-  rejected without mutation; pause reuses the accepted fence. Reads and
-  polling are pure projection reads;
+  rejected without mutation; pause reuses the accepted IDs. Reads and
+  polling only read state;
   they do not reconcile, settle, release leases, or append events.
 - Drivers receive prompts on stdin and construct provider argv themselves.
   Codex, Claude, and Pi apply workspace/full trust flags inside the driver.
   Full trust still uses direct argv with no shell wrapper. Runtime adapters do
   not receive GitHub merge authority.
-- Validate proposed mutations against a cloned projection before one journal
+- Validate proposed changes against a copy of the current state before one journal
   append. Retry an ambiguous mutation with the same idempotency key and exact
   input; divergent reuse fails closed.
 
@@ -96,12 +96,12 @@ do not infer lifecycle state from a transcript or a legacy store.
    `docs/protocol.md` before changing semantics.
 2. Inspect `handoff status --json`, `handoff activity list --json`, and
    `handoff events --after N` from the private state root.
-3. Confirm canonical worktree ownership, exact Session/Attempt identity,
+3. Confirm resolved worktree ownership, exact Session/Attempt identity,
    process start tokens, lease state, and named publication gates before any
    retry or stop.
 4. Preserve immutable results and continuation generations. Do not invent a
    new Session to resume old work unless the journal records a typed fallback
-   child with narrowed authority.
+   child with fewer permissions.
 5. Before handoff, run `gofmt`, `go test ./...`, `go test -race ./...`,
    `go vet ./...`, `git diff --check`, and the supported cross-platform builds.
 

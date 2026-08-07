@@ -162,7 +162,7 @@ Usage:
   handoff run WORKFLOW_ID [--once]
   handoff serve [--environment-json FILE] [--trust-mode workspace|full]
   handoff preference set ROLE --candidate runtime:model[:effort]
-  handoff github merge --execution ID --repo OWNER/REPO --pr NUMBER --gate NAME --idempotency-key KEY --approved --json
+  handoff github merge --execution ID --repo OWNER/REPO --pr NUMBER --gate NAME --idempotency-key KEY [--approved] --json
   handoff reply --execution ID --activity ID --file -
   handoff activity list|read [--json]
   handoff tui [--snapshot]

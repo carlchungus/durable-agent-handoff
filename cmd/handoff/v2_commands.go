@@ -635,7 +635,7 @@ func cmdV2Service(args []string, out io.Writer) error {
 
 func cmdV2GitHub(args []string, out io.Writer) error {
 	if len(args) == 0 || args[0] != "merge" {
-		return errors.New("usage: handoff github merge --execution ID --repo OWNER/REPO --pr NUMBER --gate NAME --idempotency-key KEY --approved --json")
+		return errors.New("usage: handoff github merge --execution ID --repo OWNER/REPO --pr NUMBER --gate NAME --idempotency-key KEY [--approved] --json")
 	}
 	fs := flag.NewFlagSet("github merge", flag.ContinueOnError)
 	state := common(fs)

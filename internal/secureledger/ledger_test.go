@@ -172,6 +172,35 @@ func TestSeparateLedgersSerializeWriters(t *testing.T) {
 	}
 }
 
+func TestSeparateLedgersCanInitializeOneRecordConcurrently(t *testing.T) {
+	root := privateTempDir(t)
+	options := Options{Namespace: "records", ValidateID: func(string) error { return nil }}
+	ledgers := make([]*Ledger, 8)
+	for index := range ledgers {
+		var err error
+		ledgers[index], err = Open(root, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, len(ledgers))
+	for _, ledger := range ledgers {
+		wg.Add(1)
+		go func(ledger *Ledger) {
+			defer wg.Done()
+			errs <- ledger.Update("rec_new", func(*Txn) error { return nil })
+		}(ledger)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestConcurrentAppendsKeepEverySequence(t *testing.T) {
 	root := privateTempDir(t)
 	options := Options{Namespace: "records", ValidateID: func(string) error { return nil }}

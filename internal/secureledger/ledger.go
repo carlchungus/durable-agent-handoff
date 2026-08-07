@@ -567,58 +567,69 @@ func identifyRegularPath(root *os.Root, name string) (storageIdentity, error) {
 }
 
 func (l *Ledger) openRegular(root *os.Root, name string, flag int, perm os.FileMode) (*os.File, error) {
-	before, err := root.Lstat(name)
-	existed := err == nil
-	var beforeIdentity storageIdentity
-	if err == nil {
-		if !before.Mode().IsRegular() {
-			return nil, fmt.Errorf("secure ledger file %q is not a regular file", name)
+	for attempts := 0; attempts < 8; attempts++ {
+		before, err := root.Lstat(name)
+		existed := err == nil
+		var beforeIdentity storageIdentity
+		if err == nil {
+			if !before.Mode().IsRegular() {
+				return nil, fmt.Errorf("secure ledger file %q is not a regular file", name)
+			}
+			beforeIdentity, err = identifyRegularPath(root, name)
+			if err != nil {
+				return nil, err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) || flag&os.O_CREATE == 0 {
+			return nil, err
 		}
-		beforeIdentity, err = identifyRegularPath(root, name)
+		if l.safetyHooks.afterFilePrecheck != nil {
+			l.safetyHooks.afterFilePrecheck(name)
+		}
+		openFlag := flag
+		exclusiveCreate := !existed && flag&os.O_CREATE != 0 && flag&os.O_EXCL == 0
+		if exclusiveCreate {
+			openFlag |= os.O_EXCL
+		}
+		file, err := root.OpenFile(name, openFlag, perm)
+		if exclusiveCreate && errors.Is(err, os.ErrExist) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
-	} else if !errors.Is(err, os.ErrNotExist) || flag&os.O_CREATE == 0 {
-		return nil, err
-	}
-	if l.safetyHooks.afterFilePrecheck != nil {
-		l.safetyHooks.afterFilePrecheck(name)
-	}
-	file, err := root.OpenFile(name, flag, perm)
-	if err != nil {
-		return nil, err
-	}
-	after, pathErr := root.Lstat(name)
-	safetyErr := validateRegularFile(file)
-	if pathErr != nil || safetyErr != nil || !after.Mode().IsRegular() {
-		_ = file.Close()
-		if pathErr != nil {
-			return nil, pathErr
-		}
-		if safetyErr != nil {
-			return nil, fmt.Errorf("unsafe secure ledger file %q: %w", name, safetyErr)
-		}
-		return nil, fmt.Errorf("secure ledger file %q is not a regular file", name)
-	}
-	openedIdentity, openedErr := identifyStorageFile(file)
-	afterIdentity, afterErr := identifyRegularPath(root, name)
-	if openedErr != nil || afterErr != nil || !sameStorageIdentity(openedIdentity, afterIdentity) || existed && !sameStorageIdentity(beforeIdentity, openedIdentity) {
-		_ = file.Close()
-		if openedErr != nil {
-			return nil, openedErr
-		}
-		if afterErr != nil {
-			return nil, afterErr
-		}
-		return nil, fmt.Errorf("secure ledger file %q changed while opening", name)
-	}
-	if !existed {
-		if err = syncRoot(root); err != nil {
+		after, pathErr := root.Lstat(name)
+		safetyErr := validateRegularFile(file)
+		if pathErr != nil || safetyErr != nil || !after.Mode().IsRegular() {
 			_ = file.Close()
-			return nil, fmt.Errorf("sync secure ledger directory after creating %q: %w", name, err)
+			if pathErr != nil {
+				return nil, pathErr
+			}
+			if safetyErr != nil {
+				return nil, fmt.Errorf("unsafe secure ledger file %q: %w", name, safetyErr)
+			}
+			return nil, fmt.Errorf("secure ledger file %q is not a regular file", name)
 		}
+		openedIdentity, openedErr := identifyStorageFile(file)
+		afterIdentity, afterErr := identifyRegularPath(root, name)
+		if openedErr != nil || afterErr != nil || !sameStorageIdentity(openedIdentity, afterIdentity) || existed && !sameStorageIdentity(beforeIdentity, openedIdentity) {
+			_ = file.Close()
+			if openedErr != nil {
+				return nil, openedErr
+			}
+			if afterErr != nil {
+				return nil, afterErr
+			}
+			return nil, fmt.Errorf("secure ledger file %q changed while opening", name)
+		}
+		if !existed {
+			if err = syncRoot(root); err != nil {
+				_ = file.Close()
+				return nil, fmt.Errorf("sync secure ledger directory after creating %q: %w", name, err)
+			}
+		}
+		return file, nil
 	}
-	return file, nil
+	return nil, fmt.Errorf("secure ledger file %q was created concurrently too many times", name)
 }
 
 func (l *Ledger) acquire(id string) (*Txn, error) {

@@ -18,7 +18,7 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 	if err := os.Chmod(state, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	request := `{"idempotency_key":"arca-file-start-01","goal":"promote work","prompt":"secret stdin prompt","remote_root":"` + root + `","runtime":"codex","resume_id":"exact-thread","sandbox":"read-only","role":"arca-cloud"}`
+	request := `{"idempotency_key":"arca-file-start-01","goal":"promote work","prompt":"secret stdin prompt","remote_root":"` + root + `","runtime":"codex","resume_id":"exact-thread","sandbox":"read-only","role":"arca-cloud","finalizer_enabled":true,"finalizer_required_checks":["verify"],"finalizer_require_human":true,"finalizer_require_verifier":true,"finalizer_verifiers":["verifier:ci"]}`
 	read, write, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -51,6 +51,17 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 	if response.WorkflowID == "" || response.NodeID == "" || strings.Contains(out.String(), "secret stdin prompt") {
 		t.Fatalf("unexpected response=%s", out.String())
 	}
+	store, err := supervisor.Open(state, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalizer := projection.Workflows[response.WorkflowID].Finalizer; !finalizer.Enabled || !finalizer.RequireHuman || !finalizer.RequireVerifier || len(finalizer.RequiredChecks) != 1 || finalizer.RequiredChecks[0] != "verify" || len(finalizer.Verifiers) != 1 || finalizer.Verifiers[0] != "verifier:ci" {
+		t.Fatalf("promotion finalizer was not persisted immutably: %+v", finalizer)
+	}
 	divergent := strings.Replace(request, `"promote work"`, `"different work"`, 1)
 	out.Reset()
 	if err = runWithPrompt(t, []string{"execution", "start", "--state", state, "--file", "-", "--json"}, divergent, &out, &errOut); !errors.Is(err, supervisor.ErrIdempotencyConflict) {
@@ -58,6 +69,43 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 	}
 	if err = run([]string{"execution", "start", "--state", state, "--file", "-", "--json"}, &out, &errOut); err == nil {
 		t.Fatal("closed stdin unexpectedly accepted a second request")
+	}
+}
+
+func TestOrdinaryStartPersistsAdvertisedFinalizerAndRejectsIncompleteConfig(t *testing.T) {
+	state, root := t.TempDir(), t.TempDir()
+	if err := os.Chmod(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--runtime", "codex", "--file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "cli-finalizer-start", "--finalizer-enabled", "--required-check", "verify", "--require-human", "--require-verifier", "--verifier", "verifier:ci", "--json"}, "ship", &out, &errOut); err != nil {
+		t.Fatalf("ordinary finalizer start: %v stderr=%s", err, errOut.String())
+	}
+	var response ordinaryStartResponse
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	store, err := supervisor.Open(state, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalizer := projection.Workflows[response.Execution.WorkflowID].Finalizer; !finalizer.Enabled || len(finalizer.RequiredChecks) != 1 || finalizer.RequiredChecks[0] != "verify" {
+		t.Fatalf("ordinary finalizer was not persisted: %+v", finalizer)
+	}
+	before, err := store.Events(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--runtime", "codex", "--file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "cli-finalizer-incomplete", "--finalizer-enabled", "--require-human"}, "missing gate", &out, &errOut); err == nil {
+		t.Fatal("enabled finalizer without required checks was accepted")
+	}
+	after, _ := store.Events(0)
+	if len(after) != len(before) {
+		t.Fatal("rejected incomplete finalizer mutated the journal")
 	}
 }
 

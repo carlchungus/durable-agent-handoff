@@ -1,6 +1,6 @@
 //go:build linux
 
-package runstate
+package processidentity
 
 import (
 	"os"

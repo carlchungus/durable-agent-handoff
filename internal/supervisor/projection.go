@@ -3,6 +3,7 @@ package supervisor
 import (
 	"os"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -58,13 +59,13 @@ type AttemptView struct {
 	ID                  AttemptID     `json:"id"`
 	ActivityID          ActivityID    `json:"activity_id"`
 	ActivityGeneration  uint64        `json:"activity_generation"`
-	State               string        `json:"state"`
 	Health              ProcessHealth `json:"health"`
 	TurnStarted         bool          `json:"turn_started"`
 	TaskAttempt         int           `json:"task_attempt,omitempty"`
 	MeaningfulProgress  string        `json:"meaningful_progress,omitempty"`
 	ProviderUnavailable bool          `json:"provider_unavailable,omitempty"`
 	TerminalReason      string        `json:"terminal_reason,omitempty"`
+	ResultStatus        string        `json:"result_status,omitempty"`
 	Overhead            Overhead      `json:"orchestration_overhead"`
 }
 
@@ -136,7 +137,7 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 	}
 	taskOrdinals := map[NodeID]int{}
 	for _, attempt := range orderedAttempts(state, workflow.ID) {
-		item := projectAttempt(attempt)
+		item := projectAttempt(state, attempt)
 		activity := state.Activities[attempt.ActivityID]
 		if item.TurnStarted && !hasProviderUnavailable(state.Attempts[item.ID]) {
 			taskOrdinals[activity.NodeID]++
@@ -247,15 +248,15 @@ func projectActivity(state *State, activity *Activity) ActivityView {
 	return view
 }
 
-func projectAttempt(attempt *Attempt) AttemptView {
-	view := AttemptView{ID: attempt.ID, ActivityID: attempt.ActivityID, ActivityGeneration: attempt.ActivityGeneration, State: "starting", Health: HealthStarting}
+func projectAttempt(state *State, attempt *Attempt) AttemptView {
+	view := AttemptView{ID: attempt.ID, ActivityID: attempt.ActivityID, ActivityGeneration: attempt.ActivityGeneration, Health: HealthStarting}
 	var spawned, turn, progress time.Time
 	for _, milestone := range attempt.Milestones {
 		switch milestone.Kind {
 		case MilestoneProcessSpawned:
 			spawned = milestone.At
 		case MilestoneTurnStarted:
-			view.TurnStarted, view.Health, view.State, turn = true, HealthRunning, "running", milestone.At
+			view.TurnStarted, view.Health, turn = true, HealthRunning, milestone.At
 		case MilestoneMeaningfulProgress:
 			view.MeaningfulProgress = milestone.Progress
 			if progress.IsZero() {
@@ -263,15 +264,18 @@ func projectAttempt(attempt *Attempt) AttemptView {
 			}
 		case MilestoneProviderUnavailable:
 			view.ProviderUnavailable = true
-			view.Health, view.State, view.TerminalReason = HealthExited, "failed", milestone.Failure
+			view.Health, view.TerminalReason = HealthExited, milestone.Failure
 		case MilestoneAdapterStartFailed:
-			view.Health, view.State, view.TerminalReason = HealthExited, "failed", milestone.Failure
+			view.Health, view.TerminalReason = HealthExited, milestone.Failure
 		case MilestoneExit:
-			view.Health, view.State = HealthExited, "completed"
-			if milestone.Exit != nil {
+			view.Health = HealthExited
+			if milestone.Exit != nil && strings.TrimSpace(milestone.Exit.Error) != "" {
 				view.TerminalReason = milestone.Exit.Error
 			}
 		}
+	}
+	if result := resultForActivity(state, attempt.ActivityID); result != nil && result.AttemptID == attempt.ID {
+		view.ResultStatus = result.Status
 	}
 	if attempt.Process == nil && len(attempt.Milestones) == 0 {
 		view.Health = HealthStarting
@@ -406,4 +410,27 @@ func orderedAttempts(state *State, workflowID WorkflowID) []*Attempt {
 		return out[i].CreatedAt.Before(out[j].CreatedAt) || out[i].CreatedAt.Equal(out[j].CreatedAt) && out[i].ID < out[j].ID
 	})
 	return out
+}
+
+// AcceptedControlForAttempt returns the one accepted control for an exact
+// Activity generation and Attempt. Sorting makes projections deterministic even
+// when a legacy journal contains duplicate accepted controls.
+func AcceptedControlForAttempt(state *State, activity *Activity, attempt *Attempt) *Control {
+	if state == nil || activity == nil || attempt == nil {
+		return nil
+	}
+	controls := make([]*Control, 0, len(state.Controls))
+	for _, control := range state.Controls {
+		if control.Accepted && control.ActivityID == activity.ID && control.ExpectedGeneration == activity.Generation && control.ExpectedAttemptID == attempt.ID && attempt.ActivityGeneration == activity.Generation {
+			controls = append(controls, control)
+		}
+	}
+	sort.Slice(controls, func(i, j int) bool {
+		return controls[i].CreatedAt.Before(controls[j].CreatedAt) || controls[i].CreatedAt.Equal(controls[j].CreatedAt) && controls[i].ID < controls[j].ID
+	})
+	if len(controls) == 0 {
+		return nil
+	}
+	copy := *controls[0]
+	return &copy
 }

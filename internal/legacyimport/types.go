@@ -1,4 +1,6 @@
-package core
+// Package legacyimport contains only the V1 workflow schema retained for the
+// one-way ImportV1 decoder. It has no store, locks, or mutation authority.
+package legacyimport
 
 import "time"
 

@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/carlchungus/durable-agent-handoff/internal/core"
-	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
+	"github.com/carlchungus/durable-agent-handoff/internal/legacyimport"
+	"github.com/carlchungus/durable-agent-handoff/internal/processidentity"
 )
 
 func safeDir(t *testing.T) string {
@@ -147,6 +148,40 @@ func TestThreadStartedWithoutTurnRemainsStarting(t *testing.T) {
 	}
 }
 
+func TestAttemptViewUsesHealthAndTerminalReasonWithoutStateAlias(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	execution := startTestExecution(t, store, worktree, "attempt-view-lifecycle", DefaultBudget())
+	state, _ := store.Projection()
+	activity := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "attempt-view-failure")
+	milestone(t, store, activity, attempt, "attempt-view-start-failure", Milestone{Kind: MilestoneAdapterStartFailed, Failure: "provider executable missing"})
+	milestone(t, store, activity, attempt, "attempt-view-failure-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 127}})
+	view, err := store.View(execution.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Attempts) != 1 || view.Attempts[0].Health != HealthExited || view.Attempts[0].TerminalReason != "provider executable missing" {
+		t.Fatalf("failure lifecycle was overwritten by exit: %+v", view.Attempts)
+	}
+	raw, err := json.Marshal(view.Attempts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"state"`) {
+		t.Fatalf("AttemptView retained the removed state alias: %s", raw)
+	}
+
+	attempt = prepareTestAttempt(t, store, activity.ID, activity.Generation, "attempt-view-result")
+	milestone(t, store, activity, attempt, "attempt-view-result-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 88, StartToken: "attempt-view-result-process"}})
+	milestone(t, store, activity, attempt, "attempt-view-result-turn", Milestone{Kind: MilestoneTurnStarted})
+	milestone(t, store, activity, attempt, "attempt-view-result-value", Milestone{Kind: MilestoneResult, Result: &WorkerResult{Status: "completed", Summary: "done"}})
+	milestone(t, store, activity, attempt, "attempt-view-result-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 0}})
+	view, err = store.View(execution.ID, time.Now().UTC())
+	if err != nil || len(view.Attempts) != 2 || view.Attempts[1].ResultStatus != "completed" {
+		t.Fatalf("result status was not projected from immutable Result: attempts=%+v err=%v", view.Attempts, err)
+	}
+}
+
 func TestStartupReconcileDeadOrphanReleasesLeaseAndQueuesRetry(t *testing.T) {
 	store, stateRoot, worktree := openTestStore(t, Options{})
 	execution := startTestExecution(t, store, worktree, "dead-orphan-start", DefaultBudget())
@@ -234,7 +269,7 @@ func TestStartupReconcileFailsClosedForExactLiveOrphan(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	token := ""
 	for time.Now().Before(deadline) && token == "" {
-		token = runstate.ProcessStartToken(cmd.Process.Pid)
+		token = processidentity.ProcessStartToken(cmd.Process.Pid)
 		if token == "" {
 			time.Sleep(5 * time.Millisecond)
 		}
@@ -499,6 +534,106 @@ func TestPauseFencesActiveAttemptsReleasesOwnershipAndIsIdempotent(t *testing.T)
 	}
 }
 
+func TestExactAttemptAcceptsOnlyOneControlAndPauseReusesIt(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	execution := startTestExecution(t, store, worktree, "control-unique-start", DefaultBudget())
+	state, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	activity := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "control-unique-attempt")
+	first, _, err := store.RequestControl(context.Background(), RequestControlInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, ExpectedAttemptID: attempt.ID, Kind: "stop", Actor: "cloud:a", IdempotencyKey: "control-unique-first"})
+	if err != nil || first == nil || !first.Accepted {
+		t.Fatalf("first control was not accepted: control=%+v err=%v", first, err)
+	}
+	entriesBefore, err := store.Events(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = store.RequestControl(context.Background(), RequestControlInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, ExpectedAttemptID: attempt.ID, Kind: "stop", Actor: "cloud:b", IdempotencyKey: "control-unique-second"}); !errors.Is(err, ErrControlAlreadyAccepted) {
+		t.Fatalf("competing control was not deterministically rejected: %v", err)
+	}
+	entriesAfter, _ := store.Events(0)
+	if len(entriesAfter) != len(entriesBefore) {
+		t.Fatal("competing control mutated the journal")
+	}
+
+	pause, _, err := store.PauseWorkflow(context.Background(), PauseWorkflowInput{WorkflowID: execution.WorkflowID, RequestedBy: "human:pause", IdempotencyKey: "control-unique-pause"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pause.FencedAttemptIDs) != 1 {
+		t.Fatalf("pause did not fence the existing accepted control: %+v", pause)
+	}
+	entriesBefore, err = store.Events(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = store.RequestControl(context.Background(), RequestControlInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, ExpectedAttemptID: attempt.ID, Kind: "stop", Actor: "cloud:c", IdempotencyKey: "control-unique-after-pause"}); !errors.Is(err, ErrControlAlreadyAccepted) {
+		t.Fatalf("post-pause competing control was not rejected by the existing fence: %v", err)
+	}
+	entriesAfter, _ = store.Events(0)
+	if len(entriesAfter) != len(entriesBefore) {
+		t.Fatal("post-pause competing control mutated the journal")
+	}
+	state, _ = store.Projection()
+	accepted := 0
+	for _, control := range state.Controls {
+		if control.Accepted && control.ActivityID == activity.ID && control.ExpectedAttemptID == attempt.ID {
+			accepted++
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("pause created a competing accepted control: count=%d controls=%+v", accepted, state.Controls)
+	}
+}
+
+func TestCompetingControlsConcurrentAcceptExactlyOne(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	execution := startTestExecution(t, store, worktree, "control-concurrent-start", DefaultBudget())
+	state, _ := store.Projection()
+	activity := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "control-concurrent-attempt")
+	type result struct {
+		accepted *Control
+		err      error
+	}
+	results := make(chan result, 2)
+	for _, key := range []string{"control-concurrent-a", "control-concurrent-b"} {
+		go func(key string) {
+			control, _, err := store.RequestControl(context.Background(), RequestControlInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, ExpectedAttemptID: attempt.ID, Kind: "stop", Actor: key, IdempotencyKey: key})
+			results <- result{accepted: control, err: err}
+		}(key)
+	}
+	accepted := 0
+	conflicts := 0
+	for range 2 {
+		item := <-results
+		if item.err == nil && item.accepted != nil && item.accepted.Accepted {
+			accepted++
+		} else if errors.Is(item.err, ErrControlAlreadyAccepted) {
+			conflicts++
+		} else {
+			t.Fatalf("unexpected concurrent control result: %+v", item)
+		}
+	}
+	if accepted != 1 || conflicts != 1 {
+		t.Fatalf("concurrent controls accepted=%d conflicts=%d", accepted, conflicts)
+	}
+}
+
+func TestAcceptedControlProjectionSelectionIsDeterministic(t *testing.T) {
+	state := &State{Controls: map[ControlID]*Control{
+		"z": {ID: "z", Accepted: true, ActivityID: "activity", ExpectedGeneration: 1, ExpectedAttemptID: "attempt", CreatedAt: time.Unix(10, 0)},
+		"a": {ID: "a", Accepted: true, ActivityID: "activity", ExpectedGeneration: 1, ExpectedAttemptID: "attempt", CreatedAt: time.Unix(10, 0)},
+	}}
+	control := AcceptedControlForAttempt(state, &Activity{ID: "activity", Generation: 1}, &Attempt{ID: "attempt", ActivityGeneration: 1})
+	if control == nil || control.ID != "a" {
+		t.Fatalf("control selection depended on map order: %+v", control)
+	}
+}
+
 func TestCrashInjectionAtEveryTransactionBoundaryReplaysExactlyOnce(t *testing.T) {
 	for _, boundary := range []Boundary{BoundaryAfterValidation, BoundaryAfterAppend, BoundaryAfterSnapshot} {
 		t.Run(string(boundary), func(t *testing.T) {
@@ -711,32 +846,38 @@ func TestStartExecutionRejectsRootOutsideAuthorityWithoutMutation(t *testing.T) 
 
 func TestLegacyLedgerImportIsDeterministicOneWayAndPreservesContinuationHistory(t *testing.T) {
 	sourceRoot, worktree := safeDir(t), safeDir(t)
-	legacy, err := core.OpenStore(sourceRoot)
-	if err != nil {
-		t.Fatal(err)
+	workflow := &legacyimport.Workflow{ID: "wf_legacy_import", Goal: "legacy goal", Root: worktree, Status: legacyimport.WorkflowActive, Budget: legacyimport.Budget{MaxNodes: 8, MaxConcurrent: 1, MaxAttempts: 3, MaxChangedFiles: 10, MaxDiffLines: 100}, Nodes: map[string]*legacyimport.Node{}, CreatedAt: time.Unix(100, 0).UTC(), UpdatedAt: time.Unix(100, 0).UTC()}
+	created := *workflow
+	created.Nodes = map[string]*legacyimport.Node{}
+	legacyEvents := []legacyimport.Event{{Sequence: 1, ID: "created", WorkflowID: workflow.ID, Type: "workflow.created", Actor: "human", At: workflow.CreatedAt, Data: &created}}
+	appendProposal := func(sequence uint64, proposal legacyimport.Proposal, at time.Time) {
+		t.Helper()
+		if err := legacyimport.ApplyProposal(workflow, proposal, at); err != nil {
+			t.Fatal(err)
+		}
+		legacyEvents = append(legacyEvents, legacyimport.Event{Sequence: sequence, ID: fmt.Sprintf("proposal-%d", sequence), WorkflowID: workflow.ID, Type: "proposal.applied", Actor: proposal.Actor, At: at, Data: proposal})
 	}
-	workflow, err := legacy.Create("legacy goal", worktree, core.Budget{MaxNodes: 8, MaxConcurrent: 1, MaxAttempts: 3, MaxChangedFiles: 10, MaxDiffLines: 100})
-	if err != nil {
-		t.Fatal(err)
-	}
-	node := &core.Node{ID: "lead", Title: "legacy lead", Kind: "agent", Prompt: "legacy prompt", Worktree: worktree, Runtime: core.RuntimeSpec{Name: "claude", Sandbox: "workspace-write"}, SessionID: "legacy-exact-session", MaxAttempts: 3}
-	workflow, err = legacy.Apply(core.Proposal{WorkflowID: workflow.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: node}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	workflow, err = legacy.Apply(core.Proposal{WorkflowID: workflow.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: node.ID, State: core.NodeRunning}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	workflow, err = legacy.Apply(core.Proposal{WorkflowID: workflow.ID, Actor: node.ID, Mutations: []core.Mutation{{Op: "set_state", NodeID: node.ID, State: core.NodeCompleted}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = legacy.Apply(core.Proposal{WorkflowID: workflow.ID, Actor: "human", Mutations: []core.Mutation{{Op: "reopen_agent", NodeID: node.ID}}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	node := &legacyimport.Node{ID: "lead", Title: "legacy lead", Kind: "agent", Prompt: "legacy prompt", Worktree: worktree, Runtime: legacyimport.RuntimeSpec{Name: "claude", Sandbox: "workspace-write"}, SessionID: "legacy-exact-session", MaxAttempts: 3}
+	appendProposal(2, legacyimport.Proposal{WorkflowID: workflow.ID, Actor: "human", Mutations: []legacyimport.Mutation{{Op: "add_node", Node: node}}}, time.Unix(101, 0).UTC())
+	appendProposal(3, legacyimport.Proposal{WorkflowID: workflow.ID, Actor: "supervisor", Mutations: []legacyimport.Mutation{{Op: "set_state", NodeID: node.ID, State: legacyimport.NodeRunning}}}, time.Unix(102, 0).UTC())
+	appendProposal(4, legacyimport.Proposal{WorkflowID: workflow.ID, Actor: node.ID, Mutations: []legacyimport.Mutation{{Op: "set_state", NodeID: node.ID, State: legacyimport.NodeCompleted}}}, time.Unix(103, 0).UTC())
+	appendProposal(5, legacyimport.Proposal{WorkflowID: workflow.ID, Actor: "human", Mutations: []legacyimport.Mutation{{Op: "reopen_agent", NodeID: node.ID}}}, time.Unix(104, 0).UTC())
 	legacyPath := filepath.Join(sourceRoot, "workflows", workflow.ID, "events.jsonl")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var encoded []byte
+	for _, event := range legacyEvents {
+		raw, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded = append(encoded, raw...)
+		encoded = append(encoded, '\n')
+	}
+	if err := os.WriteFile(legacyPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	before, err := os.ReadFile(legacyPath)
 	if err != nil {
 		t.Fatal(err)

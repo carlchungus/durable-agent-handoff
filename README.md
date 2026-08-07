@@ -17,6 +17,11 @@ selector:
 ```sh
 printf '%s' 'work' | handoff start --runtime codex --file - \
   --root /repo --authorized-by human:id --idempotency-key request-01 --json
+# An autonomous merge-capable execution must configure its gates at start.
+printf '%s' 'ship it' | handoff start --runtime codex --file - \
+  --root /repo --authorized-by human:id --idempotency-key request-02 \
+  --finalizer-enabled --required-check verify --require-human \
+  --require-verifier --verifier verifier:ci --json
 handoff status EXECUTION_ID --json
 handoff list --json
 handoff tui --snapshot
@@ -36,13 +41,20 @@ handoff execution start --file - --json <<'JSON'
   "runtime": "codex",
   "resume_id": "THREAD_ID",
   "sandbox": "workspace-write",
-  "role": "human:id"
+  "role": "human:id",
+  "finalizer_enabled": true,
+  "finalizer_required_checks": ["verify"],
+  "finalizer_require_human": true,
+  "finalizer_require_verifier": true,
+  "finalizer_verifiers": ["verifier:ci"]
 }
 JSON
 ```
 
 The promotion response is exactly `{"workflow_id":"...","node_id":"..."}`.
-Reusing a key with different canonical input fails closed.
+Finalizer fields are flat and immutable once the execution starts; an enabled
+finalizer requires nonempty named checks, human approval, and independent
+verifier identities. Reusing a key with different canonical input fails closed.
 
 Pause is synchronous and idempotent. It records exact stop controls, waits for
 the executor to apply them and record terminal exits, releases writer Leases

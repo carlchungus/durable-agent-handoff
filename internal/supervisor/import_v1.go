@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/carlchungus/durable-agent-handoff/internal/core"
+	"github.com/carlchungus/durable-agent-handoff/internal/legacyimport"
 )
 
 type ImportV1Input struct {
@@ -120,7 +120,7 @@ func (c importV1Command) decide(state *State, now time.Time) ([]DomainEvent, str
 			session := &Session{ID: sessionID, WorkflowID: workflowID, ImportedUnresolved: true, Root: workRoot, CreatedAt: node.CreatedAt}
 			data.Sessions = append(data.Sessions, session)
 			generations := history.Completions[legacyNode.ID]
-			if generations == 0 && legacyNode.State == core.NodeCompleted {
+			if generations == 0 && legacyNode.State == legacyimport.NodeCompleted {
 				generations = 1
 			}
 			var parent ActivityID
@@ -134,7 +134,7 @@ func (c importV1Command) decide(state *State, now time.Time) ([]DomainEvent, str
 				data.Activities, data.Attempts, data.Results = append(data.Activities, activity), append(data.Attempts, attempt), append(data.Results, result)
 				parent = activityID
 			}
-			if history.Reopened[legacyNode.ID] >= generations && history.Reopened[legacyNode.ID] > 0 && legacyNode.State != core.NodeCompleted {
+			if history.Reopened[legacyNode.ID] >= generations && history.Reopened[legacyNode.ID] > 0 && legacyNode.State != legacyimport.NodeCompleted {
 				generation := generations + 1
 				activityID := ActivityID(stableID("activity", c.Digest+"/"+legacy.ID+"/"+legacyNode.ID+fmt.Sprintf("/%d", generation)))
 				data.Activities = append(data.Activities, &Activity{ID: activityID, WorkflowID: workflowID, NodeID: nodeID, SessionID: sessionID, Generation: uint64(generation), ParentActivityID: parent, Prompt: legacyNode.Prompt, CreatedAt: now})
@@ -166,7 +166,7 @@ func (c importV1Command) decide(state *State, now time.Time) ([]DomainEvent, str
 }
 
 type legacyWorkflowHistory struct {
-	Workflow    *core.Workflow
+	Workflow    *legacyimport.Workflow
 	Completions map[string]int
 	Reopened    map[string]int
 }
@@ -189,13 +189,13 @@ func parseLegacyWorkflow(raw []byte) (legacyWorkflowHistory, error) {
 		}
 		switch entry.Type {
 		case "workflow.created":
-			var workflow core.Workflow
+			var workflow legacyimport.Workflow
 			if err = json.Unmarshal(entry.Data, &workflow); err != nil {
 				return history, err
 			}
 			history.Workflow = &workflow
 			for id, node := range workflow.Nodes {
-				if node.State == core.NodeCompleted {
+				if node.State == legacyimport.NodeCompleted {
 					history.Completions[id]++
 				}
 			}
@@ -203,19 +203,19 @@ func parseLegacyWorkflow(raw []byte) (legacyWorkflowHistory, error) {
 			if history.Workflow == nil {
 				return history, errors.New("proposal preceded workflow creation")
 			}
-			var proposal core.Proposal
+			var proposal legacyimport.Proposal
 			if err = json.Unmarshal(entry.Data, &proposal); err != nil {
 				return history, err
 			}
 			for _, mutation := range proposal.Mutations {
-				if mutation.Op == "set_state" && mutation.State == core.NodeCompleted {
+				if mutation.Op == "set_state" && mutation.State == legacyimport.NodeCompleted {
 					history.Completions[mutation.NodeID]++
 				}
 				if mutation.Op == "reopen_agent" {
 					history.Reopened[mutation.NodeID]++
 				}
 			}
-			if err = core.ApplyProposal(history.Workflow, proposal, entry.At); err != nil {
+			if err = legacyimport.ApplyProposal(history.Workflow, proposal, entry.At); err != nil {
 				return history, err
 			}
 		}
@@ -260,7 +260,7 @@ func digestLegacyLedgers(root string) (string, map[string]string, map[string][]b
 	return hex.EncodeToString(whole.Sum(nil)), files, rawFiles, nil
 }
 
-func migrateRuntime(runtime core.RuntimeSpec) RuntimeSpec {
+func migrateRuntime(runtime legacyimport.RuntimeSpec) RuntimeSpec {
 	sandbox := Sandbox(runtime.Sandbox)
 	if sandbox != SandboxReadOnly && sandbox != SandboxWorkspaceWrite {
 		sandbox = SandboxWorkspaceWrite
@@ -271,7 +271,7 @@ func migrateRuntime(runtime core.RuntimeSpec) RuntimeSpec {
 	return RuntimeSpec{Name: runtime.Name, Executable: runtime.Executable, Model: runtime.Model, Effort: runtime.Effort, Sandbox: sandbox}
 }
 
-func migrateBudget(budget core.Budget) Budget {
+func migrateBudget(budget legacyimport.Budget) Budget {
 	maxAttempts := budget.MaxAttempts
 	if maxAttempts < 1 {
 		maxAttempts = DefaultBudget().MaxTaskAttempts

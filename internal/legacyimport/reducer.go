@@ -1,4 +1,4 @@
-package core
+package legacyimport
 
 import (
 	"errors"
@@ -43,6 +43,8 @@ func (Policy) ValidateProposal(w *Workflow, p Proposal) error {
 	return nil
 }
 
+// ApplyProposal replays one already-recorded V1 proposal in memory while
+// importing its source bytes. It never persists or authorizes a V1 mutation.
 func ApplyProposal(w *Workflow, p Proposal, at time.Time) error {
 	if err := (Policy{}).ValidateProposal(w, p); err != nil {
 		return err

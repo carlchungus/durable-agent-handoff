@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
+	"github.com/carlchungus/durable-agent-handoff/internal/processidentity"
 )
 
 const (
@@ -648,7 +648,7 @@ func (l *Ledger) acquire(id string) (*Txn, error) {
 			return nil, fmt.Errorf("lock secure ledger record %s: %w", id, lockErr)
 		}
 		if locked {
-			owner := lockOwner{PID: os.Getpid(), StartToken: runstate.ProcessStartToken(os.Getpid()), LeaseID: fmt.Sprintf("%d-%d", os.Getpid(), l.now().UnixNano()), State: lockActive, UpdatedAt: l.now().UTC()}
+			owner := lockOwner{PID: os.Getpid(), StartToken: processidentity.ProcessStartToken(os.Getpid()), LeaseID: fmt.Sprintf("%d-%d", os.Getpid(), l.now().UnixNano()), State: lockActive, UpdatedAt: l.now().UTC()}
 			tx := &Txn{ledger: l, id: id, root: root, file: file, lock: lock, owner: owner}
 			if l.safetyHooks.afterLock != nil {
 				l.safetyHooks.afterLock()

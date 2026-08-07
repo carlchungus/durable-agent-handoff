@@ -1,6 +1,6 @@
 //go:build darwin
 
-package runstate
+package processidentity
 
 import (
 	"fmt"

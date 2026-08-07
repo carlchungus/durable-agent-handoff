@@ -17,8 +17,9 @@ import (
 	"time"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/activity"
+	"github.com/carlchungus/durable-agent-handoff/internal/commanddigest"
 	"github.com/carlchungus/durable-agent-handoff/internal/driver"
-	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
+	"github.com/carlchungus/durable-agent-handoff/internal/processidentity"
 	"github.com/carlchungus/durable-agent-handoff/internal/supervisor"
 )
 
@@ -99,7 +100,7 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	preparePrelaunch := func(failure error) error {
 		attempt, receipt, prepareErr := e.Store.PrepareAttempt(ctx, supervisor.PrepareAttemptInput{
 			ActivityID: logical.ID, ExpectedGeneration: logical.Generation, Runtime: runtimeSpec,
-			CommandDigest: runstate.CommandDigest("adapter", []string{runtimeKey(runtimeSpec)}), Outputs: outputs,
+			CommandDigest: commanddigest.CommandDigest("adapter", []string{runtimeKey(runtimeSpec)}), Outputs: outputs,
 			IdempotencyKey: keyPrefix + "/prepare-prelaunch",
 		})
 		if prepareErr != nil {
@@ -122,7 +123,7 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	attempt, receipt, err := e.Store.PrepareAttempt(ctx, supervisor.PrepareAttemptInput{
 		ActivityID: logical.ID, ExpectedGeneration: logical.Generation,
 		Runtime:        runtimeSpec,
-		CommandDigest:  runstate.CommandDigest(launch.Executable, launch.Args),
+		CommandDigest:  commanddigest.CommandDigest(launch.Executable, launch.Args),
 		Outputs:        outputs,
 		IdempotencyKey: keyPrefix + "/prepare",
 	})
@@ -354,12 +355,7 @@ func pendingControl(store *supervisor.Store, activityID supervisor.ActivityID, a
 			turnStarted = true
 		}
 	}
-	for _, control := range state.Controls {
-		if control.Accepted && control.ActivityID == activity.ID && control.ExpectedGeneration == activity.Generation && control.ExpectedAttemptID == attempt.ID {
-			return control, turnStarted, nil
-		}
-	}
-	return nil, turnStarted, nil
+	return supervisor.AcceptedControlForAttempt(state, activity, attempt), turnStarted, nil
 }
 
 func selectRuntime(work supervisor.WorkSpec, state *supervisor.State, activityID supervisor.ActivityID, sessionRuntime string) (supervisor.RuntimeSpec, error) {
@@ -503,7 +499,7 @@ func writeExclusive(path string, value []byte) error {
 func waitForStartToken(pid int, timeout time.Duration) string {
 	deadline := time.Now().Add(timeout)
 	for {
-		if token := runstate.ProcessStartToken(pid); token != "" {
+		if token := processidentity.ProcessStartToken(pid); token != "" {
 			return token
 		}
 		if time.Now().After(deadline) {

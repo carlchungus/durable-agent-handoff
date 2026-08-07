@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
+	"github.com/carlchungus/durable-agent-handoff/internal/processidentity"
 )
 
 // ErrLiveOrphan is returned when startup finds an inherited Attempt whose
@@ -116,7 +116,7 @@ func exactProcessLive(process *ProcessIdentity) bool {
 	if process == nil || process.PID <= 0 || strings.TrimSpace(process.StartToken) == "" {
 		return false
 	}
-	return runstate.ProcessMatches(runstate.Manifest{PID: process.PID, ProcessStartToken: process.StartToken})
+	return processidentity.ProcessMatches(process.PID, process.StartToken)
 }
 
 func sameProcessIdentity(left, right *ProcessIdentity) bool {

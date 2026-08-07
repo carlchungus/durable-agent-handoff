@@ -14,7 +14,7 @@ import (
 
 func testLedger(t *testing.T) *Ledger {
 	t.Helper()
-	ledger, err := Open(t.TempDir(), Options{
+	ledger, err := Open(privateTempDir(t), Options{
 		Namespace: "records",
 		ValidateID: func(id string) error {
 			if len(id) < 4 || id[:4] != "rec_" {
@@ -27,6 +27,15 @@ func testLedger(t *testing.T) *Ledger {
 		t.Fatal(err)
 	}
 	return ledger
+}
+
+func privateTempDir(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return root
 }
 
 func TestAppendReplayAndSnapshotUseOneDurableRecord(t *testing.T) {
@@ -128,10 +137,16 @@ func TestUnsafeIdentifiersAndRedirectsFailClosed(t *testing.T) {
 }
 
 func TestSeparateLedgersSerializeWriters(t *testing.T) {
-	root := t.TempDir()
+	root := privateTempDir(t)
 	options := Options{Namespace: "records", ValidateID: func(string) error { return nil }}
-	left, _ := Open(root, options)
-	right, _ := Open(root, options)
+	left, err := Open(root, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := Open(root, options)
+	if err != nil {
+		t.Fatal(err)
+	}
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	done := make(chan error, 1)
@@ -158,10 +173,16 @@ func TestSeparateLedgersSerializeWriters(t *testing.T) {
 }
 
 func TestConcurrentAppendsKeepEverySequence(t *testing.T) {
-	root := t.TempDir()
+	root := privateTempDir(t)
 	options := Options{Namespace: "records", ValidateID: func(string) error { return nil }}
-	left, _ := Open(root, options)
-	right, _ := Open(root, options)
+	left, err := Open(root, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := Open(root, options)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := left.Update("rec_concurrent", func(*Txn) error { return nil }); err != nil {
 		t.Fatal(err)
 	}

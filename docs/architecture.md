@@ -232,6 +232,7 @@ schedules remain distinct state machines, but their durable changes must be
 Supervisor Commands in the same global journal. They may not introduce another
 authoritative lifecycle store.
 
-The existing QuickJS/WASM isolation and deterministic ordered-prefix replay
-remain suitable. Runtime invocation starts/results and accepted graph changes
-must use Supervisor commands so a script journal cannot race execution State.
+Dynamic JavaScript/QuickJS/WASM workflow execution is not implemented in v2;
+there is no such package or dependency in this repository. If it is added in a
+future release, its isolation and deterministic ordered-prefix replay must use
+Supervisor commands so a script journal cannot race execution State.

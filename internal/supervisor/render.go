@@ -36,6 +36,12 @@ func RenderText(view *ExecutionView) string {
 		if attempt.TaskAttempt > 0 {
 			fmt.Fprintf(&output, " task_attempt=%d", attempt.TaskAttempt)
 		}
+		if attempt.ResultStatus != "" {
+			fmt.Fprintf(&output, " result=%s", attempt.ResultStatus)
+		}
+		if attempt.TerminalReason != "" {
+			fmt.Fprintf(&output, " terminal_reason=%s", singleLine(attempt.TerminalReason))
+		}
 		if attempt.MeaningfulProgress != "" {
 			fmt.Fprintf(&output, " progress=%s", singleLine(attempt.MeaningfulProgress))
 		}

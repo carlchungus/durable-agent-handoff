@@ -1,6 +1,6 @@
 //go:build dragonfly || freebsd || netbsd || openbsd || solaris
 
-package runstate
+package processidentity
 
 import (
 	"os/exec"

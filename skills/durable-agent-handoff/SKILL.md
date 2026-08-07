@@ -15,6 +15,12 @@ do not infer lifecycle state from a transcript or a legacy store.
   Secret prompts and continuation replies are supplied with `--file -` on
   stdin, never with `--prompt`, `--prompt-file`, `--message`, private prompt
   paths, or any other argv content.
+- Configure an autonomous merge-capable execution at its start boundary with
+  `--finalizer-enabled`, one or more `--required-check NAME`,
+  `--require-human`, `--require-verifier`, and one or more `--verifier ID`.
+  Promotion uses the equivalent flat `finalizer_*` JSON fields. The immutable
+  workflow configuration, not a later caller override, owns the required gate
+  set.
 - Use the arca-cloud promotion envelope with
   `handoff execution start --file - --json`. It accepts one strict flat JSON
   object and returns only `workflow_id` and `node_id`.
@@ -53,7 +59,10 @@ do not infer lifecycle state from a transcript or a legacy store.
   writer Lease. A `turn_started` milestone consumes task budget; pre-turn
   adapter/provider failures consume launch budget only.
 - Controls name the exact Activity generation and Attempt. Stale controls and
-  stale milestones fail closed. Reads and polling are pure projection reads;
+  stale milestones fail closed, and each live exact Activity-generation plus
+  Attempt can have at most one accepted control. Competing controls are
+  rejected without mutation; pause reuses the accepted fence. Reads and
+  polling are pure projection reads;
   they do not reconcile, settle, release leases, or append events.
 - Drivers receive prompts on stdin and construct provider argv themselves.
   Codex, Claude, and Pi apply workspace/full trust flags inside the driver.

@@ -35,16 +35,21 @@ func (f *runtimeCandidateFlags) Set(value string) error {
 }
 
 type executionStartRequest struct {
-	IdempotencyKey string             `json:"idempotency_key"`
-	Goal           string             `json:"goal"`
-	Prompt         string             `json:"prompt"`
-	RemoteRoot     string             `json:"remote_root"`
-	Runtime        string             `json:"runtime"`
-	ResumeID       string             `json:"resume_id"`
-	Model          string             `json:"model,omitempty"`
-	Effort         string             `json:"effort,omitempty"`
-	Sandbox        supervisor.Sandbox `json:"sandbox"`
-	Role           string             `json:"role"`
+	IdempotencyKey           string             `json:"idempotency_key"`
+	Goal                     string             `json:"goal"`
+	Prompt                   string             `json:"prompt"`
+	RemoteRoot               string             `json:"remote_root"`
+	Runtime                  string             `json:"runtime"`
+	ResumeID                 string             `json:"resume_id"`
+	Model                    string             `json:"model,omitempty"`
+	Effort                   string             `json:"effort,omitempty"`
+	Sandbox                  supervisor.Sandbox `json:"sandbox"`
+	Role                     string             `json:"role"`
+	FinalizerEnabled         bool               `json:"finalizer_enabled,omitempty"`
+	FinalizerRequiredChecks  []string           `json:"finalizer_required_checks,omitempty"`
+	FinalizerRequireHuman    bool               `json:"finalizer_require_human,omitempty"`
+	FinalizerRequireVerifier bool               `json:"finalizer_require_verifier,omitempty"`
+	FinalizerVerifiers       []string           `json:"finalizer_verifiers,omitempty"`
 }
 
 type executionStartResponse struct {
@@ -106,8 +111,15 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 	sandbox := fs.String("sandbox", "workspace-write", "read-only or workspace-write")
 	authorizedBy := fs.String("authorized-by", "", "human identity authorizing execution")
 	key := fs.String("idempotency-key", "", "stable request identity")
+	finalizerEnabled := fs.Bool("finalizer-enabled", false, "enable the immutable github merge finalizer")
+	var requiredChecks runtimeCandidateFlags
+	fs.Var(&requiredChecks, "required-check", "required named finalizer check; repeat for each check")
+	requireHuman := fs.Bool("require-human", false, "require human approval before finalization")
+	requireVerifier := fs.Bool("require-verifier", false, "require an independent verifier before finalization")
+	var verifiers runtimeCandidateFlags
+	fs.Var(&verifiers, "verifier", "authorized independent verifier identity; repeat for each verifier")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--json": false}
+	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--finalizer-enabled": false, "--required-check": true, "--require-human": false, "--require-verifier": false, "--verifier": true, "--json": false}
 	if err := rejectUnknownFlags(args, known); err != nil {
 		return err
 	}
@@ -142,6 +154,7 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 			Runtime:   supervisor.RuntimeSpec{Name: request.Runtime, Model: request.Model, Effort: request.Effort, Sandbox: request.Sandbox},
 			Root:      request.RemoteRoot,
 			Authority: supervisor.AuthoritySpec{RequestedBy: request.Role, HumanAuthorized: true, Sandbox: request.Sandbox},
+			Finalizer: supervisor.FinalizerSpec{Enabled: request.FinalizerEnabled, RequiredChecks: append([]string(nil), request.FinalizerRequiredChecks...), RequireHuman: request.FinalizerRequireHuman, RequireVerifier: request.FinalizerRequireVerifier, Verifiers: append([]string(nil), request.FinalizerVerifiers...)},
 			Budget:    supervisor.DefaultBudget(), IdempotencyKey: request.IdempotencyKey,
 		}
 	} else {
@@ -205,6 +218,7 @@ func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 			Runtime:   supervisor.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort, Sandbox: supervisor.Sandbox(*sandbox)},
 			Root:      *root,
 			Authority: supervisor.AuthoritySpec{RequestedBy: *authorizedBy, HumanAuthorized: *authorizedBy != "", Sandbox: supervisor.Sandbox(*sandbox)},
+			Finalizer: supervisor.FinalizerSpec{Enabled: *finalizerEnabled, RequiredChecks: append([]string(nil), requiredChecks...), RequireHuman: *requireHuman, RequireVerifier: *requireVerifier, Verifiers: append([]string(nil), verifiers...)},
 			Budget:    supervisor.DefaultBudget(), IdempotencyKey: *key,
 		}
 	}

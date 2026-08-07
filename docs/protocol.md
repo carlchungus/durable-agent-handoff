@@ -139,6 +139,11 @@ Process health is:
 - `running` after `turn_started` until a terminal milestone; and
 - `exited` after `adapter_start_failed` or `exit`.
 
+Attempt JSON exposes `health`, `terminal_reason`, and any immutable
+`result_status`; it has no duplicate compatibility `state` field. An exit
+milestone with no error cannot overwrite an earlier provider or adapter
+failure reason.
+
 Task-attempt ordinals count only Attempts containing `turn_started`. All OS
 launch Attempts remain listed.
 
@@ -175,8 +180,13 @@ reply `--message` argv content are rejected.
 
 `handoff execution start --file - --json` accepts exactly one flat JSON object
 with `idempotency_key`, `goal`, `prompt`, `remote_root`, `runtime`, `resume_id`,
-`sandbox`, and `role`, plus optional `model` and `effort`. Unknown fields and a
-second JSON value are rejected. Its only JSON response shape is:
+`sandbox`, and `role`, plus optional `model`, `effort`, and flat
+`finalizer_enabled`, `finalizer_required_checks`, `finalizer_require_human`,
+`finalizer_require_verifier`, and `finalizer_verifiers` fields. Unknown fields
+and a second JSON value are rejected. Finalizer configuration is persisted in
+the immutable `StartExecutionInput`; an enabled finalizer requires nonempty
+named checks, human approval, and independent verifier identities. Its only
+JSON response shape is:
 
 ```json
 {"workflow_id":"...","node_id":"..."}

@@ -1,6 +1,6 @@
 //go:build windows
 
-package runstate
+package processidentity
 
 import (
 	"strconv"

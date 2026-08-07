@@ -279,8 +279,9 @@ func cloneState(state *State) (*State, error) {
 }
 
 var (
-	ErrIdempotencyConflict = errors.New("idempotency conflict")
-	ErrFenced              = errors.New("command fenced by newer supervisor state")
-	ErrLeaseHeld           = errors.New("canonical worktree writer lease is held")
-	ErrPausePending        = errors.New("pause is still draining")
+	ErrIdempotencyConflict    = errors.New("idempotency conflict")
+	ErrFenced                 = errors.New("command fenced by newer supervisor state")
+	ErrControlAlreadyAccepted = errors.New("an accepted control already exists for this exact Attempt")
+	ErrLeaseHeld              = errors.New("canonical worktree writer lease is held")
+	ErrPausePending           = errors.New("pause is still draining")
 )

@@ -49,6 +49,12 @@ func (s *Store) StartExecution(ctx context.Context, input StartExecutionInput) (
 	input.Finalizer.RequiredChecks = append([]string(nil), input.Finalizer.RequiredChecks...)
 	input.Finalizer.Verifiers = append([]string(nil), input.Finalizer.Verifiers...)
 	input.Fallbacks = append([]RuntimeSpec(nil), input.Fallbacks...)
+	for index, check := range input.Finalizer.RequiredChecks {
+		input.Finalizer.RequiredChecks[index] = strings.TrimSpace(check)
+	}
+	for index, verifier := range input.Finalizer.Verifiers {
+		input.Finalizer.Verifiers[index] = strings.TrimSpace(verifier)
+	}
 	for index, root := range input.Authority.AllowedRoots {
 		input.Authority.AllowedRoots[index], err = canonicalDirectory(root)
 		if err != nil {
@@ -144,6 +150,18 @@ func validateStartInput(in StartExecutionInput) error {
 	}
 	if in.Finalizer.Enabled && (!in.Finalizer.RequireHuman || !in.Finalizer.RequireVerifier || len(in.Finalizer.Verifiers) == 0 || len(in.Finalizer.RequiredChecks) == 0) {
 		return errors.New("enabled finalizer requires human, independent verifier, and named check gates")
+	}
+	if in.Finalizer.Enabled {
+		for _, check := range in.Finalizer.RequiredChecks {
+			if strings.TrimSpace(check) == "" {
+				return errors.New("enabled finalizer requires non-empty named check gates")
+			}
+		}
+		for _, verifier := range in.Finalizer.Verifiers {
+			if strings.TrimSpace(verifier) == "" {
+				return errors.New("enabled finalizer requires non-empty verifier identities")
+			}
+		}
 	}
 	allowed := false
 	for _, root := range in.Authority.AllowedRoots {
@@ -873,7 +891,14 @@ func (c pauseWorkflowCommand) decide(state *State, now time.Time) ([]DomainEvent
 			continue
 		}
 		activity := state.Activities[attempt.ActivityID]
-		if activity == nil {
+		if activity == nil || attempt.ActivityGeneration != activity.Generation {
+			continue
+		}
+		if existing := AcceptedControlForAttempt(state, activity, attempt); existing != nil {
+			// A pause fences the already accepted exact control. It must not
+			// create a second accepted stop/pause command for the same Attempt.
+			events = append(events, settleMessages(state, activity.ID, attempt.ID, false, now)...)
+			pause.FencedAttemptIDs = append(pause.FencedAttemptIDs, attempt.ID)
 			continue
 		}
 		control := &Control{ID: ControlID(stableID("control", string(in.WorkflowID)+"/pause/"+string(attempt.ID))), Kind: "pause", Actor: in.RequestedBy, ActivityID: activity.ID, ExpectedGeneration: activity.Generation, ExpectedAttemptID: attempt.ID, Accepted: true, CreatedAt: now}
@@ -1018,8 +1043,14 @@ func (c requestControlCommand) decide(state *State, now time.Time) ([]DomainEven
 	}
 	activity := state.Activities[in.ActivityID]
 	attempt := state.Attempts[in.ExpectedAttemptID]
+	exactAttempt := activity != nil && attempt != nil && activity.Generation == in.ExpectedGeneration && attempt.ActivityID == activity.ID && attempt.ActivityGeneration == activity.Generation
+	if exactAttempt {
+		if existing := AcceptedControlForAttempt(state, activity, attempt); existing != nil {
+			return nil, "", fmt.Errorf("%w: %s", ErrControlAlreadyAccepted, existing.ID)
+		}
+	}
 	workflowPaused := activity != nil && state.Pauses[activity.WorkflowID] != nil
-	accepted := !workflowPaused && activity != nil && attempt != nil && activity.Generation == in.ExpectedGeneration && attempt.ActivityID == activity.ID && !attemptTerminal(attempt)
+	accepted := !workflowPaused && exactAttempt && !attemptTerminal(attempt)
 	reason := ""
 	if !accepted {
 		reason = "activity is paused or generation or exact Attempt identity changed"

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 var version = "dev"
@@ -111,6 +112,30 @@ func reorderFlags(args []string, known map[string]bool) []string {
 	return append(flags, positional...)
 }
 
+func rejectUnknownFlags(args []string, known map[string]bool) error {
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if arg == "-" || !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		name := arg
+		for position, char := range arg {
+			if char == '=' {
+				name = arg[:position]
+				break
+			}
+		}
+		takesValue, ok := known[name]
+		if !ok {
+			return fmt.Errorf("unknown option %q", name)
+		}
+		if takesValue && name == arg && index+1 < len(args) {
+			index++
+		}
+	}
+	return nil
+}
+
 func writeJSON(out io.Writer, value any) error {
 	encoder := jsonEncoder(out)
 	return encoder.Encode(value)
@@ -129,7 +154,7 @@ func jsonEncoder(out io.Writer) *json.Encoder {
 const usage = `handoff — Supervisor v2 durable execution
 
 Usage:
-  handoff start [--session EXACT_ID] --runtime codex --prompt-file - --idempotency-key KEY --authorized-by HUMAN
+  handoff start [--session EXACT_ID] --runtime codex --file - --idempotency-key KEY --authorized-by HUMAN
   handoff execution start --file - --json
   handoff execution pause --workflow ID --timeout 30s --json
   handoff status [EXECUTION_ID] [--json]
@@ -138,7 +163,7 @@ Usage:
   handoff serve [--environment-json FILE] [--trust-mode workspace|full]
   handoff preference set ROLE --candidate runtime:model[:effort]
   handoff github merge --execution ID --repo OWNER/REPO --pr NUMBER --gate NAME --idempotency-key KEY --approved --json
-  handoff reply --execution ID --activity ID --message TEXT
+  handoff reply --execution ID --activity ID --file -
   handoff activity list|read [--json]
   handoff tui [--snapshot]
   handoff execution import-v1 --source LEGACY_HOME --idempotency-key KEY

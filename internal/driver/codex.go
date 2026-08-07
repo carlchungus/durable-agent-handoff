@@ -36,7 +36,7 @@ func (Codex) Build(request LaunchRequest) (Launch, error) {
 	} else {
 		args = append(args, "-")
 	}
-	return Launch{Executable: fallback(request.Runtime.Executable, "codex"), Args: args, PromptOnStdin: true}, nil
+	return Launch{Executable: fallback(request.Runtime.Executable, "codex"), Args: args, PromptOnStdin: true, Prompt: promptForRuntime("codex", request.Prompt)}, nil
 }
 
 func (Codex) NewDecoder() Decoder { return &codexDecoder{} }

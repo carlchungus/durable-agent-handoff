@@ -89,12 +89,15 @@ func cmdV2Init(args []string, out io.Writer) error {
 }
 
 func cmdV2Start(args []string, out io.Writer) error {
+	return cmdV2StartMode(args, out, false)
+}
+
+func cmdV2StartMode(args []string, out io.Writer, promotion bool) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	state := common(fs)
-	file := fs.String("file", "", "strict JSON request file; use - for stdin")
+	file := fs.String("file", "", "read strict request or prompt from stdin; must be -")
 	root := fs.String("root", ".", "canonical execution root")
 	goal := fs.String("goal", "", "desired work title")
-	promptFile := fs.String("prompt-file", "-", "read the secret prompt from this file; - means stdin")
 	runtimeName := fs.String("runtime", "", "codex, claude, or pi")
 	nativeSession := fs.String("session", "", "exact native runtime Session identity")
 	role := fs.String("role", "", "role ladder name, such as planner or verifier")
@@ -104,23 +107,19 @@ func cmdV2Start(args []string, out io.Writer) error {
 	authorizedBy := fs.String("authorized-by", "", "human identity authorizing execution")
 	key := fs.String("idempotency-key", "", "stable request identity")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--prompt-file": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--json": false})); err != nil {
+	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--json": false}
+	if err := rejectUnknownFlags(args, known); err != nil {
+		return err
+	}
+	if err := fs.Parse(reorderFlags(args, known)); err != nil {
 		return err
 	}
 	var input supervisor.StartExecutionInput
-	if *file != "" {
-		if !*jsonOut || fs.NArg() != 0 {
-			return errors.New("start --file requires --json and no positional arguments")
+	if promotion {
+		if *file != "-" || !*jsonOut || fs.NArg() != 0 {
+			return errors.New("execution start requires --file - --json and no positional arguments")
 		}
 		var reader io.Reader = os.Stdin
-		if *file != "-" {
-			opened, err := os.Open(*file)
-			if err != nil {
-				return err
-			}
-			defer opened.Close()
-			reader = opened
-		}
 		var request executionStartRequest
 		decoder := json.NewDecoder(bufio.NewReader(reader))
 		decoder.DisallowUnknownFields()
@@ -146,10 +145,10 @@ func cmdV2Start(args []string, out io.Writer) error {
 			Budget:    supervisor.DefaultBudget(), IdempotencyKey: request.IdempotencyKey,
 		}
 	} else {
-		if fs.NArg() != 0 {
-			return errors.New("start does not accept positional arguments")
+		if *file != "-" || fs.NArg() != 0 {
+			return errors.New("start requires --file - and no positional arguments")
 		}
-		prompt, err := readPromptFile(*promptFile)
+		prompt, err := readPromptStdin()
 		if err != nil {
 			return err
 		}
@@ -218,7 +217,7 @@ func cmdV2Start(args []string, out io.Writer) error {
 		return err
 	}
 	if *jsonOut {
-		if *file != "" {
+		if promotion {
 			return writeJSON(out, executionStartResponse{WorkflowID: execution.WorkflowID, NodeID: execution.RootNodeID})
 		}
 		return writeJSON(out, ordinaryStartResponse{Execution: execution, Receipt: receipt})
@@ -708,17 +707,8 @@ func readEnvironmentJSON(path string) ([]string, error) {
 	return env, nil
 }
 
-func readPromptFile(path string) (string, error) {
-	var reader io.Reader = os.Stdin
-	if path != "-" {
-		file, err := os.Open(path)
-		if err != nil {
-			return "", err
-		}
-		defer file.Close()
-		reader = file
-	}
-	raw, err := io.ReadAll(reader)
+func readPromptStdin() (string, error) {
+	raw, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return "", fmt.Errorf("read prompt input: %w", err)
 	}
@@ -827,18 +817,31 @@ func cmdV2Reply(args []string, out io.Writer) error {
 	workflowID := fs.String("workflow", "", "Workflow ID")
 	sessionID := fs.String("session", "", "exact Session ID")
 	activityID := fs.String("activity", "", "predecessor Activity ID")
-	message := fs.String("message", "", "reply body")
+	file := fs.String("file", "", "read reply body from stdin; must be -")
 	from := fs.String("from", "human", "requesting identity")
 	key := fs.String("idempotency-key", "", "stable request identity")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--execution": true, "--session": true, "--activity": true, "--message": true, "--from": true, "--idempotency-key": true, "--json": false})); err != nil {
+	known := map[string]bool{"--state": true, "--execution": true, "--session": true, "--activity": true, "--file": true, "--from": true, "--idempotency-key": true, "--json": false}
+	if err := rejectUnknownFlags(args, known); err != nil {
 		return err
+	}
+	if err := fs.Parse(reorderFlags(args, known)); err != nil {
+		return err
+	}
+	for _, arg := range args {
+		if arg == "--message" || strings.HasPrefix(arg, "--message=") {
+			return errors.New("reply requires --file -; --message is not supported")
+		}
+	}
+	if *file != "-" {
+		return errors.New("reply requires --file -")
 	}
 	if fs.NArg() != 0 && fs.NArg() != 2 {
 		return errors.New("reply accepts either --execution/--activity or WORKFLOW_ID NODE_ID")
 	}
-	if strings.TrimSpace(*message) == "" {
-		return errors.New("reply requires --message")
+	message, err := readPromptStdin()
+	if err != nil {
+		return err
 	}
 	store, err := openV2(*state)
 	if err != nil {
@@ -881,7 +884,7 @@ func cmdV2Reply(args []string, out io.Writer) error {
 	if *key == "" {
 		*key = "reply/" + *activityID
 	}
-	continuation, receipt, err := store.ContinueSession(context.Background(), supervisor.ContinueSessionInput{ExecutionID: supervisor.ExecutionID(*executionID), SessionID: supervisor.SessionID(*sessionID), PredecessorActivityID: activity.ID, From: *from, Message: *message, IdempotencyKey: *key})
+	continuation, receipt, err := store.ContinueSession(context.Background(), supervisor.ContinueSessionInput{ExecutionID: supervisor.ExecutionID(*executionID), SessionID: supervisor.SessionID(*sessionID), PredecessorActivityID: activity.ID, From: *from, Message: message, IdempotencyKey: *key})
 	if err != nil {
 		return err
 	}

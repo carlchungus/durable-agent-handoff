@@ -169,6 +169,10 @@ input. They must not synthesize a new Activity, Attempt, or Session identity.
 
 ## CLI promotion and service boundary
 
+Ordinary `start`/`create` prompts and `reply` bodies are stdin-only: callers
+must pass `--file -`. Arbitrary prompt paths, `--prompt`, `--prompt-file`, and
+reply `--message` argv content are rejected.
+
 `handoff execution start --file - --json` accepts exactly one flat JSON object
 with `idempotency_key`, `goal`, `prompt`, `remote_root`, `runtime`, `resume_id`,
 `sandbox`, and `role`, plus optional `model` and `effort`. Unknown fields and a
@@ -194,7 +198,10 @@ terminal milestones and release their exact Leases before returning.
 
 ## One-way migration
 
-`ImportV1` reads legacy event ledgers only, calculates the source digest before
-mutation, and leaves source bytes unchanged. V1 snapshots, output scraping,
-guessed Activity IDs, and timestamp-based cross-ledger ordering are not import
-authorities. A second import of the same source under a new key is rejected.
+`ImportV1` reads only legacy workflow-history event ledgers, calculates the
+source digest before mutation, and leaves source bytes unchanged. Legacy
+Session, Activity, and team ledgers are not replayed; exact native
+Session/Activity recovery is unsupported and remains explicitly unresolved.
+V1 snapshots, output scraping, guessed Activity IDs, and timestamp-based
+cross-ledger ordering are not import authorities. A second import of the same
+source under a new key is rejected.

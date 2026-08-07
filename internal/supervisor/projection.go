@@ -213,6 +213,13 @@ func projectActivity(state *State, activity *Activity) ActivityView {
 		}
 		return view
 	}
+	if session := state.Sessions[activity.SessionID]; session != nil && session.ImportedUnresolved {
+		// Workflow history can be normalized, but an exact native Session or
+		// Activity cannot be recovered from it. Keep the continuation visible
+		// for human promotion and fail closed before it reaches Queue.
+		view.Status = ActivityNeedsHuman
+		return view
+	}
 	if state.Pauses[activity.WorkflowID] != nil {
 		view.Status = ActivityPaused
 		return view

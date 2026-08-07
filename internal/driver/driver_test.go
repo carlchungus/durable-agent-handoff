@@ -2,6 +2,7 @@ package driver
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -75,6 +76,70 @@ func TestDriversNeverPlacePromptInArgvOrServiceData(t *testing.T) {
 			}
 			if !built.PromptOnStdin || strings.Contains(strings.Join(built.Args, "\x00"), secret) {
 				t.Fatalf("prompt was not stdin-only: %+v", built)
+			}
+		})
+	}
+}
+
+func TestClaudeAndPiUseRuntimeOwnedCompletionContract(t *testing.T) {
+	for _, runtimeName := range []string{"claude", "pi"} {
+		t.Run(runtimeName, func(t *testing.T) {
+			request := launchRequest(runtimeName)
+			request.Prompt = "ordinary work that must produce a durable result"
+			built, err := Lookup(runtimeName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			launch, err := built.Build(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !launch.PromptOnStdin || !strings.Contains(launch.Prompt, completionContract) || !strings.Contains(launch.Prompt, request.Prompt) {
+				t.Fatalf("runtime-owned completion contract was not attached to stdin prompt: %+v", launch)
+			}
+			if strings.Contains(strings.Join(launch.Args, "\x00"), completionContract) || strings.Contains(strings.Join(launch.Args, "\x00"), request.Prompt) {
+				t.Fatalf("completion contract or prompt leaked into argv: %+v", launch.Args)
+			}
+		})
+	}
+}
+
+func TestClaudeAndPiContractResultCompletesOrdinaryWork(t *testing.T) {
+	resultJSON := `{"status":"completed","summary":"ordinary work finished"}`
+	encodedResult := strconv.Quote(resultJSON)
+	tests := []struct {
+		name    string
+		decoder Decoder
+		lines   []string
+	}{
+		{name: "claude", decoder: Claude{}.NewDecoder(), lines: []string{
+			`{"type":"system","subtype":"init","session_id":"claude-contract"}`,
+			`{"type":"assistant","message":{"content":[{"type":"text","text":` + encodedResult + `}]}}`,
+		}},
+		{name: "pi", decoder: Pi{}.NewDecoder(), lines: []string{
+			`{"type":"turn_start"}`,
+			`{"type":"message_update","text":` + encodedResult + `}`,
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var resultCount int
+			for _, line := range test.lines {
+				milestones, err := test.decoder.DecodeLine([]byte(line))
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, milestone := range milestones {
+					if milestone.Kind == supervisor.MilestoneResult {
+						resultCount++
+						if milestone.Result == nil || milestone.Result.Status != "completed" || milestone.Result.Summary != "ordinary work finished" {
+							t.Fatalf("wrong contract result: %+v", milestone)
+						}
+					}
+				}
+			}
+			if resultCount != 1 {
+				t.Fatalf("ordinary work did not complete through the exact contract: %d results", resultCount)
 			}
 		})
 	}

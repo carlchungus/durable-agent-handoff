@@ -28,7 +28,7 @@ func (Pi) Build(request LaunchRequest) (Launch, error) {
 	} else {
 		args = append(args, "--no-approve")
 	}
-	return Launch{Executable: fallback(request.Runtime.Executable, "pi"), Args: args, PromptOnStdin: true}, nil
+	return Launch{Executable: fallback(request.Runtime.Executable, "pi"), Args: args, PromptOnStdin: true, Prompt: promptForRuntime("pi", request.Prompt)}, nil
 }
 
 func (Pi) NewDecoder() Decoder { return &piDecoder{} }

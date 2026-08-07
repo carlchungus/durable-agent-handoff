@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -66,7 +67,7 @@ func TestStatusListReplyAndPauseUseSupervisorProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
-	if err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--runtime", "codex", "--session", "exact-thread", "--prompt-file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "cli-v2-start-01", "--json"}, "work", &out, &errOut); err != nil {
+	if err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--runtime", "codex", "--session", "exact-thread", "--file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "cli-v2-start-01", "--json"}, "work", &out, &errOut); err != nil {
 		t.Fatal(err)
 	}
 	var response struct {
@@ -85,6 +86,49 @@ func TestStatusListReplyAndPauseUseSupervisorProjection(t *testing.T) {
 	out.Reset()
 	if err := run([]string{"status", string(response.Execution.ID), "--state", state}, &out, &errOut); err != nil || !strings.Contains(out.String(), "status=queued") {
 		t.Fatalf("status=%s err=%v", out.String(), err)
+	}
+	store, err := supervisor.Open(state, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	activity := projection.Activities[response.Execution.FirstActivity]
+	if activity == nil {
+		t.Fatal("missing first activity")
+	}
+	attempt, _, err := store.PrepareAttempt(context.Background(), supervisor.PrepareAttemptInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, Runtime: supervisor.RuntimeSpec{Name: "codex", Sandbox: supervisor.SandboxReadOnly}, CommandDigest: "cli-reply-command", Outputs: supervisor.OutputIdentity{Stdout: "cli-reply-stdout", Stderr: "cli-reply-stderr"}, IdempotencyKey: "cli-reply-attempt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, milestone := range []supervisor.Milestone{
+		{Kind: supervisor.MilestoneProcessSpawned, Process: &supervisor.ProcessIdentity{PID: 55, StartToken: "cli-reply-process"}},
+		{Kind: supervisor.MilestoneTurnStarted},
+		{Kind: supervisor.MilestoneResult, Result: &supervisor.WorkerResult{Status: "completed", Summary: "cli reply predecessor"}},
+		{Kind: supervisor.MilestoneExit, Exit: &supervisor.Exit{Code: 0}},
+	} {
+		if _, err := store.RecordMilestone(context.Background(), supervisor.RecordMilestoneInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, AttemptID: attempt.ID, LeaseID: attempt.LeaseID, Milestone: milestone, IdempotencyKey: "cli-reply-" + string(milestone.Kind)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out.Reset()
+	if err := runWithPrompt(t, []string{"reply", "--state", state, "--execution", string(response.Execution.ID), "--activity", string(activity.ID), "--file", "-", "--json"}, "continue privately", &out, &errOut); err != nil {
+		t.Fatalf("stdin-only reply: %v", err)
+	}
+	if strings.Contains(out.String(), "continue privately") {
+		t.Fatalf("reply body leaked in response: %s", out.String())
+	}
+	if err := run([]string{"reply", "--state", state, "--execution", string(response.Execution.ID), "--activity", string(activity.ID), "--message", "argv-secret"}, &out, &errOut); err == nil || strings.Contains(out.String(), "argv-secret") {
+		t.Fatal("legacy reply --message was accepted or exposed")
+	}
+	promptPath := filepath.Join(t.TempDir(), "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("path-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"start", "--state", state, "--root", root, "--runtime", "codex", "--file", promptPath, "--authorized-by", "human:test", "--idempotency-key", "path-prompt-rejected"}, &out, &errOut); err == nil || strings.Contains(out.String(), "path-secret") {
+		t.Fatal("ordinary start accepted or exposed an arbitrary prompt path")
 	}
 	out.Reset()
 	if err := run([]string{"execution", "pause", "--state", state, "--workflow", string(response.Execution.WorkflowID), "--json"}, &out, &errOut); err != nil {
@@ -125,7 +169,7 @@ func TestPreferenceLadderIsJournaledAndOrdinaryStartUsesChildFallbacks(t *testin
 		t.Fatalf("preference list=%s err=%v", out.String(), err)
 	}
 	out.Reset()
-	if err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--role", "planner", "--authorized-by", "human:test", "--idempotency-key", "role-start-01", "--json"}, "role prompt", &out, &errOut); err != nil {
+	if err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--role", "planner", "--file", "-", "--authorized-by", "human:test", "--idempotency-key", "role-start-01", "--json"}, "role prompt", &out, &errOut); err != nil {
 		t.Fatal(err)
 	}
 	var response struct {
@@ -174,7 +218,7 @@ func TestPauseCLIWaitsForDurableExitWithoutMutatingWhilePolling(t *testing.T) {
 		t.Fatal(err)
 	}
 	var startOut, errOut bytes.Buffer
-	if err := runWithPrompt(t, []string{"start", "--state", stateRoot, "--root", worktree, "--runtime", "claude", "--prompt-file", "-", "--sandbox", "workspace-write", "--authorized-by", "human:test", "--idempotency-key", "pause-cli-start", "--json"}, "work", &startOut, &errOut); err != nil {
+	if err := runWithPrompt(t, []string{"start", "--state", stateRoot, "--root", worktree, "--runtime", "claude", "--file", "-", "--sandbox", "workspace-write", "--authorized-by", "human:test", "--idempotency-key", "pause-cli-start", "--json"}, "work", &startOut, &errOut); err != nil {
 		t.Fatal(err)
 	}
 	var started struct {

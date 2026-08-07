@@ -741,6 +741,15 @@ func TestLegacyLedgerImportIsDeterministicOneWayAndPreservesContinuationHistory(
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, namespace := range []string{"sessions", "activities", "teams"} {
+		path := filepath.Join(sourceRoot, namespace, "unreplayed", "events.jsonl")
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("non-workflow history is not replayed\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	target, _, _ := openTestStore(t, Options{})
 	receipt, err := target.ImportV1(context.Background(), ImportV1Input{SourceRoot: sourceRoot, IdempotencyKey: "legacy-import-01"})
 	if err != nil {
@@ -753,6 +762,20 @@ func TestLegacyLedgerImportIsDeterministicOneWayAndPreservesContinuationHistory(
 	if len(state.Workflows) != 1 || len(state.Results) != 1 || len(state.Activities) != 2 || len(state.LegacyImports) != 1 {
 		t.Fatalf("unexpected imported projection: workflows=%d results=%d activities=%d imports=%d", len(state.Workflows), len(state.Results), len(state.Activities), len(state.LegacyImports))
 	}
+	for _, session := range state.Sessions {
+		if !session.ImportedUnresolved || session.Native.ID != "" {
+			t.Fatalf("legacy session was presented as exact recoverable identity: %+v", session)
+		}
+	}
+	importRecord, ok := state.LegacyImports[receipt.ResourceID]
+	if !ok || len(importRecord.Files) == 0 {
+		t.Fatalf("workflow import record is missing file inventory: receipt=%+v imports=%+v", receipt, state.LegacyImports)
+	}
+	for path := range importRecord.Files {
+		if strings.HasPrefix(path, "sessions/") || strings.HasPrefix(path, "activities/") || strings.HasPrefix(path, "teams/") {
+			t.Fatalf("non-workflow ledger was incorrectly inventoried: %s", path)
+		}
+	}
 	var predecessor, continuation *Activity
 	for _, activity := range state.Activities {
 		if activity.Generation == 1 {
@@ -763,6 +786,24 @@ func TestLegacyLedgerImportIsDeterministicOneWayAndPreservesContinuationHistory(
 	}
 	if predecessor == nil || continuation == nil || continuation.ParentActivityID != predecessor.ID || resultForActivity(state, predecessor.ID) == nil || resultForActivity(state, continuation.ID) != nil {
 		t.Fatalf("legacy reopen was not normalized to immutable predecessor plus queued continuation: predecessor=%+v continuation=%+v", predecessor, continuation)
+	}
+	var executionID ExecutionID
+	for id := range state.Executions {
+		executionID = id
+		break
+	}
+	view, err := target.View(executionID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var continuationView *ActivityView
+	for index := range view.Activities {
+		if view.Activities[index].ID == continuation.ID {
+			continuationView = &view.Activities[index]
+		}
+	}
+	if len(view.Queue) != 0 || continuationView == nil || continuationView.Status != ActivityNeedsHuman {
+		t.Fatalf("unresolved imported continuation was schedulable: queue=%v activities=%+v", view.Queue, view.Activities)
 	}
 	retry, err := target.ImportV1(context.Background(), ImportV1Input{SourceRoot: sourceRoot, IdempotencyKey: "legacy-import-01"})
 	if err != nil || !retry.Existing || retry.Sequence != receipt.Sequence {

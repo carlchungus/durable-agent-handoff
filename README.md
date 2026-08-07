@@ -15,7 +15,7 @@ Ordinary `start` and `create` may launch a new native Session; passing
 selector:
 
 ```sh
-printf '%s' 'work' | handoff start --runtime codex --prompt-file - \
+printf '%s' 'work' | handoff start --runtime codex --file - \
   --root /repo --authorized-by human:id --idempotency-key request-01 --json
 handoff status EXECUTION_ID --json
 handoff list --json
@@ -58,7 +58,9 @@ never reopen or modify a completed Result:
 
 ```sh
 handoff reply --execution EXECUTION_ID --activity ACTIVITY_ID \
-  --message 'continue' --idempotency-key reply-01 --json
+  --file - --idempotency-key reply-01 --json <<'TEXT'
+continue
+TEXT
 ```
 
 ## Runtime and service boundary
@@ -90,10 +92,12 @@ closed because Supervisor v2 does not guess at runtime adoption.
 
 ## Migration
 
-`handoff execution import-v1` is the only v1 compatibility path. It hashes and
-replays legacy event ledgers deterministically, preserves source bytes, and
-records one `legacy.imported` transaction. After import, all execution reads
-and writes use the Supervisor journal.
+`handoff execution import-v1` is the only v1 compatibility path. It inventories
+and normalizes only legacy workflow-history ledgers, preserves source bytes,
+and records one `legacy.imported` transaction. Legacy Session, Activity, and
+team ledgers are not replayed; exact native Session/Activity recovery is
+unsupported and marked unresolved. After import, all execution reads and
+writes use the Supervisor journal.
 
 Required checks before handoff:
 

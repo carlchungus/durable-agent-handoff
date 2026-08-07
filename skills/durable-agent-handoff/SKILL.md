@@ -12,8 +12,9 @@ do not infer lifecycle state from a transcript or a legacy store.
 ## Supported v2 surface
 
 - Start a new or exact-resume execution with `handoff start` or `handoff create`.
-  Secret prompts are supplied with `--prompt-file -` (or a private file), never
-  with `--prompt` and never in argv.
+  Secret prompts and continuation replies are supplied with `--file -` on
+  stdin, never with `--prompt`, `--prompt-file`, `--message`, private prompt
+  paths, or any other argv content.
 - Use the arca-cloud promotion envelope with
   `handoff execution start --file - --json`. It accepts one strict flat JSON
   object and returns only `workflow_id` and `node_id`.
@@ -36,7 +37,10 @@ do not infer lifecycle state from a transcript or a legacy store.
   the prepared exact PR head, named gates, approval, and idempotency key before
   an argv-only `gh` effect, then journals merged or blocked outcome.
 - Import old state only with deterministic one-way `handoff execution import-v1`.
-  The v1 source remains unchanged and is never a live write path.
+  It normalizes workflow-history ledgers only; legacy Session, Activity, and
+  team ledgers are not replayed, exact native Session/Activity recovery is
+  unsupported and marked unresolved, and the v1 source remains unchanged and
+  is never a live write path.
 
 ## Identity and durability rules
 

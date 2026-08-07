@@ -34,6 +34,10 @@ type Launch struct {
 	Executable    string
 	Args          []string
 	PromptOnStdin bool
+	// Prompt is transient launch input. Drivers may append a runtime-owned
+	// completion contract without putting user content in argv or durable
+	// Supervisor state.
+	Prompt string
 }
 
 type Decoder interface {
@@ -89,6 +93,21 @@ func fallback(value, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+const completionContract = `
+
+Supervisor completion contract: after performing the requested work, emit exactly one JSON object with this shape and no Markdown or surrounding prose:
+{"status":"completed|needs_human|blocked","summary":" concise outcome "}
+The status must be one of completed, needs_human, or blocked, and summary must be a non-empty string. Do not emit this object until the work is finished.`
+
+func promptForRuntime(runtime, prompt string) string {
+	if runtime == "codex" {
+		// Codex receives the same contract as a native output schema through the
+		// schema file, so its user prompt remains unchanged.
+		return prompt
+	}
+	return strings.TrimRight(prompt, "\n") + completionContract
 }
 
 func validateLaunch(request LaunchRequest, runtime string) error {

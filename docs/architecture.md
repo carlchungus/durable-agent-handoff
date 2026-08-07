@@ -217,11 +217,13 @@ remain idempotent and changed heads fail closed.
 
 ## Migration
 
-V1 is imported once; it is not dual-run. `Store.ImportV1` reads and hashes legacy
-event ledgers, replays each ledger by its own sequence, normalizes completed and
-reopened histories, and appends one `legacy.imported` transaction. Legacy bytes
-remain backward readable and unchanged. Missing exact Session identities are
-explicitly unresolved instead of scraped or guessed. See ADR 0003.
+V1 is imported once; it is not dual-run. `Store.ImportV1` reads and hashes only
+legacy workflow-history ledgers, replays each workflow by its own sequence,
+normalizes completed and reopened histories, and appends one
+`legacy.imported` transaction. Legacy Session, Activity, and team ledgers are
+not replayed. Legacy bytes remain unchanged, and exact native Session/Activity
+recovery is explicitly unsupported and unresolved instead of scraped or
+guessed. See ADR 0003.
 
 ## Extension boundaries
 

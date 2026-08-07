@@ -16,11 +16,11 @@ Migration is a one-way import, implemented by `Store.ImportV1`.
 
 The importer:
 
-1. reads legacy `events.jsonl` files in sorted namespace/path order;
+1. reads only legacy Workflow `events.jsonl` files in sorted path order;
 2. validates and replays each Workflow by its own sequence, never from a
    replaceable `state.json` snapshot;
-3. hashes every source path and byte stream into one source digest;
-4. normalizes all resources against a cloned v2 projection; and
+3. hashes every imported workflow path and byte stream into one source digest;
+4. normalizes workflow history against a cloned v2 projection; and
 5. appends one `legacy.imported` Supervisor transaction containing deterministic
    qualified identities and per-file checksums.
 
@@ -30,16 +30,18 @@ a different key is rejected. Changing source bytes changes the command digest
 and conflicts with reuse of the original key.
 
 Legacy completed→reopened history is normalized into an immutable completed
-Activity/Result generation followed by a queued continuation generation. It is
-never imported as a mutable completed Node returning to ready. Missing exact
-native Session identities are explicitly marked `imported_unresolved`; the
-importer does not scrape output or invent a resumable provider identity.
+Activity/Result generation followed by a continuation generation. It is never
+imported as a mutable completed Node returning to ready. Session and Activity
+ledgers are not replayed, so exact native Session/Activity recovery is
+unsupported: normalized Sessions are explicitly marked `imported_unresolved`,
+their continuations are held for human promotion, and the importer does not
+scrape output or invent a resumable provider identity.
 
-Legacy cross-store chronology is not guessed. Historical Attempts without a
-complete v1 Activity record receive deterministic import-qualified identities
-and provenance. They do not receive a live writer Lease or publication
-authority. Publication evidence is historical until independently verified in
-v2.
+Legacy cross-store chronology is not guessed. Workflow-history completion
+markers receive deterministic import-qualified Activity/Attempt identities and
+provenance; no v1 Session, Activity, or Attempt ledger is replayed. Imported
+Attempts do not receive a live writer Lease or publication authority.
+Publication evidence is historical until independently verified in v2.
 
 After a successful import, the Supervisor journal is the only execution state.
 There is no dual-write or fallback read path.
@@ -50,8 +52,9 @@ There is no dual-write or fallback read path.
 - A live v1 writer must be quiesced before promotion; import does not grant a v2
   Lease beside ambiguous legacy process authority.
 - Some v1 facts remain explicitly unresolved instead of being guessed.
-- Backward readability is preserved because all legacy ledger bytes remain in
-  place and use their original schema.
+- Backward readability is preserved because legacy source bytes remain in place
+  and use their original schema; non-workflow ledgers are outside the import
+  authority and are not replayed.
 
 ## Rejected alternatives
 

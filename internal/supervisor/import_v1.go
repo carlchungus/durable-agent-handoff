@@ -34,9 +34,11 @@ func (c importV1Command) commandType() string     { return "ImportV1" }
 func (c importV1Command) idempotencyKey() string  { return c.Input.IdempotencyKey }
 func (c importV1Command) digest() (string, error) { return c.Digest, nil }
 
-// ImportV1 is a deterministic one-way import. It reads legacy ledgers, never
-// their replaceable snapshots, and appends one v2 transaction. Source bytes are
-// left untouched and are never consulted again by Supervisor execution.
+// ImportV1 is a deterministic one-way import. It reads only legacy workflow
+// history ledgers, never replaceable snapshots or non-workflow ledgers, and
+// appends one v2 transaction. Source bytes are left untouched and are never
+// consulted again by Supervisor execution. Exact legacy Session and Activity
+// recovery is intentionally unsupported and remains explicitly unresolved.
 func (s *Store) ImportV1(ctx context.Context, input ImportV1Input) (Receipt, error) {
 	canonical, err := canonicalDirectory(input.SourceRoot)
 	if err != nil {
@@ -115,8 +117,7 @@ func (c importV1Command) decide(state *State, now time.Time) ([]DomainEvent, str
 			workflow.Nodes[nodeID] = node
 			workflow.Order = append(workflow.Order, nodeID)
 			sessionID := SessionID(stableID("session", c.Digest+"/"+legacy.ID+"/"+legacyNode.ID))
-			native := NativeSessionIdentity{Runtime: legacyNode.Runtime.Name, ID: legacyNode.SessionID}
-			session := &Session{ID: sessionID, WorkflowID: workflowID, Native: native, ImportedUnresolved: strings.TrimSpace(native.ID) == "", Root: workRoot, CreatedAt: node.CreatedAt}
+			session := &Session{ID: sessionID, WorkflowID: workflowID, ImportedUnresolved: true, Root: workRoot, CreatedAt: node.CreatedAt}
 			data.Sessions = append(data.Sessions, session)
 			generations := history.Completions[legacyNode.ID]
 			if generations == 0 && legacyNode.State == core.NodeCompleted {
@@ -227,13 +228,11 @@ func parseLegacyWorkflow(raw []byte) (legacyWorkflowHistory, error) {
 
 func digestLegacyLedgers(root string) (string, map[string]string, map[string][]byte, error) {
 	var paths []string
-	for _, namespace := range []string{"workflows", "sessions", "activities", "teams"} {
-		matches, err := filepath.Glob(filepath.Join(root, namespace, "*", "events.jsonl"))
-		if err != nil {
-			return "", nil, nil, err
-		}
-		paths = append(paths, matches...)
+	matches, err := filepath.Glob(filepath.Join(root, "workflows", "*", "events.jsonl"))
+	if err != nil {
+		return "", nil, nil, err
 	}
+	paths = append(paths, matches...)
 	sort.Strings(paths)
 	if len(paths) == 0 {
 		return "", nil, nil, errors.New("legacy source has no event ledgers")

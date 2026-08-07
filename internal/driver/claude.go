@@ -27,7 +27,7 @@ func (Claude) Build(request LaunchRequest) (Launch, error) {
 	if request.TrustMode == TrustFull {
 		args = append(args, "--dangerously-skip-permissions")
 	}
-	return Launch{Executable: fallback(request.Runtime.Executable, "claude"), Args: args, PromptOnStdin: true}, nil
+	return Launch{Executable: fallback(request.Runtime.Executable, "claude"), Args: args, PromptOnStdin: true, Prompt: promptForRuntime("claude", request.Prompt)}, nil
 }
 
 func (Claude) NewDecoder() Decoder { return &claudeDecoder{} }

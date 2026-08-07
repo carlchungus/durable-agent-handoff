@@ -12,7 +12,7 @@ The released `handoff` binary is a breaking Supervisor v2 control plane. Its
 normal start, run, serve, status, list, reply, TUI, and activity paths read and
 write one Supervisor journal. The supported command surface is documented in
 [`README.md`](../README.md) and the protocol in [`protocol.md`](protocol.md):
-ordinary prompts use `--prompt-file -`, promotion uses strict
+ordinary prompts use `--file -` (stdin-only), promotion uses strict
 `execution start --file - --json`, pause uses exact fenced Attempts, role/model
 ladders use journaled preference commands, and guarded publication uses
 `github merge`. `handoff.service` is the stable installed service name.
@@ -21,7 +21,9 @@ The old `doctor`, Claude discovery/import, team store, preference-file reset,
 activity follow/stop, and transcript/output attachment commands are deferred
 v1/product surfaces, not valid v2 compatibility adapters. They must not be
 advertised as available until they have Supervisor-journal projections and
-tests. `execution import-v1` is the sole deterministic one-way v1 importer.
+tests. `execution import-v1` is the sole deterministic one-way v1 importer; it
+normalizes workflow-history ledgers only and does not recover exact legacy
+Session or Activity identities.
 
 ## What “high fidelity” means
 

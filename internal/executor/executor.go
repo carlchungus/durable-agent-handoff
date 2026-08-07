@@ -55,6 +55,9 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	if node == nil || session == nil {
 		return errors.New("Activity projection has broken Node or Session identity")
 	}
+	if session.ImportedUnresolved {
+		return errors.New("imported Activity has no recoverable exact native Session")
+	}
 	runtimeSpec, err := selectRuntime(node.Work, state, logical.ID, session.Native.Runtime)
 	if err != nil {
 		return err
@@ -143,7 +146,13 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	}
 	var stdin []byte
 	if launch.PromptOnStdin {
-		stdin = []byte(logical.Prompt)
+		prompt := launch.Prompt
+		if prompt == "" {
+			// Test and third-party drivers predating the transient launch prompt
+			// field retain the safe stdin-only behavior.
+			prompt = logical.Prompt
+		}
+		stdin = []byte(prompt)
 	}
 	gated, err := activity.PrepareGatedCommand(argv, node.Work.Root, e.Environment, stdin)
 	if err != nil {

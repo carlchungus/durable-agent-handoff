@@ -20,8 +20,13 @@ printf '%s' 'work' | handoff start --runtime codex --file - \
 printf '%s' 'ship it' | handoff goal start --runtime codex --file - \
   --root /repo --goal 'ship the verified change' \
   --authorized-by human:id --idempotency-key request-02 \
-  --max-turns 100 \
   --finalizer-enabled --required-check verify --require-human --json
+# A monitoring supervisor can persist a ten-minute cadence without wasting a
+# live model turn while it waits.
+printf '%s' 'audit every active workstream' | handoff goal start \
+  --runtime codex --file - --root /repo --goal 'keep work unblocked' \
+  --authorized-by human:id --idempotency-key supervisor-01 \
+  --wake-interval 10m --json
 handoff status EXECUTION_ID --json
 handoff list --json
 handoff tui --snapshot
@@ -46,7 +51,7 @@ handoff execution start --file - --json <<'JSON'
   "finalizer_required_checks": ["verify"],
   "finalizer_require_human": true,
   "evaluator_model": "deepseek/deepseek-v4-flash-0731",
-  "max_turns": 100
+  "wake_interval_seconds": 600
 }
 JSON
 ```
@@ -65,6 +70,12 @@ turn stays on the exact process attempt that produced it; the decision is
 stored on the normal result. `continue` creates the next turn on the same
 native session in the same journal write. `escalate` must include one concrete
 blocker and question. A model failure leaves the turn pending and retries it.
+Goals are unbounded by default. `--max-turns N` is an explicit opt-in safety
+cap, not a required budget and not an unattended-operation default.
+`--wake-interval 10m` durably schedules each automatic continuation for a
+future time. `status` and `list` expose `next_wake_at`/`next_wake`; queued human
+replies remain immediately runnable. The service checks persisted deadlines,
+so no sleeping shell or occupied model turn is involved.
 
 DeepSeek's forced decision tool is the default because strict
 `response_format` was unreliable against the checked-in real transcripts. The
@@ -114,6 +125,12 @@ handoff service install --enable --trust-mode workspace --environment-json /priv
 handoff github merge --execution EXECUTION_ID --repo OWNER/REPO --pr 7 \
   --gate verify --idempotency-key publication-01 --approved --json
 ```
+
+`service install --enable` also installs a ten-minute OS watchdog. The normal
+service loop is the only scheduler; the watchdog merely starts it when it is
+inactive after a crash, reboot, or service-manager failure. It never restarts a
+healthy service or interrupts a live worker. systemd timers are persistent
+across missed wakeups, and launchd uses the equivalent `StartInterval` fallback.
 
 `--environment-json` must be a regular mode-0600 JSON object. Values are read
 only at service startup and passed to drivers without being persisted. Service

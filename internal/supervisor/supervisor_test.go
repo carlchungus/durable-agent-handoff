@@ -669,6 +669,143 @@ func TestGoalTurnLimitBecomesVisibleHumanEscalation(t *testing.T) {
 	}
 }
 
+func TestUnboundedGoalContinuesWithoutHumanEscalation(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	execution, _, err := store.StartExecution(context.Background(), StartExecutionInput{
+		NativeSession: NativeSessionIdentity{Runtime: "claude", ID: "unbounded-session"}, Goal: "Keep supervising until explicitly complete", Prompt: "Check and continue useful work",
+		Runtime: RuntimeSpec{Name: "claude", Sandbox: SandboxWorkspaceWrite}, Root: worktree,
+		Authority: AuthoritySpec{RequestedBy: "human:test", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite}, Budget: DefaultBudget(),
+		EvaluatorModel: "fake/evaluator", MaxTurns: 0, IdempotencyKey: "unbounded-goal-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := store.Projection()
+	activity := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "unbounded-attempt")
+	milestone(t, store, activity, attempt, "unbounded-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 705, StartToken: "unbounded-process"}})
+	milestone(t, store, activity, attempt, "unbounded-turn", Milestone{Kind: MilestoneTurnStarted})
+	milestone(t, store, activity, attempt, "unbounded-result", Milestone{Kind: MilestoneResult, Result: &WorkerResult{Status: "continue", Summary: "Useful monitoring remains"}})
+	milestone(t, store, activity, attempt, "unbounded-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 0}})
+	continuation, _, err := store.DecideTurn(context.Background(), DecideTurnInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, AttemptID: attempt.ID, Decision: TurnDecision{Outcome: "continue", Reason: "Continue unattended supervision.", Model: "fake/evaluator"}, IdempotencyKey: "unbounded-goal-continue"})
+	if err != nil || continuation == nil {
+		t.Fatalf("unbounded goal did not continue: continuation=%+v err=%v", continuation, err)
+	}
+	view, err := store.View(execution.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Queue) != 1 || view.Queue[0] != continuation.ID || view.Activities[0].BlockerKind != "" {
+		t.Fatalf("unbounded goal escalated instead of continuing: %+v", view)
+	}
+}
+
+func TestGoalWakeIntervalPersistsAndBecomesRunnableWhenDue(t *testing.T) {
+	now := time.Date(2026, time.August, 7, 16, 0, 0, 0, time.UTC)
+	store, _, worktree := openTestStore(t, Options{Now: func() time.Time { return now }})
+	execution, _, err := store.StartExecution(context.Background(), StartExecutionInput{
+		NativeSession: NativeSessionIdentity{Runtime: "codex", ID: "scheduled-session"}, Goal: "Periodically supervise active work", Prompt: "Inspect every workstream",
+		Runtime: RuntimeSpec{Name: "codex", Sandbox: SandboxWorkspaceWrite}, Root: worktree,
+		Authority: AuthoritySpec{RequestedBy: "human:test", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite}, Budget: DefaultBudget(),
+		EvaluatorModel: "fake/evaluator", WakeIntervalSeconds: 600, IdempotencyKey: "scheduled-goal-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := store.Projection()
+	activity := state.Activities[execution.FirstActivity]
+	attempt := prepareTestAttempt(t, store, activity.ID, activity.Generation, "scheduled-attempt")
+	milestone(t, store, activity, attempt, "scheduled-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 708, StartToken: "scheduled-process"}})
+	milestone(t, store, activity, attempt, "scheduled-turn", Milestone{Kind: MilestoneTurnStarted})
+	milestone(t, store, activity, attempt, "scheduled-result", Milestone{Kind: MilestoneResult, Result: &WorkerResult{Status: "continue", Summary: "Check again later"}})
+	milestone(t, store, activity, attempt, "scheduled-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 0}})
+	continuation, _, err := store.DecideTurn(context.Background(), DecideTurnInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, AttemptID: attempt.ID, Decision: TurnDecision{Outcome: "continue", Reason: "Wake for the next audit.", Model: "fake/evaluator"}, IdempotencyKey: "scheduled-goal-continue"})
+	if err != nil || continuation == nil {
+		t.Fatalf("scheduled goal did not continue: continuation=%+v err=%v", continuation, err)
+	}
+	wakeAt := now.Add(10 * time.Minute)
+	if continuation.NotBefore == nil || !continuation.NotBefore.Equal(wakeAt) {
+		t.Fatalf("continuation wake=%s want=%s", continuation.NotBefore, wakeAt)
+	}
+	view, err := store.View(execution.ID, now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Queue) != 0 || view.NextWakeAt == nil || !view.NextWakeAt.Equal(wakeAt) {
+		t.Fatalf("scheduled continuation became runnable early: %+v", view)
+	}
+	var scheduled ActivityView
+	for _, candidate := range view.Activities {
+		if candidate.ID == continuation.ID {
+			scheduled = candidate
+			break
+		}
+	}
+	if scheduled.Status != ActivityScheduled {
+		t.Fatalf("continuation status=%s want=%s", scheduled.Status, ActivityScheduled)
+	}
+	if _, _, err = store.PrepareAttempt(context.Background(), PrepareAttemptInput{ActivityID: continuation.ID, ExpectedGeneration: continuation.Generation, CommandDigest: "sha256:early", Outputs: OutputIdentity{Stdout: "early-out", Stderr: "early-err"}, IdempotencyKey: "scheduled-too-early"}); err == nil || !strings.Contains(err.Error(), "scheduled for") {
+		t.Fatalf("early execution was not rejected: %v", err)
+	}
+	now = wakeAt
+	view, err = store.View(execution.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Queue) != 1 || view.Queue[0] != continuation.ID || view.NextWakeAt != nil {
+		t.Fatalf("due continuation did not enter queue: %+v", view)
+	}
+	prepareTestAttempt(t, store, continuation.ID, continuation.Generation, "scheduled-due-attempt")
+}
+
+func TestGoalContinuationDoesNotStarveQueuedHumanReply(t *testing.T) {
+	store, _, worktree := openTestStore(t, Options{})
+	execution, _, err := store.StartExecution(context.Background(), StartExecutionInput{
+		NativeSession: NativeSessionIdentity{Runtime: "claude", ID: "reply-priority-session"}, Goal: "Keep shipping useful work", Prompt: "Ship the next change",
+		Runtime: RuntimeSpec{Name: "claude", Sandbox: SandboxWorkspaceWrite}, Root: worktree,
+		Authority: AuthoritySpec{RequestedBy: "human:test", HumanAuthorized: true, Sandbox: SandboxWorkspaceWrite}, Budget: DefaultBudget(),
+		EvaluatorModel: "fake/evaluator", IdempotencyKey: "reply-priority-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := store.Projection()
+	first := state.Activities[execution.FirstActivity]
+	firstAttempt := prepareTestAttempt(t, store, first.ID, first.Generation, "reply-priority-first-attempt")
+	milestone(t, store, first, firstAttempt, "reply-priority-first-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 706, StartToken: "reply-priority-first"}})
+	milestone(t, store, first, firstAttempt, "reply-priority-first-turn", Milestone{Kind: MilestoneTurnStarted})
+	milestone(t, store, first, firstAttempt, "reply-priority-first-result", Milestone{Kind: MilestoneResult, Result: &WorkerResult{Status: "continue", Summary: "More work remains"}})
+	milestone(t, store, first, firstAttempt, "reply-priority-first-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 0}})
+	automatic, _, err := store.DecideTurn(context.Background(), DecideTurnInput{ActivityID: first.ID, ExpectedGeneration: first.Generation, AttemptID: firstAttempt.ID, Decision: TurnDecision{Outcome: "continue", Reason: "Continue the campaign.", Model: "fake/evaluator"}, IdempotencyKey: "reply-priority-first-decision"})
+	if err != nil || automatic == nil {
+		t.Fatalf("first continuation failed: activity=%+v err=%v", automatic, err)
+	}
+	human, _, err := store.ContinueSession(context.Background(), ContinueSessionInput{ExecutionID: execution.ID, SessionID: execution.SessionID, PredecessorActivityID: first.ID, From: "human", Message: "Stop polling CI and start the next independent candidate.", IdempotencyKey: "reply-priority-human"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	automaticAttempt := prepareTestAttempt(t, store, automatic.ID, automatic.Generation, "reply-priority-auto-attempt")
+	milestone(t, store, automatic, automaticAttempt, "reply-priority-auto-spawn", Milestone{Kind: MilestoneProcessSpawned, Process: &ProcessIdentity{PID: 707, StartToken: "reply-priority-auto"}})
+	milestone(t, store, automatic, automaticAttempt, "reply-priority-auto-turn", Milestone{Kind: MilestoneTurnStarted})
+	milestone(t, store, automatic, automaticAttempt, "reply-priority-auto-result", Milestone{Kind: MilestoneResult, Result: &WorkerResult{Status: "continue", Summary: "CI is still pending"}})
+	milestone(t, store, automatic, automaticAttempt, "reply-priority-auto-exit", Milestone{Kind: MilestoneExit, Exit: &Exit{Code: 0}})
+	next, _, err := store.DecideTurn(context.Background(), DecideTurnInput{ActivityID: automatic.ID, ExpectedGeneration: automatic.Generation, AttemptID: automaticAttempt.ID, Decision: TurnDecision{Outcome: "continue", Reason: "Keep watching CI.", Model: "fake/evaluator"}, IdempotencyKey: "reply-priority-auto-decision"})
+	if err != nil || next == nil || next.ID != human.ID {
+		t.Fatalf("evaluator continuation starved human reply: next=%+v human=%+v err=%v", next, human, err)
+	}
+	state, _ = store.Projection()
+	if len(state.Activities) != 3 {
+		t.Fatalf("evaluator created a competing continuation: activities=%d", len(state.Activities))
+	}
+	view, err := store.View(execution.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Queue) != 1 || view.Queue[0] != human.ID {
+		t.Fatalf("human reply is not the sole queued continuation: %+v", view.Queue)
+	}
+}
+
 func TestCompletedPredecessorIsImmutableAndContinuationQueuesBehindSuccessorLease(t *testing.T) {
 	store, _, worktree := openTestStore(t, Options{})
 	execution := startTestExecution(t, store, worktree, "continuation-start", DefaultBudget())

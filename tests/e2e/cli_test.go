@@ -127,7 +127,7 @@ func TestPublicCLICompletesOneActivityThroughRuntimeProcess(t *testing.T) {
 	}
 }
 
-func TestPublicCLIGoalRejectsPlanAndContinuesExactSession(t *testing.T) {
+func TestPublicCLIUnboundedGoalRejectsPlanAndContinuesExactSession(t *testing.T) {
 	state := privateDir(t)
 	worktree := t.TempDir()
 	fakeBin := t.TempDir()
@@ -186,7 +186,7 @@ func TestPublicCLIGoalRejectsPlanAndContinuesExactSession(t *testing.T) {
 			WorkflowID string `json:"workflow_id"`
 		} `json:"execution"`
 	}
-	decodeJSON(t, runCLI(t, environment, "complete the implementation", "goal", "start", "--state", state, "--root", worktree, "--goal", "complete the implementation", "--runtime", "codex", "--file", "-", "--sandbox", "workspace-write", "--authorized-by", "human:e2e", "--idempotency-key", "black-box-goal", "--evaluator-model", "fake/evaluator", "--max-turns", "3", "--json"), &started)
+	decodeJSON(t, runCLI(t, environment, "complete the implementation", "goal", "start", "--state", state, "--root", worktree, "--goal", "complete the implementation", "--runtime", "codex", "--file", "-", "--sandbox", "workspace-write", "--authorized-by", "human:e2e", "--idempotency-key", "black-box-goal", "--evaluator-model", "fake/evaluator", "--json"), &started)
 	serviceCommand := exec.Command(handoffPath, "serve", "--state", state, "--interval", "100ms", "--workers", "1", "--environment-json", environmentFile, "--startup-timeout", "5s")
 	serviceCommand.Env = environment
 	var serviceOutput strings.Builder

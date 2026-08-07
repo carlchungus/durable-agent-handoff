@@ -52,6 +52,11 @@ func TestOpenRouterEvaluatorUsesFreshToollessStructuredRequest(t *testing.T) {
 	if !strings.Contains(string(messages), "does not grant new authority") {
 		t.Fatalf("evaluator prompt omitted immutable authority semantics: %s", messages)
 	}
+	for _, want := range []string{"human is unavailable", "draft PR", "external CI", "another independent candidate"} {
+		if !strings.Contains(string(messages), want) {
+			t.Fatalf("evaluator prompt omitted unattended behavior %q: %s", want, messages)
+		}
+	}
 	tools, ok := captured["tools"].([]any)
 	if !ok || len(tools) != 0 {
 		t.Fatalf("evaluator unexpectedly received tools: %#v", captured["tools"])

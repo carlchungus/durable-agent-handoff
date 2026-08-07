@@ -15,19 +15,20 @@ import (
 )
 
 type StartExecutionInput struct {
-	NativeSession  NativeSessionIdentity `json:"native_session"`
-	Prompt         string                `json:"prompt"`
-	Goal           string                `json:"goal,omitempty"`
-	Runtime        RuntimeSpec           `json:"runtime"`
-	Fallbacks      []RuntimeSpec         `json:"fallbacks,omitempty"`
-	Role           string                `json:"role,omitempty"`
-	Root           string                `json:"root"`
-	Authority      AuthoritySpec         `json:"authority"`
-	Finalizer      FinalizerSpec         `json:"finalizer"`
-	Budget         Budget                `json:"budget"`
-	EvaluatorModel string                `json:"evaluator_model,omitempty"`
-	MaxTurns       int                   `json:"max_turns,omitempty"`
-	IdempotencyKey string                `json:"-"`
+	NativeSession       NativeSessionIdentity `json:"native_session"`
+	Prompt              string                `json:"prompt"`
+	Goal                string                `json:"goal,omitempty"`
+	Runtime             RuntimeSpec           `json:"runtime"`
+	Fallbacks           []RuntimeSpec         `json:"fallbacks,omitempty"`
+	Role                string                `json:"role,omitempty"`
+	Root                string                `json:"root"`
+	Authority           AuthoritySpec         `json:"authority"`
+	Finalizer           FinalizerSpec         `json:"finalizer"`
+	Budget              Budget                `json:"budget"`
+	EvaluatorModel      string                `json:"evaluator_model,omitempty"`
+	MaxTurns            int                   `json:"max_turns,omitempty"`
+	WakeIntervalSeconds int64                 `json:"wake_interval_seconds,omitempty"`
+	IdempotencyKey      string                `json:"-"`
 }
 
 type startExecutionCommand struct{ Input StartExecutionInput }
@@ -93,7 +94,7 @@ func (c startExecutionCommand) decide(state *State, now time.Time) ([]DomainEven
 	activityID := ActivityID(stableID("activity", in.IdempotencyKey+"/1"))
 	digest, _ := c.digest()
 	workflow := &Workflow{
-		ID: workflowID, Root: in.Root, Role: in.Role, Authority: in.Authority, Finalizer: in.Finalizer, Budget: in.Budget, EvaluatorModel: in.EvaluatorModel, MaxTurns: in.MaxTurns,
+		ID: workflowID, Root: in.Root, Role: in.Role, Authority: in.Authority, Finalizer: in.Finalizer, Budget: in.Budget, EvaluatorModel: in.EvaluatorModel, MaxTurns: in.MaxTurns, WakeIntervalSeconds: in.WakeIntervalSeconds,
 		Nodes: map[NodeID]*Node{}, CreatedAt: now,
 	}
 	title := in.Goal
@@ -144,10 +145,14 @@ func validateStartInput(in StartExecutionInput) error {
 	if in.Budget.MaxTaskAttempts < 1 || in.Budget.MaxLaunches < in.Budget.MaxTaskAttempts {
 		return errors.New("budget requires positive task attempts and at least as many OS launches")
 	}
-	if in.EvaluatorModel != "" || in.MaxTurns != 0 {
-		if strings.TrimSpace(in.Goal) == "" || strings.TrimSpace(in.EvaluatorModel) == "" || in.MaxTurns < 1 {
-			return errors.New("a goal requires its text, evaluator model, and at least one turn")
+	if strings.TrimSpace(in.EvaluatorModel) != "" {
+		if strings.TrimSpace(in.Goal) == "" || in.MaxTurns < 0 || in.WakeIntervalSeconds < 0 {
+			return errors.New("a goal requires its text and evaluator model; max turns and wake interval must be zero or positive")
 		}
+	} else if in.MaxTurns != 0 {
+		return errors.New("max turns requires an evaluator model")
+	} else if in.WakeIntervalSeconds != 0 {
+		return errors.New("wake interval requires an evaluator model")
 	}
 	if in.Finalizer.Enabled && len(in.Finalizer.RequiredChecks) == 0 {
 		return errors.New("enabled finalizer requires a non-empty canonical set of external GitHub checks")
@@ -579,6 +584,9 @@ func (c prepareAttemptCommand) decide(state *State, now time.Time) ([]DomainEven
 	if state.Pauses[activity.WorkflowID] != nil {
 		return nil, "", ErrFenced
 	}
+	if activity.NotBefore != nil && !activity.NotBefore.IsZero() && activity.NotBefore.After(now) {
+		return nil, "", fmt.Errorf("Activity is scheduled for %s", activity.NotBefore.UTC().Format(time.RFC3339))
+	}
 	if !workflow.Authority.HumanAuthorized || session == nil || session.ImportedUnresolved {
 		return nil, "", errors.New("Activity lacks human-authorized execution authority")
 	}
@@ -746,7 +754,7 @@ func (c decideTurnCommand) decide(state *State, now time.Time) ([]DomainEvent, s
 		return nil, "", errors.New("human escalation requires a typed blocker and concrete question")
 	}
 	turns := turnsForNode(state, activity.WorkflowID, activity.NodeID)
-	if decision.Outcome == "continue" && turns >= workflow.MaxTurns {
+	if decision.Outcome == "continue" && workflow.MaxTurns > 0 && turns >= workflow.MaxTurns {
 		decision.Outcome = "escalate"
 		decision.Reason = fmt.Sprintf("Turn limit reached after %d turns. Last decision: %s", turns, decision.Reason)
 		decision.BlockerKind = "budget"
@@ -772,10 +780,21 @@ func (c decideTurnCommand) decide(state *State, now time.Time) ([]DomainEvent, s
 	if session.ImportedUnresolved || strings.TrimSpace(session.Native.ID) == "" {
 		return nil, "", errors.New("continuing a goal requires an exact bound native Session")
 	}
+	if queued := existingContinuation(state, activity); queued != nil {
+		// A human or supervisor may have replied while this turn was running.
+		// Preserve that higher-information continuation instead of creating an
+		// evaluator sibling that can repeatedly jump ahead of it.
+		return events, string(queued.ID), nil
+	}
 	generation := nextActivityGeneration(state, activity.NodeID, activity.Generation+1)
 	continuationID := ActivityID(stableID("activity", c.Input.IdempotencyKey+"/continuation"))
 	messageID := MessageID(stableID("message", c.Input.IdempotencyKey+"/continuation"))
-	continuation := &Activity{ID: continuationID, WorkflowID: activity.WorkflowID, NodeID: activity.NodeID, SessionID: activity.SessionID, Generation: generation, ParentActivityID: activity.ID, Prompt: decision.Reason, DependencyBindings: append([]ResultBinding(nil), activity.DependencyBindings...), CreatedAt: now}
+	var notBefore *time.Time
+	if workflow.WakeIntervalSeconds > 0 {
+		wakeAt := now.Add(time.Duration(workflow.WakeIntervalSeconds) * time.Second)
+		notBefore = &wakeAt
+	}
+	continuation := &Activity{ID: continuationID, WorkflowID: activity.WorkflowID, NodeID: activity.NodeID, SessionID: activity.SessionID, Generation: generation, ParentActivityID: activity.ID, Prompt: decision.Reason, DependencyBindings: append([]ResultBinding(nil), activity.DependencyBindings...), NotBefore: notBefore, CreatedAt: now}
 	message := &Message{ID: messageID, SessionID: session.ID, ActivityID: continuation.ID, Body: decision.Reason, From: "supervisor:evaluator/" + decision.Model, State: MessageQueued, CreatedAt: now}
 	events = append(events, mustEvent(eventActivityQueued, activityQueuedEvent{Activity: continuation}), mustEvent(eventMessageQueued, messageEvent{Message: message}))
 	return events, string(continuation.ID), nil
@@ -1129,7 +1148,7 @@ func turnsForNode(state *State, workflowID WorkflowID, nodeID NodeID) int {
 }
 
 func runsAsGoal(workflow *Workflow) bool {
-	return workflow != nil && strings.TrimSpace(workflow.EvaluatorModel) != "" && workflow.MaxTurns > 0
+	return workflow != nil && strings.TrimSpace(workflow.EvaluatorModel) != ""
 }
 
 func workerResultForActivity(state *State, activityID ActivityID) *WorkerResult {
@@ -1160,6 +1179,19 @@ func nextActivityGeneration(state *State, nodeID NodeID, minimum uint64) uint64 
 		}
 	}
 	return generation
+}
+
+func existingContinuation(state *State, predecessor *Activity) *Activity {
+	var selected *Activity
+	for _, activity := range state.Activities {
+		if activity.ID == predecessor.ID || activity.WorkflowID != predecessor.WorkflowID || activity.NodeID != predecessor.NodeID || activity.SessionID != predecessor.SessionID || resultForActivity(state, activity.ID) != nil {
+			continue
+		}
+		if selected == nil || activity.Generation < selected.Generation || activity.Generation == selected.Generation && activity.CreatedAt.Before(selected.CreatedAt) {
+			selected = activity
+		}
+	}
+	return selected
 }
 func attemptCountsForActivity(state *State, activityID ActivityID) (launches, turns int) {
 	for _, attempt := range state.Attempts {

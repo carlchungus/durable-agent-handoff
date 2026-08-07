@@ -15,6 +15,12 @@ do not infer lifecycle state from a transcript or a legacy store.
   Secret prompts and continuation replies are supplied with `--file -` on
   stdin, never with `--prompt`, `--prompt-file`, `--message`, private prompt
   paths, or any other argv content.
+- Use `handoff goal start` for unattended work. Goals are unbounded by default;
+  add `--max-turns` only when the human explicitly requests a finite safety
+  cap, never as an arbitrary supervisor budget. For periodic supervision, add
+  `--wake-interval 10m`; the next automatic continuation is scheduled in the
+  journal without occupying a model turn. Do not emulate cadence with polling
+  prompts or shell sleeps. Human replies remain immediately runnable.
 - Configure an autonomous merge-capable execution at its start boundary with
   `--finalizer-enabled`, one or more externally hosted `--required-check NAME`,
   and optional `--require-human`. Promotion uses the equivalent flat
@@ -30,7 +36,9 @@ do not infer lifecycle state from a transcript or a legacy store.
 - Run queued work with `handoff run` or `handoff serve`. Use
   `handoff service install [--enable]` for the stable `handoff.service` unit.
   `serve --environment-json FILE` requires a regular mode-0600 JSON object;
-  values are transient and service units contain only the file path.
+  values are transient and service units contain only the file path. The
+  installation includes a ten-minute OS watchdog that starts an inactive
+  service after a crash or reboot but never restarts healthy live work.
 - Configure journaled role/model ladders with `handoff preference set|list|health`.
   Provider fallback creates a child Session with a new native identity; it
   never mutates the original exact runtime Session.
@@ -42,6 +50,13 @@ do not infer lifecycle state from a transcript or a legacy store.
   authority. Worker Result payloads are evidence of immutable work only;
   handoff does not pretend that same-UID workers can authenticate their own
   Results.
+- For unattended work with publication authority, missing optional evidence,
+  external CI, or browser authentication lowers confidence but does not erase
+  useful work. Publish an honest draft PR with the verification limits and
+  continue independent work. Once a PR is handed to repository automation,
+  do not spend turns waiting for it to merge. Use `needs_human` only when
+  indispensable authority or information blocks the entire workflow and no
+  safe partial result can be published.
 - Use `handoff github merge` only for authority-owned finalization. It journals
   the prepared exact PR head, named gates, approval, and idempotency key before
   an argv-only `gh` effect, then journals merged or blocked outcome.

@@ -106,7 +106,13 @@ the process exits, a small model chooses `accept`, `continue`, or `escalate`.
 The decision writes the predecessor Result; `continue` also queues its reason
 as a Message and creates the next Activity on the exact bound Session in the
 same transaction. `escalate` requires a concrete blocker and question.
-Exhausting the turn limit becomes a visible `budget` blocker.
+Goals are unbounded by default. An explicitly configured positive turn limit
+remains an opt-in safety cap and becomes a visible `budget` blocker when
+exhausted.
+An optional wake interval records a `not_before` deadline on automatic
+continuations. The normal service scan makes a scheduled Activity runnable
+when due; a human reply is not delayed. This is journal state, not a sleeping
+process or a second scheduler.
 
 ## Attempts, budgets, and health
 
@@ -192,6 +198,11 @@ by placing prompt/environment data in a unit file.
 Installed services use an explicit executable search path containing the
 user-local binary directory so Codex, Claude, and Pi resolve identically under
 systemd or launchd and an interactive shell.
+
+Installation also adds a ten-minute OS liveness watchdog. It starts the service
+only when inactive; it never restarts a healthy process. The journal-backed
+service remains the single scheduler while systemd or launchd covers crashes,
+reboots, and missed wakeups without a second task state store.
 
 ## Canonical-worktree writer Lease
 

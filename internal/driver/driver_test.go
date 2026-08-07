@@ -107,6 +107,14 @@ func TestDriversUseRuntimeOwnedCompletionContract(t *testing.T) {
 	}
 }
 
+func TestCompletionContractPrefersDraftProgressOverOptionalEvidenceBlockers(t *testing.T) {
+	for _, want := range []string{"human is unavailable", "draft PR", "external CI", "do not idle"} {
+		if !strings.Contains(completionContract, want) {
+			t.Fatalf("completion contract omitted unattended behavior %q", want)
+		}
+	}
+}
+
 func TestClaudeAndPiContractResultCompletesOrdinaryWork(t *testing.T) {
 	resultJSON := `{"status":"completed","summary":"ordinary work finished"}`
 	encodedResult := strconv.Quote(resultJSON)

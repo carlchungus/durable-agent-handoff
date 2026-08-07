@@ -19,7 +19,7 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 	if err := os.Chmod(state, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	request, err := json.Marshal(executionStartRequest{IdempotencyKey: "arca-file-start-01", Goal: "promote work", Prompt: "secret stdin prompt", RemoteRoot: root, Runtime: "codex", ResumeID: "exact-thread", Sandbox: supervisor.SandboxReadOnly, Role: "arca-cloud", FinalizerEnabled: true, FinalizerRequiredChecks: []string{"verify"}, FinalizerRequireHuman: true})
+	request, err := json.Marshal(executionStartRequest{IdempotencyKey: "arca-file-start-01", Goal: "promote work", Prompt: "secret stdin prompt", RemoteRoot: root, Runtime: "codex", ResumeID: "exact-thread", Sandbox: supervisor.SandboxReadOnly, Role: "arca-cloud", FinalizerEnabled: true, FinalizerRequiredChecks: []string{"verify"}, FinalizerRequireHuman: true, WakeIntervalSeconds: 600})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestExecutionStartFileStdinUsesStrictV2Response(t *testing.T) {
 		t.Fatalf("promotion finalizer was not persisted immutably: %+v", finalizer)
 	}
 	workflow := projection.Workflows[response.WorkflowID]
-	if workflow.EvaluatorModel != "deepseek/deepseek-v4-flash-0731" || workflow.MaxTurns != 100 {
+	if workflow.EvaluatorModel != "deepseek/deepseek-v4-flash-0731" || workflow.MaxTurns != 0 || workflow.WakeIntervalSeconds != 600 {
 		t.Fatalf("promotion goal settings were not persisted: %+v", workflow)
 	}
 	divergent := strings.Replace(string(request), `"promote work"`, `"different work"`, 1)
@@ -86,7 +86,7 @@ func TestGoalStartKeepsRunningByConstruction(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
-	err := runWithPrompt(t, []string{"goal", "start", "--state", state, "--root", root, "--goal", "ship the whole campaign", "--runtime", "codex", "--file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "goal-native-start", "--json"}, "continue until the goal is terminal", &out, &errOut)
+	err := runWithPrompt(t, []string{"goal", "start", "--state", state, "--root", root, "--goal", "ship the whole campaign", "--runtime", "codex", "--file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "goal-native-start", "--wake-interval", "10m", "--json"}, "continue until the goal is terminal", &out, &errOut)
 	if err != nil {
 		t.Fatalf("goal start: %v stderr=%s", err, errOut.String())
 	}
@@ -103,8 +103,15 @@ func TestGoalStartKeepsRunningByConstruction(t *testing.T) {
 		t.Fatal(err)
 	}
 	workflow := projection.Workflows[response.Execution.WorkflowID]
-	if workflow.EvaluatorModel != "deepseek/deepseek-v4-flash-0731" || workflow.MaxTurns != 100 {
+	if workflow.EvaluatorModel != "deepseek/deepseek-v4-flash-0731" || workflow.MaxTurns != 0 || workflow.WakeIntervalSeconds != 600 {
 		t.Fatalf("goal start did not keep running by default: %+v", workflow)
+	}
+	out.Reset()
+	if err := run([]string{"status", string(response.Execution.ID), "--state", state, "--json"}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "not_before") || strings.Contains(out.String(), "next_wake_at") {
+		t.Fatalf("unscheduled goal leaked zero wake timestamps: %s", out.String())
 	}
 }
 
@@ -145,14 +152,14 @@ func TestOrdinaryStartPersistsAdvertisedFinalizerAndRejectsIncompleteConfig(t *t
 	}
 }
 
-func TestOneShotStartRejectsPartialGoalSettings(t *testing.T) {
+func TestOneShotStartRejectsTurnCapWithoutEvaluator(t *testing.T) {
 	state, root := t.TempDir(), t.TempDir()
 	if err := os.Chmod(state, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
-	err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--goal", "keep shipping", "--runtime", "codex", "--file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "partial-goal", "--evaluator-model", "fake/evaluator"}, "ship", &out, &errOut)
-	if err == nil || !strings.Contains(err.Error(), "a goal requires") {
+	err := runWithPrompt(t, []string{"start", "--state", state, "--root", root, "--goal", "keep shipping", "--runtime", "codex", "--file", "-", "--sandbox", "read-only", "--authorized-by", "human:test", "--idempotency-key", "partial-goal", "--max-turns", "7"}, "ship", &out, &errOut)
+	if err == nil || !strings.Contains(err.Error(), "max turns requires") {
 		t.Fatalf("partial goal settings were not rejected: %v", err)
 	}
 	store, openErr := supervisor.Open(state, supervisor.Options{})

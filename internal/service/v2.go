@@ -18,6 +18,8 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/supervisor"
 )
 
+const serviceWatchdogInterval = 10 * time.Minute
+
 // ServeOptions is the Supervisor v2 service configuration. Environment values
 // are read by the CLI from a private mode-0600 file and are passed to Drivers
 // only at launch; they are never persisted in the journal or service unit.
@@ -379,7 +381,7 @@ func installV2For(goos, home, binary, state, environmentJSON string, trustMode d
 		if environmentJSON != "" {
 			body += fmt.Sprintf("<string>--environment-json</string><string>%s</string>", xml(environmentJSON))
 		}
-		body += fmt.Sprintf("</array><key>EnvironmentVariables</key><dict><key>PATH</key><string>%s</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n", xml(workerPath))
+		body += fmt.Sprintf("</array><key>EnvironmentVariables</key><dict><key>PATH</key><string>%s</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StartInterval</key><integer>%d</integer></dict></plist>\n", xml(workerPath), int(serviceWatchdogInterval/time.Second))
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			return "", err
 		}
@@ -392,6 +394,14 @@ func installV2For(goos, home, binary, state, environmentJSON string, trustMode d
 		path := filepath.Join(dir, "handoff.service")
 		body := fmt.Sprintf("[Unit]\nDescription=Durable agent handoff Supervisor v2\n\n[Service]\nEnvironment=PATH=%s\nExecStart=%s %s\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n", systemd(workerPath), systemd(binary), args)
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			return "", err
+		}
+		watchdogService := "[Unit]\nDescription=Start durable agent handoff if inactive\n\n[Service]\nType=oneshot\nExecStart=/usr/bin/systemctl --user start handoff.service\n"
+		if err := os.WriteFile(filepath.Join(dir, "handoff-watchdog.service"), []byte(watchdogService), 0o600); err != nil {
+			return "", err
+		}
+		watchdogTimer := fmt.Sprintf("[Unit]\nDescription=Periodic durable agent handoff wake\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=%ds\nPersistent=true\nUnit=handoff-watchdog.service\n\n[Install]\nWantedBy=timers.target\n", int(serviceWatchdogInterval/time.Second))
+		if err := os.WriteFile(filepath.Join(dir, "handoff-watchdog.timer"), []byte(watchdogTimer), 0o600); err != nil {
 			return "", err
 		}
 		return path, nil

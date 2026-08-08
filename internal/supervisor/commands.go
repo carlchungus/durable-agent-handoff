@@ -28,6 +28,7 @@ type StartExecutionInput struct {
 	EvaluatorModel      string                `json:"evaluator_model,omitempty"`
 	MaxTurns            int                   `json:"max_turns,omitempty"`
 	WakeIntervalSeconds int64                 `json:"wake_interval_seconds,omitempty"`
+	PrepareCommand      string                `json:"prepare_command,omitempty"`
 	IdempotencyKey      string                `json:"-"`
 }
 
@@ -101,7 +102,7 @@ func (c startExecutionCommand) decide(state *State, now time.Time) ([]DomainEven
 	if strings.TrimSpace(title) == "" {
 		title = "Root execution"
 	}
-	node := &Node{ID: nodeID, WorkflowID: workflowID, Title: title, Work: WorkSpec{Kind: "agent", Prompt: in.Prompt, Root: in.Root, Runtime: in.Runtime, Fallbacks: append([]RuntimeSpec(nil), in.Fallbacks...)}, CreatedAt: now}
+	node := &Node{ID: nodeID, WorkflowID: workflowID, Title: title, Work: WorkSpec{Kind: "agent", Prompt: in.Prompt, Root: in.Root, Runtime: in.Runtime, Fallbacks: append([]RuntimeSpec(nil), in.Fallbacks...), PrepareCommand: in.PrepareCommand}, CreatedAt: now}
 	session := &Session{ID: sessionID, WorkflowID: workflowID, Native: in.NativeSession, Root: in.Root, CreatedAt: now}
 	activity := &Activity{ID: activityID, WorkflowID: workflowID, NodeID: nodeID, SessionID: sessionID, Generation: 1, Prompt: in.Prompt, CreatedAt: now}
 	execution := &Execution{ID: executionID, WorkflowID: workflowID, RootNodeID: nodeID, SessionID: sessionID, FirstActivity: activityID, IdempotencyKey: in.IdempotencyKey, InputDigest: digest, CreatedAt: now}

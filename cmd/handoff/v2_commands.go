@@ -54,6 +54,7 @@ type executionStartRequest struct {
 	EvaluatorModel          string             `json:"evaluator_model,omitempty"`
 	MaxTurns                int                `json:"max_turns,omitempty"`
 	WakeIntervalSeconds     int64              `json:"wake_interval_seconds,omitempty"`
+	PrepareCommand          string             `json:"prepare_command,omitempty"`
 }
 
 type executionStartResponse struct {
@@ -126,11 +127,12 @@ func cmdV2StartMode(args []string, out io.Writer, promotion, goalMode bool) erro
 	var requiredChecks runtimeCandidateFlags
 	fs.Var(&requiredChecks, "required-check", "required external GitHub check; repeat for each check")
 	requireHuman := fs.Bool("require-human", false, "require human approval before finalization")
+	prepareCommand := fs.String("prepare-command", "", "shell command run in the worktree root before each activity to keep per-worktree infrastructure (e.g. local Postgres) healthy")
 	evaluatorModel := fs.String("evaluator-model", "", "small OpenRouter model that decides each turn")
 	maxTurns := fs.Int("max-turns", 0, "optional positive safety cap; goals are unbounded by default")
 	wakeInterval := fs.Duration("wake-interval", 0, "durable delay between automatic goal turns, such as 10m")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--finalizer-enabled": false, "--required-check": true, "--require-human": false, "--evaluator-model": true, "--max-turns": true, "--wake-interval": true, "--json": false}
+	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--finalizer-enabled": false, "--required-check": true, "--require-human": false, "--evaluator-model": true, "--max-turns": true, "--wake-interval": true, "--prepare-command": true, "--json": false}
 	if err := rejectUnknownFlags(args, known); err != nil {
 		return err
 	}
@@ -171,7 +173,8 @@ func cmdV2StartMode(args []string, out io.Writer, promotion, goalMode bool) erro
 			Authority:      supervisor.AuthoritySpec{RequestedBy: request.Role, HumanAuthorized: true, Sandbox: request.Sandbox},
 			Finalizer:      supervisor.FinalizerSpec{Enabled: request.FinalizerEnabled, RequiredChecks: append([]string(nil), request.FinalizerRequiredChecks...), RequireHuman: request.FinalizerRequireHuman},
 			EvaluatorModel: model, MaxTurns: turns, WakeIntervalSeconds: request.WakeIntervalSeconds,
-			Budget: supervisor.DefaultBudget(), IdempotencyKey: request.IdempotencyKey,
+			PrepareCommand: request.PrepareCommand,
+			Budget:         supervisor.DefaultBudget(), IdempotencyKey: request.IdempotencyKey,
 		}
 	} else {
 		if *file != "-" || fs.NArg() != 0 {
@@ -237,7 +240,8 @@ func cmdV2StartMode(args []string, out io.Writer, promotion, goalMode bool) erro
 			Authority:      supervisor.AuthoritySpec{RequestedBy: *authorizedBy, HumanAuthorized: *authorizedBy != "", Sandbox: supervisor.Sandbox(*sandbox)},
 			Finalizer:      supervisor.FinalizerSpec{Enabled: *finalizerEnabled, RequiredChecks: append([]string(nil), requiredChecks...), RequireHuman: *requireHuman},
 			EvaluatorModel: decisionModel, MaxTurns: turns, WakeIntervalSeconds: int64(*wakeInterval / time.Second),
-			Budget: supervisor.DefaultBudget(), IdempotencyKey: *key,
+			PrepareCommand: *prepareCommand,
+			Budget:         supervisor.DefaultBudget(), IdempotencyKey: *key,
 		}
 	}
 	store, err := supervisor.Open(stateDir(*state), supervisor.Options{})

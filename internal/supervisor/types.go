@@ -66,11 +66,12 @@ type Budget struct {
 func DefaultBudget() Budget { return Budget{MaxTaskAttempts: 3, MaxLaunches: 12} }
 
 type WorkSpec struct {
-	Kind      string        `json:"kind"`
-	Prompt    string        `json:"prompt"`
-	Root      string        `json:"root"`
-	Runtime   RuntimeSpec   `json:"runtime"`
-	Fallbacks []RuntimeSpec `json:"fallbacks,omitempty"`
+	Kind           string        `json:"kind"`
+	Prompt         string        `json:"prompt"`
+	Root           string        `json:"root"`
+	Runtime        RuntimeSpec   `json:"runtime"`
+	Fallbacks      []RuntimeSpec `json:"fallbacks,omitempty"`
+	PrepareCommand string        `json:"prepare_command,omitempty"`
 }
 
 type Execution struct {

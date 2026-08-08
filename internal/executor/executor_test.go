@@ -316,6 +316,68 @@ func TestExecutorBuildFailureJournalsPrelaunchExitAndReleasesLeaseForRetry(t *te
 	}
 }
 
+func TestExecutorPrepareCommandFailureJournalsPrelaunchExit(t *testing.T) {
+	stateRoot, worktree, outputRoot := t.TempDir(), t.TempDir(), t.TempDir()
+	for _, path := range []string{stateRoot, outputRoot} {
+		if err := os.Chmod(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := supervisor.Open(stateRoot, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, _, err := store.StartExecution(context.Background(), supervisor.StartExecutionInput{NativeSession: supervisor.NativeSessionIdentity{Runtime: "test", ID: "prepare-fail"}, Prompt: "prepare fails first", Runtime: supervisor.RuntimeSpec{Name: "test", Sandbox: supervisor.SandboxWorkspaceWrite}, Root: worktree, Authority: supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite}, Budget: supervisor.DefaultBudget(), PrepareCommand: "false", IdempotencyKey: "executor-prepare-failure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &Executor{Store: store, OutputRoot: outputRoot, Drivers: func(string) (driver.Driver, error) { return testDriver{}, nil }}
+	if err = runner.RunActivity(context.Background(), execution.FirstActivity); err == nil {
+		t.Fatal("prepare failure unexpectedly completed")
+	}
+	state, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Attempts) != 1 {
+		t.Fatalf("prepare failure was not represented as an Attempt: %d", len(state.Attempts))
+	}
+	for _, attempt := range state.Attempts {
+		if !hasAttemptMilestone(attempt, supervisor.MilestoneAdapterStartFailed) || !hasAttemptMilestone(attempt, supervisor.MilestoneExit) {
+			t.Fatalf("prepare prelaunch evidence=%+v", attempt.Milestones)
+		}
+	}
+}
+
+func TestExecutorPrepareCommandSuccessProceedsToDriver(t *testing.T) {
+	stateRoot, worktree, outputRoot := t.TempDir(), t.TempDir(), t.TempDir()
+	if err := os.Chmod(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(outputRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := supervisor.Open(stateRoot, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, _, err := store.StartExecution(context.Background(), supervisor.StartExecutionInput{NativeSession: supervisor.NativeSessionIdentity{Runtime: "test", ID: "prepare-ok"}, Prompt: "prepare then run", Runtime: supervisor.RuntimeSpec{Name: "test", Sandbox: supervisor.SandboxWorkspaceWrite}, Root: worktree, Authority: supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite}, Budget: supervisor.DefaultBudget(), PrepareCommand: "true", IdempotencyKey: "executor-prepare-success"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &Executor{Store: store, OutputRoot: outputRoot, Drivers: func(string) (driver.Driver, error) { return testDriver{}, nil }}
+	if err = runner.RunActivity(context.Background(), execution.FirstActivity); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Results) != 1 {
+		t.Fatalf("driver did not complete after successful prepare: results=%d", len(state.Results))
+	}
+}
+
 func TestExecutorHonorsExternallyAppliedControlWithoutSecondStartupControl(t *testing.T) {
 	stateRoot, worktree, outputRoot := t.TempDir(), t.TempDir(), t.TempDir()
 	for _, path := range []string{stateRoot, outputRoot} {

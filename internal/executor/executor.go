@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -115,6 +116,9 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	runtimeDriver, err := e.Drivers(runtimeSpec.Name)
 	if err != nil {
 		return preparePrelaunch(err)
+	}
+	if prepareErr := e.runPrepareCommand(ctx, node.Work); prepareErr != nil {
+		return preparePrelaunch(prepareErr)
 	}
 	launch, err := runtimeDriver.Build(driver.LaunchRequest{Runtime: runtimeSpec, Worktree: node.Work.Root, Prompt: logical.Prompt, Session: session.Native, SchemaPath: schemaPath, ResultPath: resultPath, TrustMode: trustMode})
 	if err != nil {
@@ -456,6 +460,36 @@ func (e *Executor) decodeFile(ctx context.Context, logical *supervisor.Activity,
 
 func (e *Executor) record(ctx context.Context, logical *supervisor.Activity, attempt *supervisor.Attempt, key string, milestone supervisor.Milestone) (supervisor.Receipt, error) {
 	return e.Store.RecordMilestone(ctx, supervisor.RecordMilestoneInput{ActivityID: logical.ID, ExpectedGeneration: logical.Generation, AttemptID: attempt.ID, LeaseID: attempt.LeaseID, Milestone: milestone, IdempotencyKey: key})
+}
+
+// runPrepareCommand executes an optional worktree-readiness command (e.g.
+// `bun run db:local:url`) in the worktree root before launching the driver.
+// This lets a project keep per-worktree infrastructure (local Postgres,
+// browser fixtures, etc.) self-healing across activities without coupling
+// handoff to any specific project. A failure is recorded as an adapter
+// prelaunch failure, same as a driver build failure.
+func (e *Executor) runPrepareCommand(ctx context.Context, work supervisor.WorkSpec) error {
+	command := strings.TrimSpace(work.PrepareCommand)
+	if command == "" {
+		return nil
+	}
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+	cmd := exec.CommandContext(ctx, shell, "-c", command)
+	cmd.Dir = work.Root
+	cmd.Env = append(os.Environ(), e.Environment...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		stderrText := strings.TrimSpace(stderr.String())
+		if stderrText != "" {
+			return fmt.Errorf("prepare command %q: %w: %s", command, err, stderrText)
+		}
+		return fmt.Errorf("prepare command %q: %w", command, err)
+	}
+	return nil
 }
 
 func (e *Executor) failStart(ctx context.Context, logical *supervisor.Activity, attempt *supervisor.Attempt, keyPrefix string, runtimeDriver driver.Driver, failure error) error {

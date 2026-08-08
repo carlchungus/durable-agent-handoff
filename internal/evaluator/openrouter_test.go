@@ -97,3 +97,42 @@ func TestOpenRouterEvaluatorAcceptsOnlyForcedDecisionTool(t *testing.T) {
 		t.Fatalf("decision=%+v", decision)
 	}
 }
+
+func TestOpenRouterEvaluatorSendsPublicationOutletAndBackpressureGuidance(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&captured); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"submit_turn_decision","arguments":"{\"outcome\":\"escalate\",\"reason\":\"Publication outlet is disabled; stop grinding.\",\"blocker_kind\":\"external_decision\",\"question\":\"Re-enable publication or re-scope the goal?\"}"}}]}}]}`))
+	}))
+	defer server.Close()
+	client := OpenRouter{APIKey: "private-key", Endpoint: server.URL, HTTPClient: server.Client(), Mode: ModeToolCall}
+	_, err := client.Evaluate(context.Background(), Request{
+		Model:       DefaultModel,
+		Goal:        "Ship 100 safe type-hardening pull requests",
+		Prompt:      "Ship the next safe candidate",
+		Publication: "disabled",
+		Turn: supervisor.WorkerResult{
+			Status:  "continue",
+			Summary: "Candidate #064 committed locally; publication deferred because slots are occupied.",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userContent, ok := captured["messages"].([]any)[1].(map[string]any)["content"].(string)
+	if !ok {
+		t.Fatalf("user message missing: %#v", captured["messages"])
+	}
+	if !strings.Contains(userContent, "\"publication\":\"disabled\"") {
+		t.Fatalf("publication outlet not sent to evaluator: %s", userContent)
+	}
+	systemContent := captured["messages"].([]any)[0].(map[string]any)["content"].(string)
+	for _, want := range []string{"cannot reach a consumer is not progress", "do not continue to produce more unpublished candidates", "publication is disabled or blocked"} {
+		if !strings.Contains(systemContent, want) {
+			t.Fatalf("evaluator system prompt omitted backpressure guidance %q: %s", want, systemContent)
+		}
+	}
+}

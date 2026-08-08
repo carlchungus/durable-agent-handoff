@@ -361,3 +361,34 @@ func pendingGoalTurn(t *testing.T, model string) (*supervisor.Store, string) {
 	}
 	return store, outputRoot
 }
+
+func TestTurnDecisionRequestReportsPublicationOutlet(t *testing.T) {
+	store, _ := pendingGoalTurn(t, "fake/evaluator")
+	state, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var activityID supervisor.ActivityID
+	for id, activity := range state.Activities {
+		if activity.WorkflowID != "" {
+			activityID = id
+			break
+		}
+	}
+	if activityID == "" {
+		t.Fatal("no goal activity found")
+	}
+	request, _, _, err := turnDecisionRequest(state, activityID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// pendingGoalTurn starts a goal without a finalizer, so the durable
+	// publication outlet is disabled. The decision-maker must see that signal;
+	// a blind continue here is the grinding pathology this guards against.
+	if request.Publication != "disabled" {
+		t.Fatalf("publication outlet not reported: got %q want %q", request.Publication, "disabled")
+	}
+	if !strings.Contains(request.SupervisorContext, "No follow-up publication step is enabled") {
+		t.Fatalf("supervisor context lost its publication note: %q", request.SupervisorContext)
+	}
+}

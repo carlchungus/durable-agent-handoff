@@ -128,6 +128,7 @@ var (
 	Open                   = internal.Open
 	DefaultBudget          = internal.DefaultBudget
 	ProjectExecution       = internal.ProjectExecution
+	ProjectPublication     = internal.ProjectPublication
 	RenderText             = internal.RenderText
 	ErrIdempotencyConflict = internal.ErrIdempotencyConflict
 	ErrFenced              = internal.ErrFenced

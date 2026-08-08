@@ -174,7 +174,7 @@ func cmdV2StartMode(args []string, out io.Writer, promotion, goalMode bool) erro
 			Finalizer:      supervisor.FinalizerSpec{Enabled: request.FinalizerEnabled, RequiredChecks: append([]string(nil), request.FinalizerRequiredChecks...), RequireHuman: request.FinalizerRequireHuman},
 			EvaluatorModel: model, MaxTurns: turns, WakeIntervalSeconds: request.WakeIntervalSeconds,
 			PrepareCommand: request.PrepareCommand,
-			Budget: supervisor.DefaultBudget(), IdempotencyKey: request.IdempotencyKey,
+			Budget:         supervisor.DefaultBudget(), IdempotencyKey: request.IdempotencyKey,
 		}
 	} else {
 		if *file != "-" || fs.NArg() != 0 {
@@ -241,7 +241,7 @@ func cmdV2StartMode(args []string, out io.Writer, promotion, goalMode bool) erro
 			Finalizer:      supervisor.FinalizerSpec{Enabled: *finalizerEnabled, RequiredChecks: append([]string(nil), requiredChecks...), RequireHuman: *requireHuman},
 			EvaluatorModel: decisionModel, MaxTurns: turns, WakeIntervalSeconds: int64(*wakeInterval / time.Second),
 			PrepareCommand: *prepareCommand,
-			Budget: supervisor.DefaultBudget(), IdempotencyKey: *key,
+			Budget:         supervisor.DefaultBudget(), IdempotencyKey: *key,
 		}
 	}
 	store, err := supervisor.Open(stateDir(*state), supervisor.Options{})

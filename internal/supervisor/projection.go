@@ -222,7 +222,7 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 		}
 		view.Nodes = append(view.Nodes, item)
 	}
-	view.Publication = projectPublication(workflow, state)
+	view.Publication = ProjectPublication(workflow, state)
 	if state.Pauses[workflow.ID] != nil {
 		view.Status, view.Active = ExecutionPaused, false
 	} else {
@@ -472,7 +472,14 @@ func fallbackChildForActivity(state *State, parentID ActivityID) *Activity {
 	return child
 }
 
-func projectPublication(workflow *Workflow, state *State) PublicationState {
+// ProjectPublication derives the durable publication outlet state for a
+// workflow from immutable configuration and the latest result. It is the
+// single computation shared by execution projections and by goal
+// turn-decision requests, so the decision-maker sees the same outlet signal
+// a human reading status would. PublicationDisabled means there is no
+// consumable outlet for new work; an open-ended goal that keeps producing
+// candidates with no outlet is grinding, not progressing.
+func ProjectPublication(workflow *Workflow, state *State) PublicationState {
 	if !workflow.Finalizer.Enabled {
 		return PublicationDisabled
 	}

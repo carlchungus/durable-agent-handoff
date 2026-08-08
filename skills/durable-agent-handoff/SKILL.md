@@ -57,6 +57,18 @@ do not infer lifecycle state from a transcript or a legacy store.
   do not spend turns waiting for it to merge. Use `needs_human` only when
   indispensable permission or information blocks the entire workflow and no
   safe partial result can be published.
+- Scope open-ended campaign goals with a viable publication outlet and a stop
+  condition, not just a count. A goal like "ship 100 PRs" with no terminal
+  acceptance and a narrow named surface invites tunnel vision: the worker
+  optimizes the objective it is handed (ship another PR) and drifts to
+  low-friction, low-value changes. Pair any count goal with a value gate
+  (a reviewer, a merge-rate signal, or a max unpublished backlog) and a named
+  stop condition ("until the reviewer queue is empty", "until the named
+  surface is exhausted"). When the publication outlet is disabled, blocked,
+  or repeatedly deferred, the goal evaluator escalates rather than grinding
+  out more un-consumable candidates; do not work around that by restating
+  "useful work remains." Producing work that cannot reach a consumer is not
+  progress.
 - Use `handoff github merge` only when merging was authorized at startup. It records
   the prepared exact PR head, named gates, approval, and idempotency key before
   an argv-only `gh` effect, then journals merged or blocked outcome.

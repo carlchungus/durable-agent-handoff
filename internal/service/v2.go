@@ -263,7 +263,7 @@ func turnDecisionRequest(state *supervisor.State, activityID supervisor.Activity
 	if attempt == nil || turn == nil {
 		return evaluator.Request{}, "", 0, errors.New("pending turn has no worker result")
 	}
-	request := evaluator.Request{Model: workflow.EvaluatorModel, Goal: node.Title, Prompt: activity.Prompt, Turn: *turn}
+	request := evaluator.Request{Model: workflow.EvaluatorModel, Goal: node.Title, Prompt: activity.Prompt, Turn: *turn, Publication: string(supervisor.ProjectPublication(workflow, state))}
 	if workflow.Finalizer.Enabled {
 		request.SupervisorContext = "The configured follow-up step can merge only an explicitly supplied existing pull request after an accepted completed Result and exact unchanged-head checks. It does not push branches, create or discover pull requests, or start itself. Do not treat those unfinished steps as already handled."
 	} else {

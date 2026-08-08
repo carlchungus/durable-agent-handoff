@@ -127,6 +127,15 @@ an honest draft PR and continue other independent work. `needs_human` is for an
 indispensable workflow-wide authority or information gap, not a request for
 optional evidence or for someone to watch CI.
 
+The goal turn-decision request carries the workflow's durable publication
+outlet state (`publication`: `disabled`, `awaiting_result`, `awaiting_human`,
+or `eligible`) computed by `ProjectPublication`. The evaluator is instructed
+that producing work which cannot reach a consumer is not progress: when the
+outlet is disabled or blocked and the worker reports accumulated unpublished
+candidates or deferred publication, it escalates instead of continuing to
+produce more un-consumable work. This is the backpressure guard against an
+open-ended count goal grinding ahead with no consumer feedback.
+
 `wake_interval_seconds` is an optional durable cadence for automatic goal
 continuations. `DecideTurn` records `not_before` on the continuation in the
 same transaction. Before that instant the projection reports `scheduled` and

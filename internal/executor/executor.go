@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -473,11 +474,7 @@ func (e *Executor) runPrepareCommand(ctx context.Context, work supervisor.WorkSp
 	if command == "" {
 		return nil
 	}
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
-	}
-	cmd := exec.CommandContext(ctx, shell, "-c", command)
+	cmd := prepareShellCommand(ctx, command)
 	cmd.Dir = work.Root
 	cmd.Env = append(os.Environ(), e.Environment...)
 	var stderr strings.Builder
@@ -490,6 +487,21 @@ func (e *Executor) runPrepareCommand(ctx context.Context, work supervisor.WorkSp
 		return fmt.Errorf("prepare command %q: %w", command, err)
 	}
 	return nil
+}
+
+// prepareShellCommand wraps a prepare command in the platform shell so a
+// single command string works on both Linux dev boxes ($SHELL / /bin/sh) and
+// Windows (cmd.exe). handoff workers run on Linux, but the executor is
+// cross-platform.
+func prepareShellCommand(ctx context.Context, command string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return exec.CommandContext(ctx, "cmd.exe", "/c", command)
+	}
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+	return exec.CommandContext(ctx, shell, "-c", command)
 }
 
 func (e *Executor) failStart(ctx context.Context, logical *supervisor.Activity, attempt *supervisor.Attempt, keyPrefix string, runtimeDriver driver.Driver, failure error) error {

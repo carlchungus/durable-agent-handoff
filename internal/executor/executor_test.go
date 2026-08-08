@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -327,7 +328,7 @@ func TestExecutorPrepareCommandFailureJournalsPrelaunchExit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	execution, _, err := store.StartExecution(context.Background(), supervisor.StartExecutionInput{NativeSession: supervisor.NativeSessionIdentity{Runtime: "test", ID: "prepare-fail"}, Prompt: "prepare fails first", Runtime: supervisor.RuntimeSpec{Name: "test", Sandbox: supervisor.SandboxWorkspaceWrite}, Root: worktree, Authority: supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite}, Budget: supervisor.DefaultBudget(), PrepareCommand: "false", IdempotencyKey: "executor-prepare-failure"})
+	execution, _, err := store.StartExecution(context.Background(), supervisor.StartExecutionInput{NativeSession: supervisor.NativeSessionIdentity{Runtime: "test", ID: "prepare-fail"}, Prompt: "prepare fails first", Runtime: supervisor.RuntimeSpec{Name: "test", Sandbox: supervisor.SandboxWorkspaceWrite}, Root: worktree, Authority: supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite}, Budget: supervisor.DefaultBudget(), PrepareCommand: prepareFailCommand(), IdempotencyKey: "executor-prepare-failure"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +362,7 @@ func TestExecutorPrepareCommandSuccessProceedsToDriver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	execution, _, err := store.StartExecution(context.Background(), supervisor.StartExecutionInput{NativeSession: supervisor.NativeSessionIdentity{Runtime: "test", ID: "prepare-ok"}, Prompt: "prepare then run", Runtime: supervisor.RuntimeSpec{Name: "test", Sandbox: supervisor.SandboxWorkspaceWrite}, Root: worktree, Authority: supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite}, Budget: supervisor.DefaultBudget(), PrepareCommand: "true", IdempotencyKey: "executor-prepare-success"})
+	execution, _, err := store.StartExecution(context.Background(), supervisor.StartExecutionInput{NativeSession: supervisor.NativeSessionIdentity{Runtime: "test", ID: "prepare-ok"}, Prompt: "prepare then run", Runtime: supervisor.RuntimeSpec{Name: "test", Sandbox: supervisor.SandboxWorkspaceWrite}, Root: worktree, Authority: supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite}, Budget: supervisor.DefaultBudget(), PrepareCommand: prepareSuccessCommand(), IdempotencyKey: "executor-prepare-success"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,6 +377,24 @@ func TestExecutorPrepareCommandSuccessProceedsToDriver(t *testing.T) {
 	if len(state.Results) != 1 {
 		t.Fatalf("driver did not complete after successful prepare: results=%d", len(state.Results))
 	}
+}
+
+// prepareSuccessCommand returns a shell command that exits 0 on the current
+// platform (true on Unix, ver>nul on Windows).
+func prepareSuccessCommand() string {
+	if runtime.GOOS == "windows" {
+		return "ver >nul"
+	}
+	return "true"
+}
+
+// prepareFailCommand returns a shell command that exits non-zero on the
+// current platform (false on Unix, exit 1 on Windows).
+func prepareFailCommand() string {
+	if runtime.GOOS == "windows" {
+		return "exit 1"
+	}
+	return "false"
 }
 
 func TestExecutorHonorsExternallyAppliedControlWithoutSecondStartupControl(t *testing.T) {

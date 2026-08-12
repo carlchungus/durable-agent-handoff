@@ -63,9 +63,68 @@ Background agent identity and inbox state use a separate append-only ledger at `
 
 `handoff agents --json` returns both `logical_state` (`working`, `needs_input`, `completed`, or `stopped`) and `process_state` (`starting`, `running`, or `exited`). Consumers must not infer one dimension from the other. `handoff agent inbox WORKFLOW_ID NODE_ID --after N` provides a cursor-readable inbox. `handoff agent reply WORKFLOW_ID NODE_ID --message TEXT` durably queues a human reply and reopens only an exact persisted session.
 
+`handoff list` and `handoff status [WORKFLOW_ID] --json` expose the canonical
+joined projection. Its `observability` object separates `process_liveness`,
+`meaningful_progress_at`/`meaningful_progress_age_seconds`, `queued_input`,
+`verifier_state`, `repair_required`, `publication_state`, and `quiet`/
+`stalled`. The nested `overhead` object reports wall-clock, useful-work,
+orchestration, runtime, turns, attempts/retries, verifier/finalizer, poll wait,
+quiet, duplicate-check, and optional runtime-usage measures from the existing
+ledgers. The nullable observed fields `total_wall_time_seconds`,
+`active_attempt_seconds`, `dependency_wait_seconds`, `queue_wait_seconds`,
+`finalizer_wait_seconds`, `retry_count_observed`, `resumption_count`,
+`verifier_seconds`, and `repair_seconds` are null when their timing/evidence
+boundary is unavailable. `duplicate_commands` and `duplicate_checks` contain
+only repeated persisted digests and occurrence counts; they never expose argv,
+prompts, or credentials. Missing adapter usage remains unavailable rather than
+estimated.
+Ready nodes whose dependencies have completed but still have queued/dispatched
+input or an active Activity expose `deferred_reason` and are not scheduled.
+Completion becomes terminal for dependency purposes only after the accepted
+result, inbox delivery, and Activity settlement are all reduced. Write-capable
+turns additionally require the durable canonical-worktree lease, so a second
+workflow cannot run a writer in the same tree concurrently.
+
+`handoff agents --json` and `handoff activity list --json` continue to expose
+their identity-specific liveness/progress projections; workflow status/list and
+the TUI use the joined overhead projection.
+
+Activity projections additionally expose `last_output_at`,
+`last_runtime_event`, `last_runtime_event_at`, `turn_started_at`, and
+`startup_stalled`. `stalled_startup` means a bounded startup grace period
+elapsed after a persisted runtime event but before `turn.started`; it is not
+the same as a live process or post-turn quiet work. Only the pre-turn,
+side-effect-free case may be automatically stopped with the exact Activity
+generation and Attempt identity, resumed with the exact session, and retried
+under the adapter-startup cap/backoff. Stale fences fail closed, and ordinary
+quiet work is never auto-killed.
+
+`handoff explain [CONTRACT] --json` is a stateless contract decision aid. It
+compares `background_session`, `subagent`, `goal`, `team`, and `workflow` and
+can recommend from explicit needs such as `--human-reply`, `--parent-return`,
+`--evaluator-loop`, `--parallel`, `--workflow-replay`, and `--finalization`.
+
 Messages move `queued` to `dispatched` under a monotonic delivery-attempt fence. This identity never rewinds when a provider-limit transition refunds the node retry counter. Requeue preserves the former delivery attempt; a later dispatch receives a larger one. A queued message with delivery attempt zero has never been dispatched and may repair the crash window between a human reply and node wake-up.
 
-Every agent exit atomically records `agent_attempt_outcome` evidence with `attempt`, `delivery_attempt`, `attempt_outcome`, and `inbox_disposition`. `completed`, `continue`, `needs_human`, `blocked`, and `diff_budget` require `deliver`; `runtime_failure`, `parse_failure`, and `provider_limit` require `requeue`. Reconciliation matches this explicit evidence to a dispatched delivery attempt and applies its disposition exactly once. It never guesses consumption from node state or a legacy evidence name.
+The service assesses active Activities every ten minutes by default. Output growth
+and `turn.started` are meaningful progress. A startup handshake without a turn
+breaches the bounded startup grace and is classified as `stalled_startup`;
+post-turn silence is quiet after fifteen minutes and stalled after thirty.
+Quiet/stalled is an attention condition only; it does not stop, expire, or
+consume retry budget. Queued guidance remains durable and is delivered on the
+next exact resumable turn.
+
+Runtime adapters normalize seam events to `session_started`, `turn_started`,
+`effect_started`, `result`, `provider_unavailable`, and
+`adapter_start_failed`; legacy raw event names remain replayable and are still
+available as last-event evidence.
+
+Every agent exit atomically records `agent_attempt_outcome` evidence with `attempt`, `delivery_attempt`, `attempt_outcome`, and `inbox_disposition`. `completed`, `continue`, `needs_human`, `blocked`, and `diff_budget` require `deliver`; `runtime_failure`, `parse_failure`, `provider_limit`, and `adapter_startup` require `requeue`. Adapter-startup outcomes are emitted only for recognized pre-turn startup failures; they refund the task attempt, preserve exact-session identity, and never silently route auth/code/test failures.
+
+Completion attestation is evaluated against the completed verification frontier,
+not any arbitrary earlier pass. A `repair` or `blocked` attestation on a later
+frontier node therefore keeps the workflow from becoming completed because an
+unrelated lead attestation passed.
 
 ## Team protocol
 

@@ -17,6 +17,8 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
 )
 
+const DefaultAssessmentInterval = 10 * time.Minute
+
 func Serve(ctx context.Context, store *core.Store, prefs *preferences.Manager, interval time.Duration, workers int, logf func(string, ...any)) error {
 	if interval < 100*time.Millisecond {
 		return fmt.Errorf("interval must be at least 100ms")
@@ -41,6 +43,10 @@ func Serve(ctx context.Context, store *core.Store, prefs *preferences.Manager, i
 			eng := &engine.Engine{Store: store, Preferences: prefs}
 			if err = eng.Reconcile(ctx, w.ID); err != nil {
 				logf("workflow=%s reconcile_error=%v", w.ID, err)
+				continue
+			}
+			if err = eng.Assess(ctx, w.ID, time.Now().UTC()); err != nil {
+				logf("workflow=%s assessment_error=%v", w.ID, err)
 				continue
 			}
 			w, err = store.Load(w.ID)

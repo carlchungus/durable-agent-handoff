@@ -172,7 +172,7 @@ func validateAttemptOutcome(e *Evidence) error {
 		return errors.New("attempt outcome requires a positive runtime attempt and non-negative delivery attempt")
 	}
 	deliver := e.AttemptOutcome == "completed" || e.AttemptOutcome == "continue" || e.AttemptOutcome == "needs_human" || e.AttemptOutcome == "blocked" || e.AttemptOutcome == "diff_budget"
-	requeue := e.AttemptOutcome == "runtime_failure" || e.AttemptOutcome == "parse_failure" || e.AttemptOutcome == "provider_limit"
+	requeue := e.AttemptOutcome == "runtime_failure" || e.AttemptOutcome == "parse_failure" || e.AttemptOutcome == "provider_limit" || e.AttemptOutcome == "adapter_startup"
 	if !deliver && !requeue {
 		return fmt.Errorf("unknown agent attempt outcome %q", e.AttemptOutcome)
 	}
@@ -343,20 +343,67 @@ func recompute(w *Workflow) {
 		w.Status = WorkflowNeedsHuman
 	case failed:
 		w.Status = WorkflowFailed
-	case w.Budget.RequireAttestation && !hasPassingAttestation(w):
+	case w.Budget.RequireAttestation && !HasQualifyingAttestation(w):
 		w.Status = WorkflowWaiting
 	default:
 		w.Status = WorkflowCompleted
 	}
 }
 
-func hasPassingAttestation(w *Workflow) bool {
-	for _, a := range w.Attestations {
-		if a.Verdict == "pass" {
-			return true
+// HasQualifyingAttestation keeps workflow completion tied to the current
+// verification frontier. A pass from an implementation node is not allowed to
+// mask a later verifier's repair or blocked result. Finalization nodes are
+// policy-owned and are qualified by the verification frontier, not by a
+// runtime-authored attestation on the finalizer itself.
+func HasQualifyingAttestation(w *Workflow) bool {
+	if w == nil {
+		return false
+	}
+	frontier := qualificationFrontier(w)
+	if len(frontier) == 0 {
+		for _, a := range w.Attestations {
+			if a.Verdict == "pass" {
+				return true
+			}
+		}
+		return false
+	}
+	for _, id := range frontier {
+		passed := false
+		for _, a := range w.Attestations {
+			if a.NodeID == id && a.Verdict == "pass" {
+				passed = true
+				break
+			}
+		}
+		if !passed {
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+func qualificationFrontier(w *Workflow) []string {
+	dependent := make(map[string]bool, len(w.Nodes))
+	for _, n := range w.Nodes {
+		if n == nil {
+			continue
+		}
+		for _, dep := range n.DependsOn {
+			dependent[dep] = true
+		}
+	}
+	var frontier []string
+	for _, id := range w.Order {
+		n := w.Nodes[id]
+		if n == nil || dependent[id] || n.Kind == "finalize" || n.Kind == "merge" || n.Kind == "human" {
+			continue
+		}
+		if n.State == NodeCompleted || n.State == NodeSuperseded {
+			frontier = append(frontier, id)
+		}
+	}
+	return frontier
 }
 
 func findCycle(w *Workflow) []string {

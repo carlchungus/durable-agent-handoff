@@ -41,7 +41,7 @@ type Result struct {
 }
 
 func Execute(ctx context.Context, r Runner, w *core.Workflow, n *core.Node) (Result, error) {
-	if !hasPass(w) {
+	if !core.HasQualifyingAttestation(w) {
 		return Result{}, errors.New("finalization requires a passing independent attestation")
 	}
 	root := n.Worktree
@@ -163,14 +163,6 @@ func InspectDiff(ctx context.Context, r Runner, root string) (DiffStats, error) 
 		_ = f.Close()
 	}
 	return DiffStats{Files: len(paths), Lines: lines, Paths: paths}, nil
-}
-func hasPass(w *core.Workflow) bool {
-	for _, a := range w.Attestations {
-		if a.Verdict == "pass" {
-			return true
-		}
-	}
-	return false
 }
 func splitCSV(s string) []string {
 	var out []string

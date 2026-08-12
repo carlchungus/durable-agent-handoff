@@ -71,6 +71,54 @@ func TestUsageLimitFallsThroughConfiguredLadder(t *testing.T) {
 	}
 }
 
+func TestAdapterStartupFailureDoesNotConsumeTaskAttempt(t *testing.T) {
+	if os.Getenv("GO_WANT_STARTUP_HELPER") == "1" {
+		if strings.Contains(strings.Join(os.Args, " "), "startup-fail") {
+			fmt.Fprintln(os.Stdout, `{"type":"thread.started","thread_id":"startup-session-123"}`)
+			fmt.Fprintln(os.Stderr, "adapter startup signal killed")
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stdout, `{"status":"completed","summary":"backup startup recovery completed","session_id":"startup-session-123"}`)
+		os.Exit(0)
+	}
+	t.Setenv("GO_WANT_STARTUP_HELPER", "1")
+	state := t.TempDir()
+	prefs := preferences.Open(state)
+	primary := core.RuntimeSpec{Name: "exec", Model: "primary", Executable: os.Args[0], Args: []string{"-test.run=TestAdapterStartupFailureDoesNotConsumeTaskAttempt", "startup-fail"}}
+	backup := core.RuntimeSpec{Name: "exec", Model: "backup", Executable: os.Args[0], Args: []string{"-test.run=TestAdapterStartupFailureDoesNotConsumeTaskAttempt", "startup-ok"}}
+	if err := prefs.Set("planner", []core.RuntimeSpec{primary, backup}); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("startup fallback", t.TempDir(), core.DefaultBudget())
+	w, err := st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: &core.Node{ID: "plan", Title: "plan", Kind: "agent", Role: "planner", Runtime: primary}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := Engine{Store: st, Preferences: prefs}
+	if _, err = eng.RunOne(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := st.Load(w.ID)
+	if after.Nodes["plan"].Attempt != 0 || after.Nodes["plan"].State != core.NodeReady || after.Nodes["plan"].Runtime.Model != "backup" {
+		t.Fatalf("startup failure consumed or failed task: %+v", after.Nodes["plan"])
+	}
+	startupEvidence := false
+	for _, evidence := range after.Evidence {
+		startupEvidence = startupEvidence || evidence.Kind == "adapter_startup"
+	}
+	if !startupEvidence {
+		t.Fatalf("missing adapter startup evidence: %+v", after.Evidence)
+	}
+	if _, err = eng.RunOne(context.Background(), w.ID); err != nil {
+		t.Fatal(err)
+	}
+	done, _ := st.Load(w.ID)
+	if done.Nodes["plan"].State != core.NodeCompleted || done.Nodes["plan"].Attempt != 1 {
+		t.Fatalf("backup did not complete after startup recovery: %+v", done.Nodes["plan"])
+	}
+}
+
 func TestCrashRecoveryFallbackRequeuesTheExactInboxDelivery(t *testing.T) {
 	state := t.TempDir()
 	prefs := preferences.Open(state)

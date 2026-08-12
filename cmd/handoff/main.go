@@ -23,6 +23,7 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/engine"
 	"github.com/carlchungus/durable-agent-handoff/internal/githubgate"
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
+	"github.com/carlchungus/durable-agent-handoff/internal/projection"
 	"github.com/carlchungus/durable-agent-handoff/internal/runtime"
 	"github.com/carlchungus/durable-agent-handoff/internal/service"
 	agentsession "github.com/carlchungus/durable-agent-handoff/internal/session"
@@ -57,6 +58,10 @@ func run(args []string, out, errOut io.Writer) error {
 		return cmdPropose(args[1:], out)
 	case "status":
 		return cmdStatus(args[1:], out)
+	case "list":
+		return cmdList(args[1:], out)
+	case "explain":
+		return cmdExplain(args[1:], out)
 	case "events":
 		return cmdEvents(args[1:], out)
 	case "run":
@@ -107,11 +112,15 @@ func cmdActivity(args []string, out io.Writer) error {
 		if err := fs.Parse(reorderFlags(args[1:], map[string]bool{"--state": true, "--json": false})); err != nil {
 			return err
 		}
-		store, err := activity.OpenStore(stateDir(*state))
+		_, err := activity.OpenStore(stateDir(*state))
 		if err != nil {
 			return err
 		}
-		activities, err := store.List()
+		coreStore, err := core.OpenStore(stateDir(*state))
+		if err != nil {
+			return err
+		}
+		activities, err := projection.ListActivities(coreStore, time.Now().UTC())
 		if err != nil {
 			return err
 		}
@@ -119,9 +128,9 @@ func cmdActivity(args []string, out io.Writer) error {
 			return writeJSON(out, activities)
 		}
 		table := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(table, "ACTIVITY\tSTATE\tGEN\tREV\tATTEMPTS\tOWNER\tKIND")
+		fmt.Fprintln(table, "ACTIVITY\tSTATE\tLIVENESS\tPROGRESS\tPROGRESS AGE\tLAST EVENT\tGEN\tOWNER\tKIND")
 		for _, item := range activities {
-			fmt.Fprintf(table, "%s\t%s\t%d\t%d\t%d\t%s\t%s\n", item.ID, item.State, item.Generation, item.Revision, len(item.Attempts), item.OwnerSessionID, item.Work.Kind)
+			fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%ds\t%s\t%d\t%s\t%s\n", item.ID, item.State, item.ProcessLiveness, item.ProgressState, item.MeaningfulProgressAge, observedEvent(item.LastRuntimeEvent), item.Generation, item.OwnerSessionID, item.Work.Kind)
 		}
 		return table.Flush()
 	case "read":
@@ -364,30 +373,29 @@ func cmdAgents(args []string, out io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	sessions, err := agentsession.OpenStore(stateDir(*state))
+	st, err := core.OpenStore(stateDir(*state))
 	if err != nil {
 		return err
 	}
-	agents, err := sessions.List()
+	agents, err := projection.ListAgents(st, *workflow, time.Now().UTC())
 	if err != nil {
 		return err
-	}
-	if *workflow != "" {
-		filtered := agents[:0]
-		for _, agent := range agents {
-			if agent.WorkflowID == *workflow {
-				filtered = append(filtered, agent)
-			}
-		}
-		agents = filtered
 	}
 	if *jsonOut {
 		return writeJSON(out, agents)
 	}
 	table := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(table, "AGENT\tLOGICAL\tPROCESS\tRUNTIME\tRUNTIME SESSION\tWORKFLOW:NODE")
+	fmt.Fprintln(table, "AGENT\tLOGICAL\tPROCESS\tLIVENESS\tCONDITION\tPROGRESS AGE\tQUEUED\tLAST EVENT\tRUNTIME SESSION\tWORKFLOW:NODE")
 	for _, agent := range agents {
-		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s:%s\n", agent.ID, agent.LogicalState, agent.ProcessState, agent.Runtime, agent.RuntimeSessionID, agent.WorkflowID, agent.NodeID)
+		condition := "progressing"
+		if agent.StartupStalled {
+			condition = "stalled_startup"
+		} else if agent.Stalled {
+			condition = "stalled"
+		} else if agent.Quiet {
+			condition = "quiet"
+		}
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%ds\t%d\t%s\t%s\t%s:%s\n", agent.ID, agent.LogicalState, agent.ProcessState, agent.ProcessLiveness, condition, agent.MeaningfulProgressAge, agent.QueuedInput, observedEvent(agent.LastRuntimeEvent), agent.RuntimeSessionID, agent.WorkflowID, agent.NodeID)
 	}
 	return table.Flush()
 }
@@ -519,19 +527,151 @@ func cmdStatus(args []string, out io.Writer) error {
 		if err != nil {
 			return err
 		}
-		return outputJSONOrSummary(out, w, *jsonOut)
+		view, err := projection.BuildWorkflow(st, w, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if *jsonOut {
+			return writeJSON(out, view)
+		}
+		return printWorkflowView(out, view)
 	}
-	ws, err := st.List()
+	views, err := projection.ListWorkflows(st, time.Now().UTC())
 	if err != nil {
 		return err
 	}
 	if *jsonOut {
-		return writeJSON(out, ws)
+		return writeJSON(out, views)
 	}
-	for _, w := range ws {
-		fmt.Fprintf(out, "%-24s %-12s %3d  %s\n", w.ID, w.Status, len(w.Nodes), w.Goal)
+	for _, view := range views {
+		h := view.Observability.Overhead
+		fmt.Fprintf(out, "%-24s %-12s %-11s %-8s queued=%-3d verify=%-16s publish=%-18s turns=%d retries=%d useful=%ds orchestration=%ds %s\n", view.ID, view.Status, view.Observability.ProcessLiveness, condition(view.Observability), view.Observability.QueuedInput, view.Observability.VerifierState, view.Observability.PublicationState, h.AgentTurns, h.RetryCount, h.UsefulWorkSeconds, h.OrchestrationSeconds, view.Goal)
+		fmt.Fprintf(out, "  runtime last_output=%s last_event=%s event_at=%s\n", observedTime(view.Observability.LastOutputAt), observedEvent(view.Observability.LastRuntimeEvent), observedTime(view.Observability.LastRuntimeEventAt))
+		fmt.Fprintf(out, "  overhead wall=%s active=%s dependency_wait=%s queue_wait=%s finalizer_wait=%s retries=%s resumptions=%s verifier=%s repair=%s\n", observedSeconds(h.TotalWallTimeSeconds), observedSeconds(h.ActiveAttemptSeconds), observedSeconds(h.DependencyWaitSeconds), observedSeconds(h.QueueWaitSeconds), observedSeconds(h.FinalizerWaitSeconds), observedCount(h.RetryCountObserved), observedCount(h.ResumptionCount), observedSeconds(h.VerifierSeconds), observedSeconds(h.RepairSeconds))
+		for _, hint := range h.OptimizationHints {
+			fmt.Fprintf(out, "  guidance: %s\n", hint)
+		}
 	}
 	return nil
+}
+
+func cmdList(args []string, out io.Writer) error {
+	return cmdStatus(args, out)
+}
+
+func cmdExplain(args []string, out io.Writer) error {
+	args = reorderFlags(args, map[string]bool{
+		"--json": false, "--human-reply": false, "--parent-return": false,
+		"--evaluator-loop": false, "--parallel": false, "--workflow-replay": false,
+		"--finalization": false,
+	})
+	fs := flag.NewFlagSet("explain", flag.ContinueOnError)
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	humanReply := fs.Bool("human-reply", false, "needs durable human peek/reply")
+	parentReturn := fs.Bool("parent-return", false, "needs a bounded result returned to one parent")
+	evaluatorLoop := fs.Bool("evaluator-loop", false, "needs repeated turns with fresh evaluation")
+	parallel := fs.Bool("parallel", false, "needs peer tasks, claims, or mailboxes")
+	workflowReplay := fs.Bool("workflow-replay", false, "needs dynamic graph replay and branching")
+	finalization := fs.Bool("finalization", false, "needs supervisor-owned publication or merge gates")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 1 {
+		return errors.New("explain accepts at most one coordination contract")
+	}
+	result := projection.Explain(projection.ContractNeeds{HumanReply: *humanReply, ParentReturn: *parentReturn, EvaluatorLoop: *evaluatorLoop, ParallelPeers: *parallel, WorkflowReplay: *workflowReplay, PrivilegedGates: *finalization})
+	if fs.NArg() == 1 {
+		contract := fs.Arg(0)
+		if !validExplainContract(contract) {
+			return fmt.Errorf("unknown coordination contract %q", contract)
+		}
+		result.Recommended = contract
+		for _, option := range result.Options {
+			if option.Contract == contract {
+				result.Reason = option.Recommendation
+				if *jsonOut {
+					return writeJSON(out, option)
+				}
+				fmt.Fprintf(out, "%s\nuse when: %s\ncoordination: %s\ndurability: %s\nauthority: %s\n%s\n", option.Contract, option.UseWhen, option.Coordination, option.Durability, option.Authority, option.Recommendation)
+				return nil
+			}
+		}
+	}
+	if *jsonOut {
+		return writeJSON(out, result)
+	}
+	fmt.Fprintf(out, "recommended: %s\nreason: %s\n\nCONTRACT\tCOORDINATION\tUSE WHEN\n", result.Recommended, result.Reason)
+	for _, option := range result.Options {
+		fmt.Fprintf(out, "%s\t%s\t%s\n", option.Contract, option.Coordination, option.UseWhen)
+	}
+	return nil
+}
+
+func validExplainContract(contract string) bool {
+	switch contract {
+	case "background_session", "goal", "subagent", "team", "workflow":
+		return true
+	default:
+		return false
+	}
+}
+
+func condition(o projection.Observability) string {
+	switch {
+	case o.StartupStalled:
+		return "stalled_startup"
+	case o.Stalled:
+		return "stalled"
+	case o.Quiet:
+		return "quiet"
+	default:
+		return "progressing"
+	}
+}
+
+func printWorkflowView(out io.Writer, view *projection.WorkflowView) error {
+	o := view.Observability
+	fmt.Fprintf(out, "%s  %s  %s\n", view.ID, view.Status, view.Goal)
+	fmt.Fprintf(out, "process=%s progress_age=%ds queued_input=%d verifier=%s repair=%t publication=%s", o.ProcessLiveness, o.MeaningfulProgressAge, o.QueuedInput, o.VerifierState, o.RepairRequired, o.PublicationState)
+	if len(o.Conditions) > 0 {
+		fmt.Fprintf(out, " conditions=%s", strings.Join(o.Conditions, ","))
+	}
+	fmt.Fprintln(out)
+	h := o.Overhead
+	fmt.Fprintf(out, "runtime last_output=%s last_event=%s event_at=%s\n", observedTime(o.LastOutputAt), observedEvent(o.LastRuntimeEvent), observedTime(o.LastRuntimeEventAt))
+	fmt.Fprintf(out, "overhead wall=%s active=%s dependency_wait=%s queue_wait=%s finalizer_wait=%s retries=%s resumptions=%s verifier=%s repair=%s\n", observedSeconds(h.TotalWallTimeSeconds), observedSeconds(h.ActiveAttemptSeconds), observedSeconds(h.DependencyWaitSeconds), observedSeconds(h.QueueWaitSeconds), observedSeconds(h.FinalizerWaitSeconds), observedCount(h.RetryCountObserved), observedCount(h.ResumptionCount), observedSeconds(h.VerifierSeconds), observedSeconds(h.RepairSeconds))
+	for _, hint := range h.OptimizationHints {
+		fmt.Fprintf(out, "guidance: %s\n", hint)
+	}
+	return nil
+}
+
+func observedSeconds(value *int64) string {
+	if value == nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%ds", *value)
+}
+
+func observedCount(value *int) string {
+	if value == nil {
+		return "unknown"
+	}
+	return fmt.Sprint(*value)
+}
+
+func observedTime(value time.Time) string {
+	if value.IsZero() {
+		return "unknown"
+	}
+	return value.UTC().Format(time.RFC3339)
+}
+
+func observedEvent(value string) string {
+	if value == "" {
+		return "unknown"
+	}
+	return value
 }
 func cmdEvents(args []string, out io.Writer) error {
 	args = reorderFlags(args, map[string]bool{"--state": true, "--follow": false, "--after": true})
@@ -641,7 +781,7 @@ func cmdRecover(args []string, out io.Writer) error {
 func cmdServe(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	s := common(fs)
-	interval := fs.Duration("interval", 2*time.Second, "scheduler scan interval")
+	interval := fs.Duration("interval", service.DefaultAssessmentInterval, "scheduler assessment interval")
 	workers := fs.Int("workers", 2, "maximum concurrent workflows")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1079,6 +1219,8 @@ Usage:
   handoff serve [--workers 2]
   handoff service install [--enable]
   handoff status [WORKFLOW_ID] [--json]
+  handoff list [--json]
+  handoff explain [CONTRACT] [--json] [--human-reply] [--parent-return] [--evaluator-loop] [--parallel] [--workflow-replay] [--finalization]
   handoff events WORKFLOW_ID [--follow]
   handoff tui
   handoff doctor [--json]

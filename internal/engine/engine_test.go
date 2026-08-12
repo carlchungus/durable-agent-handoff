@@ -325,6 +325,60 @@ func TestRuntimeEventObserverReadsDirectChildOutput(t *testing.T) {
 	<-done
 }
 
+func TestAdapterStartupRecoveryFencesStaleControllersAndCapsRetries(t *testing.T) {
+	state := t.TempDir()
+	st, _ := core.OpenStore(state)
+	w, _ := st.Create("startup cap", t.TempDir(), core.DefaultBudget())
+	w, err := st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []core.Mutation{{Op: "add_node", Node: &core.Node{ID: "lead", Title: "lead", Kind: "agent", SessionID: "exact-startup-session", Runtime: core.RuntimeSpec{Name: "claude", Model: "opus"}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_state", NodeID: "lead", State: core.NodeRunning}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activities, _ := activity.OpenStore(state)
+	tracked, _ := activities.Create(activity.Descriptor{ID: activity.StableID(w.ID, "lead", "1"), Work: activity.WorkSpec{Kind: "agent", Cwd: w.Root}})
+	attempt, stdout, stderr, err := activities.PrepareAttempt(tracked.ID, tracked.Generation, activity.AttemptStart{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stdout.Close()
+	_ = stderr.Close()
+	attempt, err = activities.MarkRunning(tracked.ID, tracked.Generation, attempt.ID, activity.ProcessIdentity{PID: 123456, ProcessStartToken: "startup-cap", SupervisorID: "sup", SupervisorGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
+	code := 1
+	if err = activities.FinishAttempt(tracked.ID, tracked.Generation, identity, activity.ExitResult{State: activity.StateFailed, ExitCode: &code, Error: "startup"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxAdapterStartupAttempts; i++ {
+		w, err = st.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("startup-history-%d", i), NodeID: "lead", Kind: "adapter_startup", Summary: "claude/opus startup failure"}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	eng := &Engine{Store: st, Activities: activities}
+	stale := identity
+	stale.PID++
+	if err = eng.handleAdapterStartupFailure(w, w.Nodes["lead"], 1, 0, tracked.ID, tracked.Generation, stale, "stale"); !errors.Is(err, activity.ErrFenced) {
+		t.Fatalf("stale startup controller err=%v", err)
+	}
+	current, _ := st.Load(w.ID)
+	if current.Nodes["lead"].State != core.NodeRunning || current.Nodes["lead"].Attempt != 1 {
+		t.Fatalf("stale controller mutated workflow: %+v", current.Nodes["lead"])
+	}
+	if err = eng.handleAdapterStartupFailure(current, current.Nodes["lead"], 1, 0, tracked.ID, tracked.Generation, identity, "cap"); err != nil {
+		t.Fatal(err)
+	}
+	final, _ := st.Load(w.ID)
+	if final.Nodes["lead"].State != core.NodeFailed || final.Nodes["lead"].Attempt != 0 {
+		t.Fatalf("startup cap did not fail visibly/refund task: %+v", final.Nodes["lead"])
+	}
+}
+
 func TestEngineRunsGenericAgentAndPersistsSession(t *testing.T) {
 	if os.Getenv("GO_WANT_HANDOFF_HELPER") == "1" {
 		fmt.Println(`{"thread_id":"session-abcdef"}`)

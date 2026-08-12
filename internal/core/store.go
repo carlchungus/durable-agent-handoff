@@ -26,7 +26,13 @@ func OpenStore(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("store directory is required")
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "workflows"), 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "workflows"), 0o700); err != nil {
 		return nil, err
 	}
 	return &Store{dir: dir}, nil

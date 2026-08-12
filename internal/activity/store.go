@@ -309,6 +309,118 @@ func (s *Store) FinishAttempt(id string, expectedGeneration uint64, identity Att
 	})
 }
 
+// ReopenForRetry converts an exact fenced startup stop into a retryable failed
+// Activity. Ordinary user stops remain stopped and cannot be silently reused.
+func (s *Store) ReopenForRetry(id string, expectedGeneration uint64, identity AttemptIdentity) error {
+	return s.ledger.Update(id, func(tx *secureledger.Txn) error {
+		tracked, err := replay(tx.Replay)
+		if err != nil {
+			return err
+		}
+		current, ok := currentAttempt(tracked)
+		if !ok || tracked.Generation != expectedGeneration || (tracked.State != StateStopped && tracked.State != StateStopping) || !sameIdentity(current, identity) {
+			return ErrFenced
+		}
+		if err = appendEvent(tx, Event{ActivityID: id, Type: "attempt.retryable", At: time.Now().UTC(), Data: identity}); err != nil {
+			return err
+		}
+		tracked.State = StateFailed
+		tracked.Revision++
+		tracked.UpdatedAt = time.Now().UTC()
+		return snapshot(tx, tracked)
+	})
+}
+
+// Assess records durable health without controlling the process. Silence is
+// surfaced as quiet or stalled; it never implies that work should be killed.
+func (s *Store) Assess(id string, now time.Time, quietAfter, stalledAfter time.Duration) (*Activity, error) {
+	if quietAfter < 0 || stalledAfter < quietAfter {
+		return nil, errors.New("invalid progress assessment thresholds")
+	}
+	var result *Activity
+	err := s.ledger.Update(id, func(tx *secureledger.Txn) error {
+		tracked, err := replay(tx.Replay)
+		if err != nil {
+			return err
+		}
+		attempt, ok := currentAttempt(tracked)
+		if !ok {
+			return errors.New("activity has no attempt to assess")
+		}
+		if tracked.State != StateStarting && tracked.State != StateRunning && tracked.State != StateStopping {
+			result = cloneActivity(tracked)
+			return nil
+		}
+		bytes := outputSize(attempt.Stdout.Path) + outputSize(attempt.Stderr.Path)
+		outputAdvanced := bytes > tracked.LastOutputBytes
+		progressAt := tracked.LastProgressAt
+		if progressAt.IsZero() {
+			progressAt = attempt.StartedAt
+		}
+		if bytes > tracked.ProgressBytes {
+			progressAt = now
+		}
+		age := now.Sub(progressAt)
+		state := ProgressActive
+		reason := "output advanced"
+		if attempt.StartedAt.Add(DefaultStartupGrace).Before(now) && tracked.TurnStartedAt.IsZero() && tracked.LastRuntimeEvent != "" {
+			state, reason = ProgressStalledStartup, "runtime startup grace elapsed before turn.started"
+		} else if age >= stalledAfter {
+			state, reason = ProgressStalled, "no meaningful output advance within the stalled threshold"
+		} else if age >= quietAfter {
+			state, reason = ProgressQuiet, "no meaningful output advance within the quiet threshold"
+		}
+		data := assessmentEvent{AttemptID: attempt.ID, ObservedAt: now, ProgressAt: progressAt, Bytes: bytes, OutputAdvanced: outputAdvanced, State: state, Reason: reason}
+		if err = appendEvent(tx, Event{ActivityID: id, Type: "activity.assessed", At: now, Data: data}); err != nil {
+			return err
+		}
+		applyAssessment(tracked, data)
+		result = cloneActivity(tracked)
+		return snapshot(tx, tracked)
+	})
+	return result, err
+}
+
+// ObserveRuntime persists the last output boundary and protocol event from
+// the runtime stream. It is fenced to the exact Activity generation and
+// Attempt so a late observer cannot make a replacement attempt look healthy.
+func (s *Store) ObserveRuntime(id string, expectedGeneration uint64, attemptID, runtimeEvent string, outputBytes int64, observedAt time.Time) error {
+	return s.ObserveNormalized(id, expectedGeneration, attemptID, runtimeEvent, runtimeEvent, outputBytes, observedAt)
+}
+
+// ObserveNormalized persists both the adapter's raw event and its normalized
+// seam classification. The raw value remains available for backward replay
+// and operator evidence; scheduling predicates use the normalized value.
+func (s *Store) ObserveNormalized(id string, expectedGeneration uint64, attemptID, runtimeEvent, normalizedEvent string, outputBytes int64, observedAt time.Time) error {
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
+	return s.ledger.Update(id, func(tx *secureledger.Txn) error {
+		tracked, err := replay(tx.Replay)
+		if err != nil {
+			return err
+		}
+		current, ok := currentAttempt(tracked)
+		if !ok || current.ID != attemptID || tracked.Generation != expectedGeneration || terminal(tracked.State) {
+			return ErrFenced
+		}
+		data := runtimeObservationEvent{AttemptID: attemptID, ObservedAt: observedAt, OutputBytes: outputBytes, RuntimeEvent: runtimeEvent, NormalizedEvent: normalizedEvent}
+		if err = appendEvent(tx, Event{ActivityID: id, Type: "attempt.observed", At: observedAt, Data: data}); err != nil {
+			return err
+		}
+		applyRuntimeObservation(tracked, data)
+		return snapshot(tx, tracked)
+	})
+}
+
+func outputSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
 func (s *Store) ResolveLost(id string, expectedGeneration uint64, identity AttemptIdentity, result ExitResult) error {
 	if result.State != StateCompleted && result.State != StateFailed {
 		return fmt.Errorf("lost attempt can only resolve to completed or failed, got %q", result.State)
@@ -474,6 +586,37 @@ func replay(run replayFn) (*Activity, error) {
 				return err
 			}
 			applyFinish(activity, data, event.At)
+		case "attempt.retryable":
+			if activity == nil {
+				return errors.New("retryable event preceded activity creation")
+			}
+			var identity AttemptIdentity
+			if err := json.Unmarshal(event.Data, &identity); err != nil {
+				return err
+			}
+			if current, ok := currentAttempt(activity); ok && (activity.State == StateStopped || activity.State == StateStopping) && sameIdentity(current, identity) {
+				activity.State = StateFailed
+				activity.Revision++
+				activity.UpdatedAt = event.At
+			}
+		case "activity.assessed":
+			if activity == nil {
+				return errors.New("assessment preceded activity creation")
+			}
+			var data assessmentEvent
+			if err := json.Unmarshal(event.Data, &data); err != nil {
+				return err
+			}
+			applyAssessment(activity, data)
+		case "attempt.observed":
+			if activity == nil {
+				return errors.New("observation preceded activity creation")
+			}
+			var data runtimeObservationEvent
+			if err := json.Unmarshal(event.Data, &data); err != nil {
+				return err
+			}
+			applyRuntimeObservation(activity, data)
 		}
 		return nil
 	}); err != nil {
@@ -505,6 +648,24 @@ type adoptEvent struct {
 type preparedFailureEvent struct {
 	AttemptID string `json:"attempt_id"`
 	Error     string `json:"error"`
+}
+
+type assessmentEvent struct {
+	AttemptID      string        `json:"attempt_id"`
+	ObservedAt     time.Time     `json:"observed_at"`
+	ProgressAt     time.Time     `json:"progress_at"`
+	Bytes          int64         `json:"bytes"`
+	OutputAdvanced bool          `json:"output_advanced,omitempty"`
+	State          ProgressState `json:"state"`
+	Reason         string        `json:"reason"`
+}
+
+type runtimeObservationEvent struct {
+	AttemptID       string    `json:"attempt_id"`
+	ObservedAt      time.Time `json:"observed_at"`
+	OutputBytes     int64     `json:"output_bytes"`
+	RuntimeEvent    string    `json:"runtime_event,omitempty"`
+	NormalizedEvent string    `json:"normalized_event,omitempty"`
 }
 
 func appendEvent(tx *secureledger.Txn, event Event) error {
@@ -549,6 +710,44 @@ func applyFinish(activity *Activity, data finishEvent, at time.Time) {
 	activity.State = data.Result.State
 	activity.Revision++
 	activity.UpdatedAt = at
+}
+
+func applyAssessment(activity *Activity, data assessmentEvent) {
+	activity.LastObservedAt = data.ObservedAt
+	activity.LastProgressAt = data.ProgressAt
+	activity.ProgressBytes = data.Bytes
+	activity.ProgressState = data.State
+	activity.ProgressReason = data.Reason
+	if data.OutputAdvanced {
+		activity.LastOutputAt = data.ObservedAt
+		activity.LastOutputBytes = data.Bytes
+	}
+	activity.Revision++
+	activity.UpdatedAt = data.ObservedAt
+}
+
+func applyRuntimeObservation(activity *Activity, data runtimeObservationEvent) {
+	if data.OutputBytes >= activity.LastOutputBytes {
+		activity.LastOutputBytes = data.OutputBytes
+		activity.LastOutputAt = data.ObservedAt
+	}
+	if data.RuntimeEvent != "" {
+		activity.LastRuntimeEvent = data.RuntimeEvent
+		activity.LastRuntimeEventAt = data.ObservedAt
+	}
+	if data.NormalizedEvent != "" {
+		activity.LastNormalizedEvent = data.NormalizedEvent
+		activity.LastNormalizedAt = data.ObservedAt
+	}
+	if data.RuntimeEvent == "turn.started" || data.NormalizedEvent == "turn_started" {
+		activity.TurnStartedAt = data.ObservedAt
+		activity.LastProgressAt = data.ObservedAt
+	}
+	if data.NormalizedEvent == "effect_started" || strings.Contains(data.RuntimeEvent, "tool.started") || strings.Contains(data.RuntimeEvent, "command.started") || strings.Contains(data.RuntimeEvent, "side_effect") {
+		activity.SideEffectStartedAt = data.ObservedAt
+	}
+	activity.Revision++
+	activity.UpdatedAt = data.ObservedAt
 }
 
 func applyRunning(activity *Activity, data runningEvent, at time.Time) {

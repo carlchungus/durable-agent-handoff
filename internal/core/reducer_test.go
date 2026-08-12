@@ -101,6 +101,32 @@ func TestCompletionWaitsForAttestation(t *testing.T) {
 	}
 }
 
+func TestRepairOnVerificationFrontierCannotBeMaskedByLeadPass(t *testing.T) {
+	w := fixtureWorkflow(t)
+	if err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []Mutation{
+		{Op: "add_node", Node: &Node{ID: "lead", Title: "lead", Kind: "agent"}},
+		{Op: "add_node", Node: &Node{ID: "verify", Title: "verify", Kind: "agent", DependsOn: []string{"lead"}}},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []Mutation{
+		{Op: "set_state", NodeID: "lead", State: NodeRunning}, {Op: "set_state", NodeID: "lead", State: NodeCompleted},
+		{Op: "set_state", NodeID: "verify", State: NodeRunning}, {Op: "attest", Attestation: &Attestation{ID: "lead-pass", NodeID: "lead", Verifier: "lead", Verdict: "pass", Summary: "implemented"}},
+		{Op: "attest", Attestation: &Attestation{ID: "verify-repair", NodeID: "verify", Verifier: "verify", Verdict: "repair", Summary: "needs repair"}}, {Op: "set_state", NodeID: "verify", State: NodeCompleted},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if w.Status == WorkflowCompleted || HasQualifyingAttestation(w) {
+		t.Fatalf("lead pass masked verifier repair: status=%s", w.Status)
+	}
+	if err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "verify", Mutations: []Mutation{{Op: "attest", Attestation: &Attestation{ID: "verify-pass", NodeID: "verify", Verifier: "verify", Verdict: "pass", Summary: "repaired"}}}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if w.Status != WorkflowCompleted {
+		t.Fatalf("frontier pass did not complete workflow: %s", w.Status)
+	}
+}
+
 func TestAttestationRejectsContradictoryRawVerdictAtomically(t *testing.T) {
 	w := fixtureWorkflow(t)
 	if err := ApplyProposal(w, Proposal{WorkflowID: w.ID, Actor: "human", Mutations: []Mutation{{Op: "add_node", Node: &Node{ID: "verify", Title: "verify", Kind: "agent"}}}}, time.Now().UTC()); err != nil {

@@ -17,6 +17,21 @@ const (
 	StateLost      State = "lost"
 )
 
+type ProgressState string
+
+const (
+	ProgressActive         ProgressState = "active"
+	ProgressQuiet          ProgressState = "quiet"
+	ProgressStalled        ProgressState = "stalled"
+	ProgressStalledStartup ProgressState = "stalled_startup"
+)
+
+const (
+	DefaultStartupGrace = 2 * time.Minute
+	DefaultQuietAfter   = 15 * time.Minute
+	DefaultStalledAfter = 30 * time.Minute
+)
+
 type Stream string
 
 const (
@@ -125,18 +140,31 @@ type ControlRequest struct {
 }
 
 type Activity struct {
-	Version        int             `json:"version"`
-	ID             string          `json:"id"`
-	OwnerSessionID string          `json:"owner_session_id,omitempty"`
-	Work           WorkSpec        `json:"work"`
-	WorkDigest     string          `json:"work_digest"`
-	State          State           `json:"state"`
-	Generation     uint64          `json:"generation"`
-	Revision       uint64          `json:"revision"`
-	Attempts       []Attempt       `json:"attempts,omitempty"`
-	Controls       []ControlIntent `json:"controls,omitempty"`
-	CreatedAt      time.Time       `json:"created_at"`
-	UpdatedAt      time.Time       `json:"updated_at"`
+	Version             int             `json:"version"`
+	ID                  string          `json:"id"`
+	OwnerSessionID      string          `json:"owner_session_id,omitempty"`
+	Work                WorkSpec        `json:"work"`
+	WorkDigest          string          `json:"work_digest"`
+	State               State           `json:"state"`
+	Generation          uint64          `json:"generation"`
+	Revision            uint64          `json:"revision"`
+	Attempts            []Attempt       `json:"attempts,omitempty"`
+	Controls            []ControlIntent `json:"controls,omitempty"`
+	CreatedAt           time.Time       `json:"created_at"`
+	UpdatedAt           time.Time       `json:"updated_at"`
+	LastObservedAt      time.Time       `json:"last_observed_at,omitempty"`
+	LastProgressAt      time.Time       `json:"last_progress_at,omitempty"`
+	ProgressBytes       int64           `json:"progress_bytes,omitempty"`
+	ProgressState       ProgressState   `json:"progress_state,omitempty"`
+	ProgressReason      string          `json:"progress_reason,omitempty"`
+	LastOutputAt        time.Time       `json:"last_output_at,omitempty"`
+	LastOutputBytes     int64           `json:"last_output_bytes,omitempty"`
+	LastRuntimeEvent    string          `json:"last_runtime_event,omitempty"`
+	LastRuntimeEventAt  time.Time       `json:"last_runtime_event_at,omitempty"`
+	LastNormalizedEvent string          `json:"last_normalized_runtime_event,omitempty"`
+	LastNormalizedAt    time.Time       `json:"last_normalized_runtime_event_at,omitempty"`
+	TurnStartedAt       time.Time       `json:"turn_started_at,omitempty"`
+	SideEffectStartedAt time.Time       `json:"side_effect_started_at,omitempty"`
 }
 
 type OutputCursor struct {

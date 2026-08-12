@@ -77,7 +77,18 @@ type Evidence struct {
 	DeliveryAttempt  int       `json:"delivery_attempt,omitempty"`
 	AttemptOutcome   string    `json:"attempt_outcome,omitempty"`
 	InboxDisposition string    `json:"inbox_disposition,omitempty"`
+	Usage            *Usage    `json:"usage,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
+}
+
+// Usage is optional adapter-reported accounting. Zero values mean the
+// runtime did not provide that measure; projections must not infer tokens or
+// cost from wall-clock time.
+type Usage struct {
+	InputTokens  int64   `json:"input_tokens,omitempty"`
+	OutputTokens int64   `json:"output_tokens,omitempty"`
+	TotalTokens  int64   `json:"total_tokens,omitempty"`
+	CostUSD      float64 `json:"cost_usd,omitempty"`
 }
 
 type Attestation struct {

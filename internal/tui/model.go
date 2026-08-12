@@ -16,6 +16,7 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/engine"
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
+	"github.com/carlchungus/durable-agent-handoff/internal/projection"
 	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 	coord "github.com/carlchungus/durable-agent-handoff/internal/team"
 )
@@ -23,6 +24,7 @@ import (
 type tickMsg time.Time
 type loadMsg struct {
 	workflows []*core.Workflow
+	views     []*projection.WorkflowView
 	teams     []*coord.Team
 	events    []core.Event
 	attempts  map[string]attemptView
@@ -41,6 +43,7 @@ type Model struct {
 	store      *core.Store
 	teamStore  *coord.Store
 	workflows  []*core.Workflow
+	views      []*projection.WorkflowView
 	teams      []*coord.Team
 	events     []core.Event
 	attempts   map[string]attemptView
@@ -75,6 +78,7 @@ func Snapshot(store *core.Store) (string, error) {
 		return "", err
 	}
 	m.workflows = ws
+	m.views, _ = projection.ListWorkflows(store, time.Now().UTC())
 	if m.teamStore != nil {
 		m.teams, _ = m.teamStore.List()
 	}
@@ -111,7 +115,11 @@ func (m Model) load() tea.Cmd {
 			}
 			attempts, err = loadAttempts(m.store, selected)
 		}
-		return loadMsg{workflows: ws, teams: teams, events: events, attempts: attempts, err: err}
+		views, viewErr := projection.ListWorkflows(m.store, time.Now().UTC())
+		if err == nil {
+			err = viewErr
+		}
+		return loadMsg{workflows: ws, views: views, teams: teams, events: events, attempts: attempts, err: err}
 	}
 }
 
@@ -201,6 +209,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(tick(), m.load())
 	case loadMsg:
 		m.workflows = v.workflows
+		m.views = v.views
 		m.teams = v.teams
 		m.events = v.events
 		m.attempts = v.attempts
@@ -369,13 +378,18 @@ func (m Model) workflowList(width int) string {
 		if i == m.cursor {
 			cursor = "› "
 		}
+		view := m.workflowView(i, w)
 		dot := statusDot(w.Status)
 		name := truncate(w.Goal, max(8, width-7))
 		line := fmt.Sprintf("%s%s %s", cursor, dot, name)
 		if i == m.cursor {
 			line = lipgloss.NewStyle().Bold(true).Foreground(purple).Render(line)
 		}
-		lines = append(lines, line, lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("    %s · %d nodes", w.Status, len(w.Nodes))))
+		condition := "progressing"
+		if view != nil {
+			condition = conditionForView(view)
+		}
+		lines = append(lines, line, lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("    %s · %s · %d queued", w.Status, condition, queuedForView(view))))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -385,7 +399,20 @@ func (m Model) detail(width int) string {
 		return title.Render("LIVE STATE") + "\n\nWaiting for work."
 	}
 	w := m.workflows[m.cursor]
-	lines := []string{title.Render(strings.ToUpper(string(w.Status))), lipgloss.NewStyle().Bold(true).Render(truncate(w.Goal, width)), lipgloss.NewStyle().Foreground(muted).Render(w.ID + "  •  " + w.Root), "", title.Render("GRAPH")}
+	view := m.workflowView(m.cursor, w)
+	lines := []string{title.Render(strings.ToUpper(string(w.Status))), lipgloss.NewStyle().Bold(true).Render(truncate(w.Goal, width)), lipgloss.NewStyle().Foreground(muted).Render(w.ID + "  •  " + w.Root)}
+	if view != nil {
+		o := view.Observability
+		lines = append(lines, lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("process=%s · progress age=%ds · queued input=%d · verifier=%s · publication=%s", o.ProcessLiveness, o.MeaningfulProgressAge, o.QueuedInput, o.VerifierState, o.PublicationState)))
+		lastEvent := o.LastRuntimeEvent
+		if lastEvent == "" {
+			lastEvent = "unknown"
+		}
+		lines = append(lines, lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("runtime: last output=%s · last event=%s", formatObservedTime(o.LastOutputAt), lastEvent)))
+		h := o.Overhead
+		lines = append(lines, lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("overhead: %d turns · %d attempts/%d retries · useful=%ds · orchestration=%ds · quiet=%ds", h.AgentTurns, h.Attempts, h.RetryCount, h.UsefulWorkSeconds, h.OrchestrationSeconds, h.IdleQuietSeconds)))
+	}
+	lines = append(lines, "", title.Render("GRAPH"))
 	for _, id := range w.Order {
 		n := w.Nodes[id]
 		if n == nil {
@@ -427,6 +454,43 @@ func (m Model) detail(width int) string {
 	}
 	lines = append(lines, "", fmt.Sprintf("evidence %d  •  attestations %d pass / %d total", len(w.Evidence), pass, len(w.Attestations)))
 	return strings.Join(lines, "\n")
+}
+
+func (m Model) workflowView(index int, fallbackWorkflow *core.Workflow) *projection.WorkflowView {
+	if index >= 0 && index < len(m.views) && m.views[index] != nil {
+		return m.views[index]
+	}
+	return &projection.WorkflowView{Workflow: fallbackWorkflow}
+}
+
+func conditionForView(view *projection.WorkflowView) string {
+	if view == nil {
+		return "unknown"
+	}
+	if view.Observability.StartupStalled {
+		return "stalled_startup"
+	}
+	if view.Observability.Stalled {
+		return "stalled"
+	}
+	if view.Observability.Quiet {
+		return "quiet"
+	}
+	return "progressing"
+}
+
+func formatObservedTime(value time.Time) string {
+	if value.IsZero() {
+		return "unknown"
+	}
+	return value.UTC().Format(time.RFC3339)
+}
+
+func queuedForView(view *projection.WorkflowView) int {
+	if view == nil {
+		return 0
+	}
+	return view.Observability.QueuedInput
 }
 
 func statusDot(s core.WorkflowStatus) string {

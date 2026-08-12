@@ -36,6 +36,28 @@ func TestStartAndStatusJSONContract(t *testing.T) {
 	if loaded.ID != created.ID || loaded.Goal != "test the CLI" {
 		t.Fatalf("loaded=%#v", loaded)
 	}
+	var status map[string]json.RawMessage
+	if err := json.Unmarshal(out.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	var observability struct {
+		Overhead struct {
+			TotalWallTime json.RawMessage `json:"total_wall_time_seconds"`
+		} `json:"overhead"`
+	}
+	if err := json.Unmarshal(status["observability"], &observability); err != nil {
+		t.Fatal(err)
+	}
+	if string(observability.Overhead.TotalWallTime) == "null" {
+		t.Fatal("status projection omitted observed workflow wall time")
+	}
+	out.Reset()
+	if err := run([]string{"status", "--state", state, created.ID}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("overhead wall=")) || !bytes.Contains(out.Bytes(), []byte("guidance:")) {
+		t.Fatalf("human status omitted overhead guidance: %q", out.String())
+	}
 }
 
 func TestFinalizationRequiresExplicitGate(t *testing.T) {
@@ -43,6 +65,22 @@ func TestFinalizationRequiresExplicitGate(t *testing.T) {
 	err := run([]string{"start", "--state", t.TempDir(), "--goal", "ship", "--root", t.TempDir(), "--finalize-repo", "owner/repo"}, &out, &errOut)
 	if err == nil {
 		t.Fatal("expected missing gate error")
+	}
+}
+
+func TestExplainCLIShowsCoordinationDecisionModel(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if err := run([]string{"explain", "--parent-return", "--json"}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Recommended string `json:"recommended"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Recommended != "subagent" {
+		t.Fatalf("decision=%+v", result)
 	}
 }
 

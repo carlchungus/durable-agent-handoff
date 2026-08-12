@@ -15,9 +15,10 @@ import (
 )
 
 type Config struct {
-	Ladders            map[string][]core.RuntimeSpec `json:"ladders"`
-	UsageLimitCooldown time.Duration                 `json:"usage_limit_cooldown"`
-	RateLimitCooldown  time.Duration                 `json:"rate_limit_cooldown"`
+	Ladders                map[string][]core.RuntimeSpec `json:"ladders"`
+	UsageLimitCooldown     time.Duration                 `json:"usage_limit_cooldown"`
+	RateLimitCooldown      time.Duration                 `json:"rate_limit_cooldown"`
+	AdapterStartupCooldown time.Duration                 `json:"adapter_startup_cooldown"`
 }
 type Health struct {
 	Key              string    `json:"key"`
@@ -47,7 +48,7 @@ func Open(dir string) *Manager {
 	return &Manager{dir: dir, now: func() time.Time { return time.Now().UTC() }}
 }
 func DefaultConfig() Config {
-	return Config{Ladders: map[string][]core.RuntimeSpec{}, UsageLimitCooldown: time.Hour, RateLimitCooldown: 5 * time.Minute}
+	return Config{Ladders: map[string][]core.RuntimeSpec{}, UsageLimitCooldown: time.Hour, RateLimitCooldown: 5 * time.Minute, AdapterStartupCooldown: 30 * time.Second}
 }
 func (m *Manager) Config() (Config, error) { m.mu.Lock(); defer m.mu.Unlock(); return m.loadConfig() }
 func (m *Manager) Set(role string, candidates []core.RuntimeSpec) error {
@@ -126,6 +127,8 @@ func (m *Manager) Record(spec core.RuntimeSpec, class, reason string) error {
 	duration := cfg.UsageLimitCooldown
 	if class == "rate_limit" {
 		duration = cfg.RateLimitCooldown
+	} else if class == "adapter_startup" {
+		duration = cfg.AdapterStartupCooldown
 	}
 	h, err := m.loadHealth()
 	if err != nil {
@@ -198,6 +201,9 @@ func (m *Manager) loadConfig() (Config, error) {
 	}
 	if cfg.RateLimitCooldown == 0 {
 		cfg.RateLimitCooldown = 5 * time.Minute
+	}
+	if cfg.AdapterStartupCooldown == 0 {
+		cfg.AdapterStartupCooldown = 30 * time.Second
 	}
 	return cfg, nil
 }

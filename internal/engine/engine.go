@@ -12,15 +12,18 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/activity"
+	"github.com/carlchungus/durable-agent-handoff/internal/controlplane"
 	"github.com/carlchungus/durable-agent-handoff/internal/core"
 	"github.com/carlchungus/durable-agent-handoff/internal/finalize"
 	"github.com/carlchungus/durable-agent-handoff/internal/preferences"
 	"github.com/carlchungus/durable-agent-handoff/internal/runstate"
 	hruntime "github.com/carlchungus/durable-agent-handoff/internal/runtime"
 	agentsession "github.com/carlchungus/durable-agent-handoff/internal/session"
+	"github.com/carlchungus/durable-agent-handoff/internal/workspacelease"
 )
 
 type Result struct {
@@ -78,10 +81,13 @@ type Engine struct {
 	Preferences        *preferences.Manager
 	Sessions           *agentsession.Store
 	Activities         *activity.Store
+	WorkspaceLeases    *workspacelease.Store
 	FinalizeRetryDelay time.Duration
+	StartupGrace       time.Duration
 }
 
 const defaultFinalizeRetryDelay = 30 * time.Second
+const maxAdapterStartupAttempts = 2
 
 func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 	w, err := e.Store.Load(id)
@@ -92,14 +98,28 @@ func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 		return nil, errors.New("workflow is paused")
 	}
 	var node *core.Node
+	var deferredReason string
 	for _, nid := range w.Order {
 		n := w.Nodes[nid]
 		if n.State == core.NodeReady && n.Kind != "human" && n.Kind != "merge" {
+			settled, reason, gateErr := e.dependenciesSettled(w, n)
+			if gateErr != nil {
+				return nil, gateErr
+			}
+			if !settled {
+				if deferredReason == "" {
+					deferredReason = reason
+				}
+				continue
+			}
 			node = n
 			break
 		}
 	}
 	if node == nil {
+		if deferredReason != "" {
+			return nil, fmt.Errorf("no runnable node: %s", deferredReason)
+		}
 		return nil, errors.New("no runnable node")
 	}
 	if e.Preferences != nil && node.Kind == "agent" {
@@ -121,6 +141,17 @@ func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 			node.Runtime, node.CandidateIndex = routed, index
 		}
 	}
+	if until, ok := e.startupBackoffUntil(w, node, time.Now().UTC()); ok {
+		return nil, &preferences.CooldownError{Role: node.Role, Until: until}
+	}
+	lease, releaseLease, err := e.acquireWorkspaceLease(w, node)
+	if err != nil {
+		return nil, err
+	}
+	if releaseLease != nil {
+		defer func() { _ = releaseLease() }()
+	}
+	_ = lease
 	if node.Kind == "agent" {
 		agent, sessionErr := e.ensureAgentSession(w, node)
 		if sessionErr != nil {
@@ -140,6 +171,68 @@ func (e *Engine) RunOne(ctx context.Context, id string) (*core.Node, error) {
 		return node, e.runFinalize(ctx, w, node)
 	}
 	return node, e.runAgent(ctx, w, node)
+}
+
+func (e *Engine) dependenciesSettled(w *core.Workflow, node *core.Node) (bool, string, error) {
+	if len(node.DependsOn) == 0 {
+		return true, "", nil
+	}
+	if e.Sessions == nil {
+		var err error
+		e.Sessions, err = agentsession.OpenStore(e.Store.Dir())
+		if err != nil {
+			return false, "dependency_session_store_unavailable", err
+		}
+	}
+	if e.Activities == nil {
+		var err error
+		e.Activities, err = activity.OpenStore(e.Store.Dir())
+		if err != nil {
+			return false, "dependency_activity_store_unavailable", err
+		}
+	}
+	return controlplane.DependenciesSettled(w, node, e.Sessions, e.Activities)
+}
+
+func (e *Engine) acquireWorkspaceLease(w *core.Workflow, node *core.Node) (*workspacelease.Lease, func() error, error) {
+	if node.Runtime.Sandbox == "read-only" {
+		return nil, nil, nil
+	}
+	if e.WorkspaceLeases == nil {
+		var err error
+		e.WorkspaceLeases, err = workspacelease.Open(e.Store.Dir())
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	owner := fmt.Sprintf("workflow=%s/node=%s/launch=%d/pid=%d/%d", w.ID, node.ID, node.Attempt+1, os.Getpid(), time.Now().UnixNano())
+	lease, err := e.WorkspaceLeases.Acquire(workdir(w, node), owner)
+	if err != nil {
+		return nil, nil, fmt.Errorf("workspace lease for %s: %w", workdir(w, node), err)
+	}
+	return lease, func() error { return e.WorkspaceLeases.Release(lease.Worktree, lease.Owner, lease.Generation) }, nil
+}
+
+func (e *Engine) startupBackoffUntil(w *core.Workflow, n *core.Node, now time.Time) (time.Time, bool) {
+	if e.Preferences != nil {
+		if health, err := e.Preferences.Health(); err == nil {
+			for _, item := range health {
+				if item.Key == preferences.Key(n.Runtime) && item.Class == "adapter_startup" && item.UnavailableUntil.After(now) {
+					return item.UnavailableUntil, true
+				}
+			}
+		}
+	}
+	var last time.Time
+	for _, evidence := range w.Evidence {
+		if evidence.NodeID == n.ID && evidence.Kind == "adapter_startup" && strings.Contains(evidence.Summary, preferences.Key(n.Runtime)) && evidence.CreatedAt.After(last) {
+			last = evidence.CreatedAt
+		}
+	}
+	if !last.IsZero() && last.Add(30*time.Second).After(now) {
+		return last.Add(30 * time.Second), true
+	}
+	return time.Time{}, false
 }
 
 // Reconcile repairs nodes left in running state after a supervisor restart.
@@ -275,6 +368,113 @@ func (e *Engine) Reconcile(_ context.Context, id string) error {
 		return e.reconcileInterruptedAgent(w, n, sessionID, restartSafe)
 	}
 	return nil
+}
+
+// Assess performs a bounded, read-mostly health pass. It records progress and
+// quiet/stalled observations in the Activity ledger and mirrors actionable
+// findings into the workflow ledger. It never stops or retries a quiet
+// process; a later scheduler pass can resume an exact session after exit.
+func (e *Engine) Assess(ctx context.Context, id string, now time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	w, err := e.Store.Load(id)
+	if err != nil {
+		return err
+	}
+	if e.Activities == nil {
+		e.Activities, err = activity.OpenStore(e.Store.Dir())
+		if err != nil {
+			return err
+		}
+	}
+	if e.Sessions == nil {
+		e.Sessions, err = agentsession.OpenStore(e.Store.Dir())
+		if err != nil {
+			return err
+		}
+	}
+	for _, nodeID := range w.Order {
+		n := w.Nodes[nodeID]
+		if n == nil || n.Kind != "agent" || n.Attempt < 1 {
+			continue
+		}
+		tracked, loadErr := e.Activities.Load(activity.StableID(w.ID, n.ID, fmt.Sprint(n.Attempt)))
+		if loadErr == nil {
+			assessed, assessErr := e.Activities.Assess(tracked.ID, now, activity.DefaultQuietAfter, activity.DefaultStalledAfter)
+			if assessErr != nil {
+				return assessErr
+			}
+			if assessed != nil && assessed.ProgressState == activity.ProgressStalledStartup && assessed.TurnStartedAt.IsZero() && assessed.SideEffectStartedAt.IsZero() {
+				attempt, ok := currentActivityAttempt(assessed)
+				if ok {
+					deliveryAttempt, deliveryErr := e.dispatchedDeliveryAttempt(w.ID, n.ID)
+					if deliveryErr != nil {
+						return deliveryErr
+					}
+					identity := activityIdentity(attempt)
+					if _, stopErr := (&activity.Supervisor{Store: e.Activities}).StopExpected(assessed.ID, activity.ControlRequest{ExpectedGeneration: assessed.Generation, ExpectedAttempt: identity}); stopErr != nil && !errors.Is(stopErr, activity.ErrFenced) {
+						return stopErr
+					}
+					if err = e.handleAdapterStartupFailure(w, n, n.Attempt, deliveryAttempt, assessed.ID, assessed.Generation, identity, "startup grace breached during service assessment"); err != nil {
+						return err
+					}
+					w, err = e.Store.Load(w.ID)
+					if err != nil {
+						return err
+					}
+					continue
+				}
+			}
+			if assessed != nil && (assessed.ProgressState == activity.ProgressQuiet || assessed.ProgressState == activity.ProgressStalled) {
+				id := fmt.Sprintf("health-%s-%d-%d", n.ID, n.Attempt, assessed.Revision)
+				if !hasEvidence(w, id) {
+					age := now.Sub(assessed.LastProgressAt).Round(time.Second)
+					w, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "add_evidence", Evidence: &core.Evidence{ID: id, NodeID: n.ID, Kind: "health", Summary: fmt.Sprintf("activity %s is %s: no meaningful progress for %s; process remains resumable and was not stopped", n.ID, assessed.ProgressState, age)}}}, Rationale: "durable autonomous progress assessment"})
+					if err != nil {
+						return err
+					}
+				}
+			}
+		} else if !errors.Is(loadErr, os.ErrNotExist) {
+			return loadErr
+		}
+		agent, loadErr := e.Sessions.LoadByNode(w.ID, n.ID)
+		if errors.Is(loadErr, os.ErrNotExist) {
+			continue
+		}
+		if loadErr != nil {
+			return loadErr
+		}
+		var queued []agentsession.Message
+		for _, message := range agent.Inbox {
+			if message.State == agentsession.MessageQueued {
+				queued = append(queued, message)
+			}
+		}
+		if len(queued) == 0 {
+			continue
+		}
+		last := queued[len(queued)-1]
+		guidanceID := fmt.Sprintf("inbox-%s-%d", n.ID, last.Sequence)
+		if hasEvidence(w, guidanceID) {
+			continue
+		}
+		w, err = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "add_evidence", Evidence: &core.Evidence{ID: guidanceID, NodeID: n.ID, Kind: "guidance", Summary: fmt.Sprintf("%d input message(s) queued; preserve and deliver them on the next exact runtime turn", len(queued))}}}, Rationale: "durable queued-input assessment"})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func hasEvidence(w *core.Workflow, id string) bool {
+	for _, evidence := range w.Evidence {
+		if evidence.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // reconcileActivity makes the Activity ledger authoritative for all new agent
@@ -534,7 +734,7 @@ func (e *Engine) runCommand(ctx context.Context, w *core.Workflow, n *core.Node)
 	cmd := exec.CommandContext(ctx, n.Runtime.Executable, n.Runtime.Args...)
 	cmd.Dir = workdir(w, n)
 	out, err := cmd.CombinedOutput()
-	ev := core.Evidence{ID: "evidence-" + n.ID + fmt.Sprint(n.Attempt+1), NodeID: n.ID, Kind: "command", Summary: truncate(string(out), 4000)}
+	ev := core.Evidence{ID: "evidence-" + n.ID + fmt.Sprint(n.Attempt+1), NodeID: n.ID, Kind: "command", Digest: runstate.CommandDigest(n.Runtime.Executable, n.Runtime.Args), Summary: truncate(string(out), 4000)}
 	state := core.NodeCompleted
 	if err != nil {
 		state = core.NodeFailed
@@ -675,20 +875,52 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	}()
 	_ = e.Sessions.Observe(agent.ID, agentsession.Observation{ProcessState: agentsession.ProcessRunning})
 	stopObserve := make(chan struct{})
-	observed := observeRuntimeEvents(stdoutPath, stopObserve, func(sessionID string) {
-		if sessionID == "" || sessionID == n.SessionID {
-			return
+	progress := &runtimeProgress{}
+	observed := observeRuntimeEventsWithProgress(stdoutPath, stopObserve, func(observation runtimeEventObservation) {
+		normalized := normalizeRuntimeEvent(observation.Event)
+		progress.record(observation.Event)
+		_ = e.Activities.ObserveNormalized(activityRecord.ID, activityRecord.Generation, activityAttempt.ID, observation.Event, normalized, observation.OutputBytes, observation.ObservedAt)
+		if sessionID := extractSessionID(observation.Line); sessionID != "" && sessionID != n.SessionID {
+			_, _ = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, Rationale: "persist runtime session identity before the process exits"})
+			_ = e.Sessions.Observe(agent.ID, agentsession.Observation{RuntimeSessionID: sessionID})
 		}
-		_, _ = e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: []core.Mutation{{Op: "set_session", NodeID: n.ID, Reason: sessionID}}, Rationale: "persist runtime session identity before the process exits"})
-		_ = e.Sessions.Observe(agent.ID, agentsession.Observation{RuntimeSessionID: sessionID})
 	})
+	startupStop := make(chan struct{})
+	startupDone := make(chan struct{})
+	startupStalled := make(chan struct{}, 1)
+	go func() {
+		defer close(startupDone)
+		grace := e.StartupGrace
+		if grace == 0 {
+			grace = activity.DefaultStartupGrace
+		}
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			if !progress.safeToRecover() {
+				return
+			}
+			startupStalled <- struct{}{}
+			_, _ = (&activity.Supervisor{Store: e.Activities}).StopExpected(activityRecord.ID, activity.ControlRequest{ExpectedGeneration: activityRecord.Generation, ExpectedAttempt: activityIdentity})
+		case <-startupStop:
+		}
+	}()
 	err = cmd.Wait()
 	close(stopOnContext)
+	close(startupStop)
+	<-startupDone
 	_ = e.Sessions.Observe(agent.ID, agentsession.Observation{ProcessState: agentsession.ProcessExited})
 	close(stopObserve)
 	<-observed
 	_ = stdout.Sync()
 	_ = stderr.Sync()
+	startupFailed := false
+	select {
+	case <-startupStalled:
+		startupFailed = true
+	default:
+	}
 	stdoutBytes, _ := os.ReadFile(stdoutPath)
 	stderrBytes, _ := os.ReadFile(stderrPath)
 	activityState := activity.StateCompleted
@@ -707,7 +939,7 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 			return e.failAgentAttempt(w, n, attempt, deliveryAttempt, "runtime_failure", "runtime deadline exceeded: "+ctx.Err().Error())
 		}
 		current, loadErr := e.Activities.Load(activityRecord.ID)
-		if loadErr != nil || (current.State != activity.StateCompleted && current.State != activity.StateFailed) {
+		if loadErr != nil || (current.State != activity.StateCompleted && current.State != activity.StateFailed && !(startupFailed && current.State == activity.StateStopped)) {
 			return nil
 		}
 		if current.State == activity.StateCompleted {
@@ -717,6 +949,9 @@ func (e *Engine) runAgent(ctx context.Context, w *core.Workflow, n *core.Node) e
 	}
 	if finishActivityErr != nil {
 		return finishActivityErr
+	}
+	if startupFailed || (err != nil && progress.preTurnFailure()) {
+		return e.handleAdapterStartupFailure(w, n, attempt, deliveryAttempt, activityRecord.ID, activityRecord.Generation, activityIdentity, string(stdoutBytes))
 	}
 	if err != nil {
 		failure := fmt.Sprintf("runtime failed: %v: %s %s", err, truncate(string(stderrBytes), 1000), truncate(string(stdoutBytes), 1000))
@@ -905,6 +1140,90 @@ func normalizeAttestation(a core.Attestation) core.Attestation {
 // Direct file descriptors matter: if the supervisor crashes, the child keeps
 // its descriptor and can finish emitting output instead of losing a Go pipe.
 func observeRuntimeEvents(path string, stop <-chan struct{}, onSession func(string)) <-chan struct{} {
+	return observeRuntimeEventsWithProgress(path, stop, func(observation runtimeEventObservation) {
+		if id := extractSessionID(observation.Line); id != "" {
+			onSession(id)
+		}
+	})
+}
+
+type runtimeEventObservation struct {
+	Line        []byte
+	Event       string
+	OutputBytes int64
+	ObservedAt  time.Time
+}
+
+type runtimeProgress struct {
+	mu                sync.Mutex
+	startupHandshake  bool
+	turnStarted       bool
+	sideEffectStarted bool
+}
+
+func (p *runtimeProgress) record(event string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if event == "turn.started" || event == "turn_started" {
+		p.turnStarted = true
+	}
+	if event == "thread.started" || strings.HasPrefix(event, "system") {
+		p.startupHandshake = true
+	}
+	if runtimeEventIsSideEffect(event) {
+		p.sideEffectStarted = true
+	}
+}
+
+func (p *runtimeProgress) safeToRecover() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.turnStarted && !p.sideEffectStarted
+}
+
+func (p *runtimeProgress) preTurnFailure() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.startupHandshake && !p.turnStarted && !p.sideEffectStarted
+}
+
+func runtimeEventIsSideEffect(event string) bool {
+	return event == "effect_started" || strings.Contains(event, "tool.started") || strings.Contains(event, "command.started") || strings.Contains(event, "side_effect")
+}
+
+func normalizeRuntimeEvent(event string) string {
+	switch {
+	case event == "thread.started" || strings.HasPrefix(event, "system") || event == "session.started":
+		return "session_started"
+	case event == "turn.started" || event == "turn_started":
+		return "turn_started"
+	case runtimeEventIsSideEffect(event):
+		return "effect_started"
+	case event == "provider.unavailable" || event == "provider_unavailable":
+		return "provider_unavailable"
+	case event == "adapter.start_failed" || event == "adapter_start_failed":
+		return "adapter_start_failed"
+	case event == "result":
+		return "result"
+	default:
+		return event
+	}
+}
+
+func runtimeEventName(line []byte) string {
+	var value map[string]any
+	if json.Unmarshal(line, &value) != nil {
+		return ""
+	}
+	for _, key := range []string{"type", "event", "event_type"} {
+		if event, ok := value[key].(string); ok {
+			return event
+		}
+	}
+	return ""
+}
+
+func observeRuntimeEventsWithProgress(path string, stop <-chan struct{}, onObservation func(runtimeEventObservation)) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -917,13 +1236,26 @@ func observeRuntimeEvents(path string, stop <-chan struct{}, onSession func(stri
 		pending := make([]byte, 0, 32<<10)
 		seen := false
 		stopping := false
+		var outputBytes int64
 		for {
 			n, readErr := f.Read(buf)
-			if n > 0 && !seen {
+			if n > 0 {
+				outputBytes += int64(n)
 				pending = append(pending, buf[:n]...)
-				if id := extractSessionID(pending); id != "" {
-					seen = true
-					onSession(id)
+				for {
+					index := bytes.IndexByte(pending, '\n')
+					if index < 0 {
+						break
+					}
+					line := append([]byte(nil), pending[:index]...)
+					pending = pending[index+1:]
+					if !seen && extractSessionID(line) != "" {
+						seen = true
+					}
+					onObservation(runtimeEventObservation{Line: line, Event: runtimeEventName(line), OutputBytes: outputBytes, ObservedAt: time.Now().UTC()})
+				}
+				if len(pending) > 0 {
+					onObservation(runtimeEventObservation{Line: append([]byte(nil), pending...), Event: runtimeEventName(pending), OutputBytes: outputBytes, ObservedAt: time.Now().UTC()})
 				}
 			}
 			if readErr != nil && !errors.Is(readErr, io.EOF) {
@@ -994,6 +1326,86 @@ func (e *Engine) routeAfterLimit(w *core.Workflow, n *core.Node, attempt, delive
 	}
 	_, err := e.Store.Apply(core.Proposal{WorkflowID: w.ID, Actor: "supervisor", Mutations: mutations, Rationale: "observable preference-ladder fallback"})
 	return err == nil
+}
+
+// handleAdapterStartupFailure is intentionally narrower than ordinary runtime
+// failure handling. It is called only after the watchdog observed no turn or
+// side effect and stopped the exact fenced Activity attempt. The task attempt
+// is refunded, while the adapter/provider startup evidence remains durable.
+func (e *Engine) handleAdapterStartupFailure(w *core.Workflow, n *core.Node, attempt, deliveryAttempt int, activityID string, generation uint64, identity activity.AttemptIdentity, rawOutput string) error {
+	tracked, err := e.Activities.Load(activityID)
+	if err != nil {
+		return err
+	}
+	currentAttempt, ok := currentActivityAttempt(tracked)
+	if !ok || tracked.Generation != generation || !sameActivityIdentity(activityIdentity(currentAttempt), identity) {
+		return activity.ErrFenced
+	}
+	if tracked.State == activity.StateStopped || tracked.State == activity.StateStopping {
+		if err = e.Activities.ReopenForRetry(activityID, generation, identity); err != nil {
+			return err
+		}
+	} else if tracked.State != activity.StateFailed {
+		return activity.ErrFenced
+	}
+	current, err := e.Store.Load(w.ID)
+	if err != nil {
+		return err
+	}
+	currentNode := current.Nodes[n.ID]
+	if currentNode == nil {
+		return errors.New("startup recovery node disappeared")
+	}
+	key := preferences.Key(currentNode.Runtime)
+	count := 0
+	for _, evidence := range current.Evidence {
+		if evidence.NodeID == currentNode.ID && evidence.Kind == "adapter_startup" && strings.Contains(evidence.Summary, key) {
+			count++
+		}
+	}
+	summary := fmt.Sprintf("adapter startup stalled for %s before turn.started; exact activity generation=%d attempt=%s was fenced and stopped: %s", key, generation, identity.ID, truncate(rawOutput, 500))
+	mutations := []core.Mutation{
+		{Op: "add_evidence", Evidence: &core.Evidence{ID: fmt.Sprintf("adapter-startup-%s-%d", currentNode.ID, attempt), NodeID: currentNode.ID, Kind: "adapter_startup", Summary: summary}},
+		attemptOutcomeMutation(currentNode, attempt, deliveryAttempt, "adapter_startup", "requeue", summary),
+		{Op: "refund_attempt", NodeID: currentNode.ID},
+	}
+	if currentNode.SessionID == "" || count >= maxAdapterStartupAttempts {
+		if currentNode.SessionID == "" {
+			summary = "adapter startup failed before an exact runtime session identity was persisted; automatic recovery is disabled"
+		} else {
+			summary = fmt.Sprintf("adapter startup failed %d times for %s; automatic recovery is capped and human review is required", count+1, key)
+		}
+		mutations[0].Evidence.Summary = summary
+		mutations = append(mutations, core.Mutation{Op: "set_state", NodeID: currentNode.ID, State: core.NodeFailed})
+	} else {
+		if e.Preferences != nil {
+			if err = e.Preferences.Record(currentNode.Runtime, "adapter_startup", summary); err != nil {
+				return err
+			}
+			next, index, routeErr := e.Preferences.Resolve(currentNode.Role, currentNode.Runtime)
+			if routeErr == nil && preferences.Key(next) != key {
+				mutations = append(mutations, core.Mutation{Op: "set_runtime", NodeID: currentNode.ID, Runtime: &next, CandidateIndex: index})
+			}
+		}
+		mutations = append(mutations, core.Mutation{Op: "set_state", NodeID: currentNode.ID, State: core.NodeReady})
+	}
+	_, err = e.Store.Apply(core.Proposal{WorkflowID: current.ID, Actor: "supervisor", Mutations: mutations, Rationale: "fenced pre-turn adapter startup recovery"})
+	return err
+}
+
+func currentActivityAttempt(tracked *activity.Activity) (activity.Attempt, bool) {
+	if tracked == nil || len(tracked.Attempts) == 0 {
+		return activity.Attempt{}, false
+	}
+	return tracked.Attempts[len(tracked.Attempts)-1], true
+}
+
+func activityIdentity(attempt activity.Attempt) activity.AttemptIdentity {
+	return activity.AttemptIdentity{ID: attempt.ID, PID: attempt.PID, ProcessStartToken: attempt.ProcessStartToken, ProcessTreeID: attempt.ProcessTreeID, SupervisorID: attempt.SupervisorID, SupervisorGeneration: attempt.SupervisorGeneration}
+}
+
+func sameActivityIdentity(left, right activity.AttemptIdentity) bool {
+	return left.ID == right.ID && left.PID == right.PID && left.ProcessStartToken == right.ProcessStartToken && left.ProcessTreeID == right.ProcessTreeID && left.SupervisorID == right.SupervisorID && left.SupervisorGeneration == right.SupervisorGeneration
 }
 
 func attemptOutcomeMutation(n *core.Node, attempt, deliveryAttempt int, outcome, disposition, summary string) core.Mutation {

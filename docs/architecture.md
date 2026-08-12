@@ -118,6 +118,47 @@ or skipping bytes. The prior-art evidence and license boundary are in
 recorded in
 [`ADR 0001`](adr/0001-separate-sessions-and-activities.md).
 
+The operator-facing join is a rolling projection over the workflow, Session,
+and Activity reducers. It exposes process liveness separately from useful
+runtime progress: last output, last meaningful runtime event, turn-start time,
+and a bounded `stalled_startup` condition are visible identically through
+status, agents, activities, list, JSON, and the TUI. After `turn.started`, quiet
+and stalled output are attention conditions only. Active Activities are
+assessed every ten minutes by default; assessment is durable guidance except
+for the explicitly bounded pre-turn startup recovery below.
+
+When a runtime emits a startup handshake such as `thread.started` but no
+`turn.started` within the startup grace window, the supervisor may stop only
+the exact Activity generation and Attempt identity. Recovery resumes the exact
+persisted runtime session, refunds the task attempt, applies a durable
+backoff, and caps adapter/provider startup failures. A turn or side-effect
+event disables this automatic path; auth, code, test, and ordinary runtime
+failures keep their existing routing.
+
+The scheduler uses the control-plane settlement predicate rather than treating
+`node.state == completed` as sufficient: the accepted result must have no
+queued or dispatched inbox batch and no active Activity. This compensates for
+the crash window between completion and message delivery and makes the
+deferred dependency reason visible in the canonical projection. Write-capable
+turns also hold a durable global lease keyed by the canonical worktree and
+owned by the exact workflow/node launch; the lease prevents concurrent writers
+across workflows and is never used to bypass verification or authority gates.
+
+ADR 0003 records the ControlPlane/Execution checkpoint and one-way migration
+boundary for normalized runtime events and legacy ledgers.
+
+The projection also derives orchestration overhead from the same ledgers. Its
+nullable observed measurements include total wall time, active attempt time,
+dependency and scheduler-queue wait, finalizer polling wait, retries and exact
+session resumptions, verifier and repair time, and digest-only duplicate
+commands/checks. A null means the relevant evidence is absent; zero is emitted
+only after the measurement boundary is known. Concurrent useful intervals are
+unioned for a wall-clock comparison; uncertain token usage is omitted. Human
+and JSON status/list output includes concise evidence-based guidance, while
+`handoff explain` provides a stateless contract choice model so users can
+select the lightest durable coordination contract that still meets reply,
+evaluator, peer, replay, or authority requirements.
+
 The ledger root is a supervisor-private trust boundary and must remain outside
 worker-writable sandboxes. Descriptor-relative opens, ownership/mode checks,
 single-link regular files, pinned identities, locks, fsync, and replay repair

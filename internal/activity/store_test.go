@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestActivityAttemptOutputAndFencedStopSurviveSnapshotLoss(t *testing.T) {
@@ -197,6 +198,88 @@ func TestPrepareAttemptRecoversOrphanBlobsBeforePreparedEvent(t *testing.T) {
 		if statErr != nil || info.Size() != 0 {
 			t.Fatalf("orphan blob was not replaced: path=%s info=%+v err=%v", path, info, statErr)
 		}
+	}
+}
+
+func TestAssessmentPersistsProgressAndStallClassificationAcrossReplay(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, _ := OpenStore(state)
+	created, err := store.Create(Descriptor{ID: "activity_abcdefabcdefabcdefabcdef", Work: WorkSpec{Kind: "agent", Cwd: t.TempDir()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, stdout, stderr, err := store.PrepareAttempt(created.ID, created.Generation, AttemptStart{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = stdout.WriteString("meaningful output"); err != nil {
+		t.Fatal(err)
+	}
+	_ = stdout.Close()
+	_ = stderr.Close()
+	if _, err = store.MarkRunning(created.ID, created.Generation, attempt.ID, ProcessIdentity{PID: 42, ProcessStartToken: "birth", SupervisorID: "sup", SupervisorGeneration: 1}); err != nil {
+		t.Fatal(err)
+	}
+	first := attempt.StartedAt.Add(time.Minute)
+	assessed, err := store.Assess(created.ID, first, DefaultQuietAfter, DefaultStalledAfter)
+	if err != nil || assessed.ProgressState != ProgressActive {
+		t.Fatalf("first assessment=%+v err=%v", assessed, err)
+	}
+	assessed, err = store.Assess(created.ID, first.Add(DefaultStalledAfter+time.Minute), DefaultQuietAfter, DefaultStalledAfter)
+	if err != nil || assessed.ProgressState != ProgressStalled {
+		t.Fatalf("stalled assessment=%+v err=%v", assessed, err)
+	}
+	if err = os.Remove(filepath.Join(state, "activities", created.ID, "state.json")); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := store.Load(created.ID)
+	if err != nil || replayed.ProgressState != ProgressStalled || replayed.LastProgressAt.IsZero() {
+		t.Fatalf("replayed assessment=%+v err=%v", replayed, err)
+	}
+}
+
+func TestStartupStallTracksRuntimeEventAndReplay(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.Create(Descriptor{ID: "activity_121212121212121212121212", Work: WorkSpec{Kind: "agent", Cwd: "/tmp"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, stdout, stderr, err := store.PrepareAttempt(created.ID, created.Generation, AttemptStart{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stdout.Close()
+	_ = stderr.Close()
+	attempt, err = store.MarkRunning(created.ID, created.Generation, attempt.ID, ProcessIdentity{PID: 77, ProcessStartToken: "startup", SupervisorID: "sup", SupervisorGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	threadStarted := attempt.StartedAt.Add(time.Second)
+	if err = store.ObserveRuntime(created.ID, created.Generation, attempt.ID, "thread.started", 42, threadStarted); err != nil {
+		t.Fatal(err)
+	}
+	assessed, err := store.Assess(created.ID, attempt.StartedAt.Add(DefaultStartupGrace+time.Second), DefaultQuietAfter, DefaultStalledAfter)
+	if err != nil || assessed.ProgressState != ProgressStalledStartup || assessed.LastRuntimeEvent != "thread.started" || assessed.LastOutputBytes != 42 {
+		t.Fatalf("startup assessment=%+v err=%v", assessed, err)
+	}
+	turnStarted := threadStarted.Add(time.Second)
+	if err = store.ObserveRuntime(created.ID, created.Generation, attempt.ID, "turn.started", 84, turnStarted); err != nil {
+		t.Fatal(err)
+	}
+	quiet, err := store.Assess(created.ID, turnStarted.Add(DefaultStalledAfter+time.Second), DefaultQuietAfter, DefaultStalledAfter)
+	if err != nil || quiet.ProgressState != ProgressStalled || quiet.ProgressState == ProgressStalledStartup {
+		t.Fatalf("post-turn quiet work was misclassified or auto-startup-stopped: %+v err=%v", quiet, err)
+	}
+	replayed, err := store.Load(created.ID)
+	if err != nil || replayed.TurnStartedAt.IsZero() || replayed.LastRuntimeEvent != "turn.started" || replayed.LastProgressAt != turnStarted {
+		t.Fatalf("runtime replay=%+v err=%v", replayed, err)
 	}
 }
 

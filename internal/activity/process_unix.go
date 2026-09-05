@@ -4,6 +4,7 @@ package activity
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -39,7 +40,7 @@ func (w *processTreeWatchdog) complete() error {
 	writeErr := json.NewEncoder(w.gate).Encode(watchdogRequest{})
 	closeErr := w.gate.Close()
 	waitErr := w.command.Wait()
-	return errorsJoin(writeErr, closeErr, waitErr)
+	return errors.Join(writeErr, closeErr, waitErr)
 }
 
 func runProcessTreeWatchdog(input io.Reader) {

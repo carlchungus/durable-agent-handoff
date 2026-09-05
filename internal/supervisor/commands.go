@@ -15,21 +15,23 @@ import (
 )
 
 type StartExecutionInput struct {
-	NativeSession       NativeSessionIdentity `json:"native_session"`
-	Prompt              string                `json:"prompt"`
-	Goal                string                `json:"goal,omitempty"`
-	Runtime             RuntimeSpec           `json:"runtime"`
-	Fallbacks           []RuntimeSpec         `json:"fallbacks,omitempty"`
-	Role                string                `json:"role,omitempty"`
-	Root                string                `json:"root"`
-	Authority           AuthoritySpec         `json:"authority"`
-	Finalizer           FinalizerSpec         `json:"finalizer"`
-	Budget              Budget                `json:"budget"`
-	EvaluatorModel      string                `json:"evaluator_model,omitempty"`
-	MaxTurns            int                   `json:"max_turns,omitempty"`
-	WakeIntervalSeconds int64                 `json:"wake_interval_seconds,omitempty"`
-	PrepareCommand      string                `json:"prepare_command,omitempty"`
-	IdempotencyKey      string                `json:"-"`
+	NativeSession              NativeSessionIdentity `json:"native_session"`
+	Prompt                     string                `json:"prompt"`
+	Goal                       string                `json:"goal,omitempty"`
+	Runtime                    RuntimeSpec           `json:"runtime"`
+	Fallbacks                  []RuntimeSpec         `json:"fallbacks,omitempty"`
+	Role                       string                `json:"role,omitempty"`
+	Root                       string                `json:"root"`
+	Authority                  AuthoritySpec         `json:"authority"`
+	Finalizer                  FinalizerSpec         `json:"finalizer"`
+	Budget                     Budget                `json:"budget"`
+	EvaluatorModel             string                `json:"evaluator_model,omitempty"`
+	MaxTurns                   int                   `json:"max_turns,omitempty"`
+	WakeIntervalSeconds        int64                 `json:"wake_interval_seconds,omitempty"`
+	Mode                       ExecutionMode         `json:"mode,omitempty"`
+	SupervisionIntervalSeconds int64                 `json:"supervision_interval_seconds,omitempty"`
+	PrepareCommand             string                `json:"prepare_command,omitempty"`
+	IdempotencyKey             string                `json:"-"`
 }
 
 type startExecutionCommand struct{ Input StartExecutionInput }
@@ -41,6 +43,9 @@ func (c startExecutionCommand) digest() (string, error) {
 }
 
 func (s *Store) StartExecution(ctx context.Context, input StartExecutionInput) (*Execution, Receipt, error) {
+	if input.Mode == "" {
+		input.Mode = ExecutionModeTurn
+	}
 	canonical, err := canonicalDirectory(input.Root)
 	if err != nil {
 		return nil, Receipt{}, err
@@ -95,7 +100,7 @@ func (c startExecutionCommand) decide(state *State, now time.Time) ([]DomainEven
 	activityID := ActivityID(stableID("activity", in.IdempotencyKey+"/1"))
 	digest, _ := c.digest()
 	workflow := &Workflow{
-		ID: workflowID, Root: in.Root, Role: in.Role, Authority: in.Authority, Finalizer: in.Finalizer, Budget: in.Budget, EvaluatorModel: in.EvaluatorModel, MaxTurns: in.MaxTurns, WakeIntervalSeconds: in.WakeIntervalSeconds,
+		ID: workflowID, Root: in.Root, Role: in.Role, Authority: in.Authority, Finalizer: in.Finalizer, Budget: in.Budget, EvaluatorModel: in.EvaluatorModel, MaxTurns: in.MaxTurns, WakeIntervalSeconds: in.WakeIntervalSeconds, Mode: in.Mode, SupervisionIntervalSeconds: in.SupervisionIntervalSeconds,
 		Nodes: map[NodeID]*Node{}, CreatedAt: now,
 	}
 	title := in.Goal
@@ -146,6 +151,23 @@ func validateStartInput(in StartExecutionInput) error {
 	if in.Budget.MaxTaskAttempts < 1 || in.Budget.MaxLaunches < in.Budget.MaxTaskAttempts {
 		return errors.New("budget requires positive task attempts and at least as many OS launches")
 	}
+	if in.Mode == "" {
+		in.Mode = ExecutionModeTurn
+	}
+	if in.Mode != ExecutionModeTurn && in.Mode != ExecutionModeSession {
+		return fmt.Errorf("unsupported execution mode %q", in.Mode)
+	}
+	if in.SupervisionIntervalSeconds < 0 {
+		return errors.New("supervision interval must not be negative")
+	}
+	if in.Mode == ExecutionModeSession {
+		if strings.TrimSpace(in.Goal) != "" || strings.TrimSpace(in.EvaluatorModel) != "" || in.MaxTurns != 0 || in.WakeIntervalSeconds != 0 {
+			return errors.New("session mode cannot combine goal, evaluator, turn limit, or wake interval")
+		}
+	}
+	if in.Mode == ExecutionModeTurn && in.SupervisionIntervalSeconds != 0 {
+		return errors.New("supervision interval requires session mode")
+	}
 	if strings.TrimSpace(in.EvaluatorModel) != "" {
 		if strings.TrimSpace(in.Goal) == "" || in.MaxTurns < 0 || in.WakeIntervalSeconds < 0 {
 			return errors.New("a goal requires its text and evaluator model; max turns and wake interval must be zero or positive")
@@ -190,6 +212,17 @@ func validateRuntime(runtime RuntimeSpec) error {
 	}
 	if runtime.Sandbox != SandboxReadOnly && runtime.Sandbox != SandboxWorkspaceWrite {
 		return fmt.Errorf("unsupported runtime sandbox %q", runtime.Sandbox)
+	}
+	if strings.TrimSpace(runtime.Arguments) != "" {
+		var arguments []string
+		if err := json.Unmarshal([]byte(runtime.Arguments), &arguments); err != nil {
+			return fmt.Errorf("runtime arguments must be a JSON array: %w", err)
+		}
+		for _, argument := range arguments {
+			if strings.ContainsRune(argument, '\x00') {
+				return errors.New("runtime arguments cannot contain NUL")
+			}
+		}
 	}
 	return nil
 }
@@ -334,7 +367,7 @@ func FindFallbackActivity(state *State, parent ActivityID, runtime RuntimeSpec) 
 }
 
 func runtimeSpecKey(runtime RuntimeSpec) string {
-	return strings.Join([]string{runtime.Name, runtime.Executable, runtime.Model, runtime.Effort, string(runtime.Sandbox)}, "\x00")
+	return strings.Join([]string{runtime.Name, runtime.Executable, runtime.Model, runtime.Effort, string(runtime.Sandbox), runtime.Arguments}, "\x00")
 }
 
 type AddNodeInput struct {
@@ -686,6 +719,24 @@ func (c recordMilestoneCommand) decide(state *State, now time.Time) ([]DomainEve
 			events = append(events, mustEvent(eventResultCreated, resultCreatedEvent{Result: result}))
 		}
 		events = append(events, settleMessages(state, activity.ID, attempt.ID, true, now)...)
+	}
+	if m.Kind == MilestoneExit && resultForActivity(state, activity.ID) == nil {
+		workflow := state.Workflows[activity.WorkflowID]
+		if workflow != nil && workflow.Mode == ExecutionModeSession {
+			status := "completed"
+			summary := "Harness exited successfully"
+			if m.Exit != nil && m.Exit.Code != 0 {
+				status = "blocked"
+				summary = fmt.Sprintf("Harness exited with code %d", m.Exit.Code)
+			}
+			for _, prior := range attempt.Milestones {
+				if prior.Kind == MilestoneMeaningfulProgress && strings.TrimSpace(prior.Progress) != "" {
+					summary = prior.Progress
+				}
+			}
+			result := &Result{ID: ResultID(stableID("result", string(activity.ID))), WorkflowID: activity.WorkflowID, NodeID: activity.NodeID, ActivityID: activity.ID, AttemptID: attempt.ID, Generation: activity.Generation, Status: status, Summary: summary, CreatedAt: now}
+			events = append(events, mustEvent(eventResultCreated, resultCreatedEvent{Result: result}))
+		}
 	}
 	if terminal {
 		if m.Kind != MilestoneExit || resultForActivity(state, activity.ID) == nil {
@@ -1235,7 +1286,7 @@ func runtimeAllowed(work WorkSpec, wanted RuntimeSpec) bool {
 }
 
 func sameRuntime(a, b RuntimeSpec) bool {
-	return a.Name == b.Name && a.Executable == b.Executable && a.Model == b.Model && a.Effort == b.Effort && a.Sandbox == b.Sandbox
+	return a.Name == b.Name && a.Executable == b.Executable && a.Model == b.Model && a.Effort == b.Effort && a.Sandbox == b.Sandbox && a.Arguments == b.Arguments
 }
 
 func hasProviderUnavailable(attempt *Attempt) bool {

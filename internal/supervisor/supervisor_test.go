@@ -284,7 +284,7 @@ func TestSupervisorLiveOrphanHelper(t *testing.T) {
 	}
 }
 
-func TestStartupReconcileFailsClosedForExactLiveOrphan(t *testing.T) {
+func TestStartupReconcileReturnsExactLiveOrphanForAdoption(t *testing.T) {
 	ready := filepath.Join(t.TempDir(), "live-orphan-ready")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestSupervisorLiveOrphanHelper$")
 	cmd.Env = append(os.Environ(), "HANDOFF_TEST_LIVE_ORPHAN_HELPER=1", "HANDOFF_TEST_LIVE_ORPHAN_READY="+ready)
@@ -322,8 +322,12 @@ func TestStartupReconcileFailsClosedForExactLiveOrphan(t *testing.T) {
 	if !processidentity.ProcessMatches(cmd.Process.Pid, token) {
 		t.Fatal("live orphan helper lost its exact identity before reconciliation")
 	}
-	if err := store.ReconcileStartup(context.Background()); !errors.Is(err, ErrLiveOrphan) {
-		t.Fatalf("exact live orphan did not fail closed: %v", err)
+	if err := store.ReconcileStartup(context.Background()); err != nil {
+		t.Fatalf("exact live orphan reconciliation failed: %v", err)
+	}
+	live, err := store.LiveAttemptIDs()
+	if err != nil || len(live) != 1 || live[0] != attempt.ID {
+		t.Fatalf("exact live orphan was not returned for adoption: live=%v err=%v", live, err)
 	}
 	state, err = store.Projection()
 	if err != nil {
@@ -334,7 +338,7 @@ func TestStartupReconcileFailsClosedForExactLiveOrphan(t *testing.T) {
 	}
 	view, err := store.View(execution.ID, time.Now())
 	if err != nil || len(view.Queue) != 0 {
-		t.Fatalf("live orphan was schedulable after fail-closed recovery: view=%+v err=%v", view, err)
+		t.Fatalf("live orphan was schedulable during adoption: view=%+v err=%v", view, err)
 	}
 }
 

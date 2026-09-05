@@ -42,6 +42,11 @@ type ServeOptions struct {
 	// Evaluator is the fresh, tool-less model that decides a completed turn. Production
 	// callers leave it nil to use OpenRouter from the transient environment.
 	Evaluator evaluator.Evaluator
+	// DetachActive keeps exact live harness processes running when this service
+	// instance is stopped or restarted. The next instance adopts them by their
+	// durable process identity. It is false for embedders that require the old
+	// graceful-drain behavior.
+	DetachActive bool
 }
 
 // ServeV2 reconciles inherited Attempts once before scheduling queued
@@ -88,9 +93,41 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 	activityRetryAt := map[supervisor.ActivityID]time.Time{}
 	activeDecisions := map[supervisor.ActivityID]bool{}
 	decisionRetryAt := map[supervisor.ActivityID]time.Time{}
+	lastQuietCheck := map[supervisor.WorkflowID]time.Time{}
+	runner := &executor.Executor{Store: store, OutputRoot: options.OutputRoot, Drivers: driver.Lookup, Environment: options.Environment, TrustMode: options.TrustMode, StartupDeadline: options.StartupDeadline}
+	if liveAttempts, liveErr := store.LiveAttemptIDs(); liveErr != nil {
+		return liveErr
+	} else {
+		for _, attemptID := range liveAttempts {
+			id := attemptID
+			adopt := func() {
+				if err := runner.AdoptAttempt(context.Background(), id); err != nil && logf != nil && !errors.Is(err, supervisor.ErrFenced) {
+					logf("attempt=%s adoption_error=%v", id, err)
+				}
+			}
+			if options.DetachActive {
+				go adopt()
+			} else {
+				activeWorkers.Add(1)
+				go func() {
+					defer activeWorkers.Done()
+					adopt()
+				}()
+			}
+		}
+	}
+	// A runner can exit in the small interval between the first reconciliation
+	// and the live-attempt read. Recheck before scheduling so that race becomes
+	// durable recovery rather than a permanently orphaned queue item.
+	if err := store.ReconcileStartup(ctx); err != nil {
+		return err
+	}
 	run := func() {
 		if ctx.Err() != nil {
 			return
+		}
+		if err := quietSessionCheck(store, lastQuietCheck, time.Now().UTC()); err != nil && logf != nil {
+			logf("quiet_supervision_error=%v", err)
 		}
 		views, err := supervisorViews(store)
 		if err != nil {
@@ -202,11 +239,14 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 						mu.Unlock()
 					}()
 					var runErr error
+					runContext := ctx
+					if options.DetachActive {
+						runContext = context.Background()
+					}
 					if options.RunActivity != nil {
-						runErr = options.RunActivity(ctx, id)
+						runErr = options.RunActivity(runContext, id)
 					} else {
-						runner := &executor.Executor{Store: store, OutputRoot: options.OutputRoot, Drivers: driver.Lookup, Environment: options.Environment, TrustMode: options.TrustMode, StartupDeadline: options.StartupDeadline}
-						runErr = runner.RunActivity(ctx, id)
+						runErr = runner.RunActivity(runContext, id)
 					}
 					if runErr != nil && logf != nil {
 						failed = true
@@ -224,12 +264,41 @@ func ServeV2(ctx context.Context, store *supervisor.Store, options ServeOptions,
 	for {
 		select {
 		case <-ctx.Done():
-			activeWorkers.Wait()
+			if !options.DetachActive {
+				activeWorkers.Wait()
+			}
 			return nil
 		case <-ticker.C:
 			run()
 		}
 	}
+}
+
+// quietSessionCheck is intentionally a read/reconcile boundary, not another
+// agent turn. Once per configured session cadence it rechecks exact process
+// identities and terminalizes only dead attempts, which lets the normal queue
+// make progress. A live attempt is left entirely alone: no prompt, signal, or
+// evaluator call is emitted.
+func quietSessionCheck(store *supervisor.Store, last map[supervisor.WorkflowID]time.Time, now time.Time) error {
+	state, err := store.Projection()
+	if err != nil {
+		return err
+	}
+	due := false
+	for workflowID, workflow := range state.Workflows {
+		if workflow.Mode != supervisor.ExecutionModeSession || workflow.SupervisionIntervalSeconds <= 0 {
+			continue
+		}
+		previous := last[workflowID]
+		if previous.IsZero() || !now.Before(previous.Add(time.Duration(workflow.SupervisionIntervalSeconds)*time.Second)) {
+			last[workflowID] = now
+			due = true
+		}
+	}
+	if !due {
+		return nil
+	}
+	return store.ReconcileStartup(context.Background())
 }
 
 func turnDecisionRequest(state *supervisor.State, activityID supervisor.ActivityID) (evaluator.Request, supervisor.AttemptID, uint64, error) {

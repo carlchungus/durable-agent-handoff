@@ -22,6 +22,10 @@ type LaunchRequest struct {
 	SchemaPath string
 	ResultPath string
 	TrustMode  TrustMode
+	// SessionMode leaves the harness in its native, terminal-like protocol. In
+	// this mode handoff records process/output facts but does not append a
+	// mandatory structured completion contract.
+	SessionMode bool
 }
 
 type TrustMode string
@@ -63,7 +67,13 @@ func Lookup(name string) (Driver, error) {
 	case "pi":
 		return Pi{}, nil
 	default:
-		return nil, fmt.Errorf("unsupported runtime driver %q", name)
+		if strings.TrimSpace(name) == "" {
+			return nil, errors.New("runtime driver name is required")
+		}
+		// Unknown names use the deliberately small line-oriented adapter. This
+		// keeps the durable process/session layer harness-neutral; a harness can
+		// opt into richer native resume semantics by adding a named Driver later.
+		return Generic{NameValue: name}, nil
 	}
 }
 
@@ -102,8 +112,17 @@ Supervisor completion contract: after performing the requested work, emit exactl
 {"status":"completed|continue|needs_human|blocked","summary":"concise outcome","blocker_kind":"","question":""}
 Use continue when this turn or candidate is finished but the objective remains actionable. Assume the human is unavailable while an unattended goal is running. Use needs_human only when indispensable authority or information blocks the entire workflow and no safe partial result can be published; fill blocker_kind plus one concrete question. Missing optional verification, external CI, or production-browser access must downgrade confidence rather than suppress useful output. When GitHub publication is authorized, publish an honest draft PR with verification limits instead of waiting for optional evidence. Once a PR is handed to repository automation, do not idle waiting for it to merge when independent work remains. A plan, progress update, or promise is not a terminal result. Continue using tools until the work is actually complete, should continue in another turn, or has a concrete workflow-wide blocker.`
 
-func promptForRuntime(_ string, prompt string) string {
+func promptForRuntime(_ string, prompt string, includeContract bool) string {
+	if !includeContract {
+		return prompt
+	}
 	return strings.TrimRight(prompt, "\n") + completionContract
+}
+
+// SessionModeDecoder lets the executor restore the native terminal-like
+// protocol without changing the public Decoder interface used by extensions.
+type SessionModeDecoder interface {
+	SetSessionMode(bool)
 }
 
 func validateLaunch(request LaunchRequest, runtime string) error {

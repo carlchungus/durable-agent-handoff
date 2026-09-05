@@ -33,10 +33,14 @@ func run(args []string, out, _ io.Writer) error {
 		return cmdV2Start(args[1:], out)
 	case "goal":
 		return cmdV2Goal(args[1:], out)
+	case "session":
+		return cmdV2Session(args[1:], out)
 	case "execution":
 		return cmdExecution(args[1:], out)
 	case "status":
 		return cmdV2Status(args[1:], out)
+	case "tail":
+		return cmdV2Tail(args[1:], out)
 	case "list":
 		return cmdV2List(args[1:], out)
 	case "events":
@@ -156,11 +160,13 @@ func jsonEncoder(out io.Writer) *json.Encoder {
 const usage = `handoff — Supervisor v2 durable execution
 
 Usage:
+  handoff session start [--runtime codex|claude|pi|grok|muse] [--root DIR] [--file -] [--check-interval 20m]
   handoff goal start --goal GOAL --runtime codex --file - --idempotency-key KEY --authorized-by HUMAN [--wake-interval 10m]
   handoff start [--session EXACT_ID] --runtime codex --file - --idempotency-key KEY --authorized-by HUMAN [--finalizer-enabled --required-check NAME --require-human]
   handoff execution start --file - --json [runs as a goal by default; set one_shot=true to opt out]
   handoff execution pause --workflow ID --timeout 30s --json
   handoff status [EXECUTION_ID] [--json]
+  handoff tail SESSION_OR_EXECUTION [--lines 40] [--follow] [--stderr]
   handoff list [--all] [--watch 30s] [--json]
   handoff run WORKFLOW_ID [--once]
   handoff serve [--environment-json FILE] [--trust-mode workspace|full]

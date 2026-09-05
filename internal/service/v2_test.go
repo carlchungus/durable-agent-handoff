@@ -129,6 +129,106 @@ func TestServeV2GracefulCancellationDrainsActiveExecutor(t *testing.T) {
 	}
 }
 
+func TestServeV2DetachActiveLeavesHarnessWorkRunningAcrossRestart(t *testing.T) {
+	stateRoot, worktree, outputRoot := t.TempDir(), t.TempDir(), t.TempDir()
+	for _, path := range []string{stateRoot, worktree, outputRoot} {
+		if err := os.Chmod(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := supervisor.Open(stateRoot, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.StartExecution(context.Background(), supervisor.StartExecutionInput{
+		NativeSession: supervisor.NativeSessionIdentity{Runtime: "test", ID: "detached-session"},
+		Prompt:        "stay alive", Runtime: supervisor.RuntimeSpec{Name: "test", Sandbox: supervisor.SandboxWorkspaceWrite}, Root: worktree,
+		Authority: supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite}, Budget: supervisor.DefaultBudget(), IdempotencyKey: "detach-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeV2(ctx, store, ServeOptions{
+			Interval: 100 * time.Millisecond, Workers: 1, OutputRoot: outputRoot, DetachActive: true,
+			RunActivity: func(runContext context.Context, _ supervisor.ActivityID) error {
+				close(started)
+				<-release
+				if runContext == ctx {
+					return errors.New("detached work inherited the service context")
+				}
+				return nil
+			},
+		}, nil)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("detached executor did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("detached service did not return on cancellation")
+	}
+	close(release)
+}
+
+func TestQuietSessionCheckIsCadencedAndReadOnlyWhenNothingIsDead(t *testing.T) {
+	stateRoot, worktree := t.TempDir(), t.TempDir()
+	for _, path := range []string{stateRoot, worktree} {
+		if err := os.Chmod(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := supervisor.Open(stateRoot, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = store.StartExecution(context.Background(), supervisor.StartExecutionInput{
+		NativeSession: supervisor.NativeSessionIdentity{Runtime: "grok"}, Prompt: "quiet check", Runtime: supervisor.RuntimeSpec{Name: "grok", Sandbox: supervisor.SandboxWorkspaceWrite}, Root: worktree,
+		Mode: supervisor.ExecutionModeSession, SupervisionIntervalSeconds: 1200,
+		Authority: supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite}, Budget: supervisor.DefaultBudget(), IdempotencyKey: "quiet-check-start",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := state.Sequence
+	last := map[supervisor.WorkflowID]time.Time{}
+	now := time.Unix(100, 0).UTC()
+	if err := quietSessionCheck(store, last, now); err != nil {
+		t.Fatal(err)
+	}
+	state, err = store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(last) != 1 || state.Sequence != before {
+		t.Fatalf("quiet check mutated the journal or omitted cadence state: last=%v state=%d before=%d", last, state.Sequence, before)
+	}
+	if err := quietSessionCheck(store, last, now.Add(10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	state, err = store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Sequence != before {
+		t.Fatalf("quiet check ran before its configured interval: after=%d before=%d", state.Sequence, before)
+	}
+}
+
 func TestServeV2DecidesTurnBeforeSchedulingContinuation(t *testing.T) {
 	stateRoot, worktree, outputRoot := t.TempDir(), t.TempDir(), t.TempDir()
 	for _, path := range []string{stateRoot, worktree, outputRoot} {

@@ -106,13 +106,3 @@ func fmtInt(value int) string {
 	}
 	return string(digits[i:])
 }
-
-func errorsJoin(values ...error) error {
-	var first error
-	for _, value := range values {
-		if value != nil && first == nil {
-			first = value
-		}
-	}
-	return first
-}

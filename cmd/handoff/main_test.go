@@ -116,6 +116,91 @@ func TestGoalStartKeepsRunningByConstruction(t *testing.T) {
 	}
 }
 
+func TestSessionStartIsSimpleHarnessNeutralAndStatusAcceptsSessionID(t *testing.T) {
+	state, root := t.TempDir(), t.TempDir()
+	if err := os.Chmod(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	err := runWithPrompt(t, []string{"session", "start", "--state", state, "--root", root, "--runtime", "grok", "--executable", "/opt/grok", "--arg=--headless", "--arg=--quiet", "--file", "-", "--check-interval", "20m", "--json"}, "work overnight", &out, &errOut)
+	if err != nil {
+		t.Fatalf("session start: %v stderr=%s", err, errOut.String())
+	}
+	var response ordinaryStartResponse
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	store, err := supervisor.Open(state, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := projection.Workflows[response.Execution.WorkflowID]
+	if workflow.Mode != supervisor.ExecutionModeSession || workflow.SupervisionIntervalSeconds != 1200 || workflow.EvaluatorModel != "" || workflow.Finalizer.Enabled {
+		t.Fatalf("unexpected session workflow: %+v", workflow)
+	}
+	node := workflow.Nodes[response.Execution.RootNodeID]
+	if node.Work.Runtime.Name != "grok" || node.Work.Runtime.Executable != "/opt/grok" || node.Work.Runtime.Arguments != `["--headless","--quiet"]` {
+		t.Fatalf("generic harness launch spec was not persisted: %+v", node.Work.Runtime)
+	}
+	out.Reset()
+	if err := run([]string{"status", string(response.Execution.SessionID), "--state", state, "--json"}, &out, &errOut); err != nil {
+		t.Fatalf("status by session: %v", err)
+	}
+	var status supervisor.ExecutionView
+	if err := json.Unmarshal(out.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.ID != response.Execution.ID || status.SessionID != response.Execution.SessionID || status.Runtime.Name != "grok" || status.Mode != supervisor.ExecutionModeSession {
+		t.Fatalf("status omitted session-first identity: %+v", status)
+	}
+}
+
+func TestTailReadsLatestAttemptOutputBySessionID(t *testing.T) {
+	state, root := t.TempDir(), t.TempDir()
+	if err := os.Chmod(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if err := runWithPrompt(t, []string{"session", "start", "--state", state, "--root", root, "--runtime", "muse", "--file", "-", "--json"}, "tail this", &out, &errOut); err != nil {
+		t.Fatalf("session start: %v stderr=%s", err, errOut.String())
+	}
+	var response ordinaryStartResponse
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	store, err := supervisor.Open(state, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputRoot := filepath.Join(state, "supervisor-v2", "outputs")
+	if err := os.MkdirAll(outputRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stdoutPath := filepath.Join(outputRoot, "tail.stdout.log")
+	if err := os.WriteFile(stdoutPath, []byte("old line\nlatest line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projection, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	activity := projection.Activities[response.Execution.FirstActivity]
+	if _, _, err = store.PrepareAttempt(context.Background(), supervisor.PrepareAttemptInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, Runtime: supervisor.RuntimeSpec{Name: "muse", Sandbox: supervisor.SandboxWorkspaceWrite}, CommandDigest: "tail-command", Outputs: supervisor.OutputIdentity{Stdout: "tail-stdout", Stderr: "tail-stderr", StdoutPath: stdoutPath}, IdempotencyKey: "tail-attempt"}); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"tail", string(response.Execution.SessionID), "--state", state, "--lines", "1"}, &out, &errOut); err != nil {
+		t.Fatalf("tail: %v", err)
+	}
+	if !strings.Contains(out.String(), "latest line") || strings.Contains(out.String(), "old line") {
+		t.Fatalf("tail did not return the requested transcript window: %q", out.String())
+	}
+}
+
 func TestOrdinaryStartPersistsAdvertisedFinalizerAndRejectsIncompleteConfig(t *testing.T) {
 	state, root := t.TempDir(), t.TempDir()
 	if err := os.Chmod(state, 0o700); err != nil {

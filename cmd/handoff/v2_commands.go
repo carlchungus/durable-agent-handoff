@@ -37,24 +37,28 @@ func (f *runtimeCandidateFlags) Set(value string) error {
 }
 
 type executionStartRequest struct {
-	IdempotencyKey          string             `json:"idempotency_key"`
-	Goal                    string             `json:"goal"`
-	Prompt                  string             `json:"prompt"`
-	RemoteRoot              string             `json:"remote_root"`
-	Runtime                 string             `json:"runtime"`
-	ResumeID                string             `json:"resume_id"`
-	Model                   string             `json:"model,omitempty"`
-	Effort                  string             `json:"effort,omitempty"`
-	Sandbox                 supervisor.Sandbox `json:"sandbox"`
-	Role                    string             `json:"role"`
-	FinalizerEnabled        bool               `json:"finalizer_enabled,omitempty"`
-	FinalizerRequiredChecks []string           `json:"finalizer_required_checks,omitempty"`
-	FinalizerRequireHuman   bool               `json:"finalizer_require_human,omitempty"`
-	OneShot                 bool               `json:"one_shot,omitempty"`
-	EvaluatorModel          string             `json:"evaluator_model,omitempty"`
-	MaxTurns                int                `json:"max_turns,omitempty"`
-	WakeIntervalSeconds     int64              `json:"wake_interval_seconds,omitempty"`
-	PrepareCommand          string             `json:"prepare_command,omitempty"`
+	IdempotencyKey             string                   `json:"idempotency_key"`
+	Goal                       string                   `json:"goal"`
+	Prompt                     string                   `json:"prompt"`
+	RemoteRoot                 string                   `json:"remote_root"`
+	Runtime                    string                   `json:"runtime"`
+	Executable                 string                   `json:"executable,omitempty"`
+	RuntimeArgs                []string                 `json:"runtime_args,omitempty"`
+	ResumeID                   string                   `json:"resume_id"`
+	Model                      string                   `json:"model,omitempty"`
+	Effort                     string                   `json:"effort,omitempty"`
+	Sandbox                    supervisor.Sandbox       `json:"sandbox"`
+	Role                       string                   `json:"role"`
+	FinalizerEnabled           bool                     `json:"finalizer_enabled,omitempty"`
+	FinalizerRequiredChecks    []string                 `json:"finalizer_required_checks,omitempty"`
+	FinalizerRequireHuman      bool                     `json:"finalizer_require_human,omitempty"`
+	OneShot                    bool                     `json:"one_shot,omitempty"`
+	EvaluatorModel             string                   `json:"evaluator_model,omitempty"`
+	MaxTurns                   int                      `json:"max_turns,omitempty"`
+	WakeIntervalSeconds        int64                    `json:"wake_interval_seconds,omitempty"`
+	PrepareCommand             string                   `json:"prepare_command,omitempty"`
+	Mode                       supervisor.ExecutionMode `json:"mode,omitempty"`
+	SupervisionIntervalSeconds int64                    `json:"supervision_interval_seconds,omitempty"`
 }
 
 type executionStartResponse struct {
@@ -116,6 +120,9 @@ func cmdV2StartMode(args []string, out io.Writer, promotion, goalMode bool) erro
 	root := fs.String("root", ".", "canonical execution root")
 	goal := fs.String("goal", "", "desired work title")
 	runtimeName := fs.String("runtime", "", "codex, claude, or pi")
+	executable := fs.String("executable", "", "harness executable override")
+	var runtimeArgs runtimeCandidateFlags
+	fs.Var(&runtimeArgs, "arg", "extra harness argument; repeat as needed")
 	nativeSession := fs.String("session", "", "exact native runtime Session identity")
 	role := fs.String("role", "", "role ladder name, such as planner or release-check")
 	model := fs.String("model", "", "runtime model")
@@ -132,7 +139,7 @@ func cmdV2StartMode(args []string, out io.Writer, promotion, goalMode bool) erro
 	maxTurns := fs.Int("max-turns", 0, "optional positive safety cap; goals are unbounded by default")
 	wakeInterval := fs.Duration("wake-interval", 0, "durable delay between automatic goal turns, such as 10m")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--finalizer-enabled": false, "--required-check": true, "--require-human": false, "--evaluator-model": true, "--max-turns": true, "--wake-interval": true, "--prepare-command": true, "--json": false}
+	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--goal": true, "--runtime": true, "--executable": true, "--arg": true, "--session": true, "--role": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--finalizer-enabled": false, "--required-check": true, "--require-human": false, "--evaluator-model": true, "--max-turns": true, "--wake-interval": true, "--prepare-command": true, "--json": false}
 	if err := rejectUnknownFlags(args, known); err != nil {
 		return err
 	}
@@ -168,11 +175,12 @@ func cmdV2StartMode(args []string, out io.Writer, promotion, goalMode bool) erro
 		input = supervisor.StartExecutionInput{
 			NativeSession: supervisor.NativeSessionIdentity{Runtime: request.Runtime, ID: request.ResumeID},
 			Prompt:        request.Prompt, Goal: request.Goal, Role: request.Role,
-			Runtime:        supervisor.RuntimeSpec{Name: request.Runtime, Model: request.Model, Effort: request.Effort, Sandbox: request.Sandbox},
+			Runtime:        supervisor.RuntimeSpec{Name: request.Runtime, Executable: request.Executable, Arguments: encodeRuntimeArgs(request.RuntimeArgs), Model: request.Model, Effort: request.Effort, Sandbox: request.Sandbox},
 			Root:           request.RemoteRoot,
 			Authority:      supervisor.AuthoritySpec{RequestedBy: request.Role, HumanAuthorized: true, Sandbox: request.Sandbox},
 			Finalizer:      supervisor.FinalizerSpec{Enabled: request.FinalizerEnabled, RequiredChecks: append([]string(nil), request.FinalizerRequiredChecks...), RequireHuman: request.FinalizerRequireHuman},
 			EvaluatorModel: model, MaxTurns: turns, WakeIntervalSeconds: request.WakeIntervalSeconds,
+			Mode: request.Mode, SupervisionIntervalSeconds: request.SupervisionIntervalSeconds,
 			PrepareCommand: request.PrepareCommand,
 			Budget:         supervisor.DefaultBudget(), IdempotencyKey: request.IdempotencyKey,
 		}
@@ -235,7 +243,7 @@ func cmdV2StartMode(args []string, out io.Writer, promotion, goalMode bool) erro
 			NativeSession: supervisor.NativeSessionIdentity{Runtime: *runtimeName, ID: *nativeSession},
 			Goal:          *goal, Prompt: prompt, Role: *role,
 			Fallbacks:      fallbacks,
-			Runtime:        supervisor.RuntimeSpec{Name: *runtimeName, Model: *model, Effort: *effort, Sandbox: supervisor.Sandbox(*sandbox)},
+			Runtime:        supervisor.RuntimeSpec{Name: *runtimeName, Executable: *executable, Arguments: encodeRuntimeArgs(runtimeArgs), Model: *model, Effort: *effort, Sandbox: supervisor.Sandbox(*sandbox)},
 			Root:           *root,
 			Authority:      supervisor.AuthoritySpec{RequestedBy: *authorizedBy, HumanAuthorized: *authorizedBy != "", Sandbox: supervisor.Sandbox(*sandbox)},
 			Finalizer:      supervisor.FinalizerSpec{Enabled: *finalizerEnabled, RequiredChecks: append([]string(nil), requiredChecks...), RequireHuman: *requireHuman},
@@ -259,6 +267,75 @@ func cmdV2StartMode(args []string, out io.Writer, promotion, goalMode bool) erro
 		return writeJSON(out, ordinaryStartResponse{Execution: execution, Receipt: receipt})
 	}
 	fmt.Fprintf(out, "execution=%s workflow=%s session=%s sequence=%d existing=%t\n", execution.ID, execution.WorkflowID, execution.SessionID, receipt.Sequence, receipt.Existing)
+	return nil
+}
+
+func cmdV2Session(args []string, out io.Writer) error {
+	if len(args) == 0 || args[0] != "start" {
+		return errors.New("usage: handoff session start [--runtime NAME] [--root DIR] [--file -]")
+	}
+	fs := flag.NewFlagSet("session start", flag.ContinueOnError)
+	state := common(fs)
+	file := fs.String("file", "-", "read the initial prompt from stdin")
+	root := fs.String("root", ".", "canonical execution root")
+	runtimeName := fs.String("runtime", "codex", "harness name, such as codex, claude, grok, muse, or pi")
+	executable := fs.String("executable", "", "harness executable; defaults to the runtime name")
+	var runtimeArgs runtimeCandidateFlags
+	fs.Var(&runtimeArgs, "arg", "extra harness argument; repeat as needed")
+	nativeSession := fs.String("session", "", "exact native runtime session identity to resume")
+	model := fs.String("model", "", "runtime model")
+	effort := fs.String("effort", "", "runtime reasoning effort")
+	sandbox := fs.String("sandbox", "workspace-write", "read-only or workspace-write")
+	authorizedBy := fs.String("authorized-by", "human:cli", "human identity authorizing execution")
+	key := fs.String("idempotency-key", "", "stable request identity; generated when omitted")
+	checkInterval := fs.Duration("check-interval", 20*time.Minute, "quiet supervisor inspection cadence; zero disables it")
+	prepareCommand := fs.String("prepare-command", "", "optional worktree readiness command")
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	known := map[string]bool{"--state": true, "--file": true, "--root": true, "--runtime": true, "--executable": true, "--arg": true, "--session": true, "--model": true, "--effort": true, "--sandbox": true, "--authorized-by": true, "--idempotency-key": true, "--check-interval": true, "--prepare-command": true, "--json": false}
+	if err := rejectUnknownFlags(args[1:], known); err != nil {
+		return err
+	}
+	if err := fs.Parse(reorderFlags(args[1:], known)); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("session start accepts no positional arguments; pass prompt with --file -")
+	}
+	if *file != "-" {
+		return errors.New("session start requires --file -; prompt input is stdin-only")
+	}
+	if *checkInterval < 0 || *checkInterval%time.Second != 0 {
+		return errors.New("check interval must be zero or a positive whole number of seconds")
+	}
+	if strings.TrimSpace(*runtimeName) == "" {
+		return errors.New("session start requires a runtime name")
+	}
+	prompt, err := readPromptStdin()
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(*key) == "" {
+		*key = fmt.Sprintf("session/%d", time.Now().UTC().UnixNano())
+	}
+	store, err := supervisor.Open(stateDir(*state), supervisor.Options{})
+	if err != nil {
+		return err
+	}
+	input := supervisor.StartExecutionInput{
+		NativeSession: supervisor.NativeSessionIdentity{Runtime: *runtimeName, ID: *nativeSession},
+		Prompt:        prompt, Runtime: supervisor.RuntimeSpec{Name: *runtimeName, Executable: *executable, Arguments: encodeRuntimeArgs(runtimeArgs), Model: *model, Effort: *effort, Sandbox: supervisor.Sandbox(*sandbox)},
+		Root: *root, Mode: supervisor.ExecutionModeSession, SupervisionIntervalSeconds: int64(*checkInterval / time.Second), PrepareCommand: *prepareCommand,
+		Authority: supervisor.AuthoritySpec{RequestedBy: *authorizedBy, HumanAuthorized: strings.TrimSpace(*authorizedBy) != "", Sandbox: supervisor.Sandbox(*sandbox)},
+		Budget:    supervisor.DefaultBudget(), IdempotencyKey: *key,
+	}
+	execution, receipt, err := store.StartExecution(context.Background(), input)
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeJSON(out, ordinaryStartResponse{Execution: execution, Receipt: receipt})
+	}
+	fmt.Fprintf(out, "session=%s execution=%s workflow=%s check_interval=%s sequence=%d existing=%t\n", execution.SessionID, execution.ID, execution.WorkflowID, *checkInterval, receipt.Sequence, receipt.Existing)
 	return nil
 }
 
@@ -293,7 +370,15 @@ func cmdV2Status(args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	view, err := store.View(supervisor.ExecutionID(fs.Arg(0)), time.Now().UTC())
+	projection, err := store.Projection()
+	if err != nil {
+		return err
+	}
+	executionID, err := executionIDForIdentifier(projection, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	view, err := store.View(executionID, time.Now().UTC())
 	if err != nil {
 		return err
 	}
@@ -302,6 +387,187 @@ func cmdV2Status(args []string, out io.Writer) error {
 	}
 	_, err = io.WriteString(out, supervisor.RenderText(view))
 	return err
+}
+
+func executionIDForIdentifier(state *supervisor.State, identifier string) (supervisor.ExecutionID, error) {
+	if state.Executions[supervisor.ExecutionID(identifier)] != nil {
+		return supervisor.ExecutionID(identifier), nil
+	}
+	for executionID, execution := range state.Executions {
+		if execution.SessionID == supervisor.SessionID(identifier) {
+			return executionID, nil
+		}
+	}
+	return "", os.ErrNotExist
+}
+
+func cmdV2Tail(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("tail", flag.ContinueOnError)
+	state := common(fs)
+	lines := fs.Int("lines", 40, "number of trailing lines")
+	follow := fs.Bool("follow", false, "follow appended transcript output")
+	stderr := fs.Bool("stderr", false, "read the harness stderr stream")
+	raw := fs.Bool("raw", false, "do not add a transcript header")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"--state": true, "--lines": true, "--follow": false, "--stderr": false, "--raw": false})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("tail requires a Session or Execution ID")
+	}
+	if *lines < 1 {
+		return errors.New("tail lines must be positive")
+	}
+	store, err := openV2(*state)
+	if err != nil {
+		return err
+	}
+	projection, err := store.Projection()
+	if err != nil {
+		return err
+	}
+	executionID, err := executionIDForIdentifier(projection, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	execution := projection.Executions[executionID]
+	var latest *supervisor.Attempt
+	for _, attempt := range projection.Attempts {
+		activity := projection.Activities[attempt.ActivityID]
+		if activity == nil || activity.WorkflowID != execution.WorkflowID {
+			continue
+		}
+		if latest == nil || attempt.CreatedAt.After(latest.CreatedAt) {
+			latest = attempt
+		}
+	}
+	if latest == nil {
+		if !*raw {
+			fmt.Fprintf(out, "Session %s\nNo transcript yet.\n", execution.SessionID)
+		}
+		return nil
+	}
+	path := latest.Outputs.StdoutPath
+	if *stderr {
+		path = latest.Outputs.StderrPath
+	}
+	if strings.TrimSpace(path) == "" {
+		return errors.New("this attempt has no readable transcript path")
+	}
+	outputRoot := filepath.Join(stateDir(*state), "supervisor-v2", "outputs")
+	if err := validateTailPath(outputRoot, path); err != nil {
+		return err
+	}
+	if !*raw {
+		fmt.Fprintf(out, "Session %s · %s · attempt %s\n", execution.SessionID, execution.WorkflowID, latest.ID)
+	}
+	if err := writeTail(out, path, *lines); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !*follow {
+		return nil
+	}
+	return followTail(out, path)
+}
+
+func validateTailPath(root, path string) error {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return errors.New("transcript path is outside the private output root")
+	}
+	return nil
+}
+
+func writeTail(out io.Writer, path string, lines int) error {
+	const maxRead = 4 << 20
+	file, err := privatepath.OpenFile(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	start := int64(0)
+	if info.Size() > maxRead {
+		start = info.Size() - maxRead
+	}
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return err
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxRead))
+	if err != nil {
+		return err
+	}
+	if start > 0 {
+		if index := strings.IndexByte(string(data), '\n'); index >= 0 {
+			data = data[index+1:]
+		}
+	}
+	parts := strings.Split(string(data), "\n")
+	if len(parts) > 0 && parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
+	if len(parts) > lines {
+		parts = parts[len(parts)-lines:]
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	_, err = io.WriteString(out, strings.Join(parts, "\n")+"\n")
+	return err
+}
+
+func followTail(out io.Writer, path string) error {
+	file, err := privatepath.OpenFile(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	offset := info.Size()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			info, statErr := file.Stat()
+			if statErr != nil {
+				return statErr
+			}
+			if info.Size() < offset {
+				offset = 0
+			}
+			if info.Size() == offset {
+				continue
+			}
+			if _, err := file.Seek(offset, io.SeekStart); err != nil {
+				return err
+			}
+			if _, err := io.CopyN(out, file, info.Size()-offset); err != nil {
+				return err
+			}
+			offset = info.Size()
+		}
+	}
 }
 
 func v2Views(store *supervisor.Store) ([]*supervisor.ExecutionView, error) {
@@ -568,6 +834,14 @@ func preferenceDigest(candidates []supervisor.RuntimeSpec) string {
 	return hex.EncodeToString(sum[:6])
 }
 
+func encodeRuntimeArgs(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	raw, _ := json.Marshal(values)
+	return string(raw)
+}
+
 func cmdV2Pause(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("execution pause", flag.ContinueOnError)
 	state := common(fs)
@@ -740,7 +1014,7 @@ func cmdV2Serve(args []string, out io.Writer) error {
 	fmt.Fprintf(out, "handoff supervisor-v2 · state=%s · workers=%d · trust=%s\n", stateDir(*state), *workers, *trustMode)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return service.ServeV2(ctx, store, service.ServeOptions{Interval: *interval, Workers: *workers, StartupDeadline: *startupTimeout, Environment: environment, TrustMode: driver.TrustMode(*trustMode), OutputRoot: filepath.Join(stateDir(*state), "supervisor-v2", "outputs")}, func(format string, values ...any) { fmt.Fprintf(out, format+"\n", values...) })
+	return service.ServeV2(ctx, store, service.ServeOptions{Interval: *interval, Workers: *workers, StartupDeadline: *startupTimeout, Environment: environment, TrustMode: driver.TrustMode(*trustMode), OutputRoot: filepath.Join(stateDir(*state), "supervisor-v2", "outputs"), DetachActive: true}, func(format string, values ...any) { fmt.Fprintf(out, format+"\n", values...) })
 }
 
 func cmdV2Service(args []string, out io.Writer) error {

@@ -61,7 +61,7 @@ All changes use typed Store methods and are written as one command:
 | `PauseWorkflow` | records exact controls and enters requested/draining; executor-applied terminal exits release Leases |
 | `SettlePause` | idempotently marks a draining pause completed after every fenced Attempt has exited |
 | `ApplyControl` | records that an executor applied one exact Activity-generation/Attempt control |
-| `ReconcileStartup` | validates inherited exact process identities; terminalizes dead/prepared orphans and releases their exact Leases, or fails closed on an exact live orphan |
+| `ReconcileStartup` | validates inherited exact process identities; terminalizes dead/prepared orphans and releases their exact Leases, while leaving exact live Attempts for service adoption |
 | `ImportV1` | one deterministic one-way legacy import transaction |
 
 Every mutating call requires an idempotency key of 8–256 safe characters.
@@ -156,8 +156,9 @@ legacy aliases and compatibility envelopes are not part of v2.
 `ServeV2` schedules work, under the journal transaction. Prepared-but-never-
 spawned Attempts are inherited orphans. Dead Attempts receive existing typed
 failure/exit facts plus exact Lease release so their immutable Activity can
-retry. An exact live PID/start-token match returns `ErrLiveOrphan` and the
-service refuses to schedule until an explicit adoption protocol is available.
+retry. An exact live PID/start-token match remains nonterminal and is returned
+to the service for observation; the service adopts that exact process instead
+of launching a duplicate.
 
 `Store.View(executionID, asOf)` returns one `ExecutionView` containing the Node,
 Activity, Attempt, queue, publication, and overhead projections.
@@ -204,6 +205,16 @@ input. They must not synthesize a new Activity, Attempt, or Session identity.
 
 ## Starting a resumed session and running the service
 
+`handoff session start` is the simple background-session surface. It creates a
+Session-mode execution without a goal, evaluator, or mandatory completion
+contract. `--check-interval` defaults to 20 minutes; the quiet check is
+read/reconcile-only and never sends a prompt or signal to a live Attempt.
+`handoff status SESSION` accepts the exact handoff Session ID, and
+`handoff tail SESSION --lines N [--follow]` reads the latest Attempt's private
+stdout (or `--stderr`) without changing lifecycle state. Named Codex, Claude,
+and Pi adapters support their exact native identities; unknown harness names
+use stdin/argv without inferred native resume semantics.
+
 Ordinary `start`/`create` prompts and `reply` bodies are stdin-only: callers
 must pass `--file -`. Arbitrary prompt paths, `--prompt`, `--prompt-file`, and
 reply `--message` argv content are rejected.
@@ -235,8 +246,10 @@ require mode `0600`; Windows requires an owner/System/Administrators-only DACL.
 The file is read into transient driver environment values. Prompts and secret
 values are never serialized into a service unit. Drivers apply trust flags
 themselves and execute provider argv directly, without shell wrappers.
-Service cancellation waits for all active executor goroutines to record their
-terminal milestones and release their exact Leases before returning.
+The default embedded service waits for all active executor goroutines to record
+their terminal milestones and release their exact Leases before returning. The
+CLI service opts into detached POSIX session workers so a supervisor restart can
+adopt them.
 Failed runtime launches are retried only after the service retry delay; the
 same queued Activity remains durable during that delay.
 
@@ -244,7 +257,12 @@ The installed OS service has a ten-minute liveness watchdog. It issues a start,
 not a restart, so a healthy supervisor and its live Attempts are untouched. If
 the service is inactive after a crash, reboot, or missed wake, systemd or
 launchd starts the same journal-backed scheduler and normal reconciliation
-resumes exact Sessions and Attempts.
+resumes exact Sessions and Attempts. Service shutdown detaches active Attempts;
+a later POSIX service instance adopts exact live processes instead of
+interrupting them. The runner writes the child exit code before POSIX
+containment teardown; missing or unknown exit evidence becomes blocked, never
+successful completion. Windows Job Object containment ends the live tree when
+the service exits, so restart adoption is not promised there.
 
 ## One-way migration
 

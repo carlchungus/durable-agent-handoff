@@ -25,10 +25,10 @@ func (Codex) Build(request LaunchRequest) (Launch, error) {
 	}
 	args = append(args, disabledProjectMCPArgs(request.Worktree)...)
 	args = append(args, "exec", "--ignore-user-config", "--json")
-	if request.SchemaPath != "" {
+	if !request.SessionMode && request.SchemaPath != "" {
 		args = append(args, "--output-schema", request.SchemaPath)
 	}
-	if request.ResultPath != "" {
+	if !request.SessionMode && request.ResultPath != "" {
 		args = append(args, "-o", request.ResultPath)
 	}
 	if strings.TrimSpace(request.Session.ID) != "" {
@@ -36,7 +36,7 @@ func (Codex) Build(request LaunchRequest) (Launch, error) {
 	} else {
 		args = append(args, "-")
 	}
-	return Launch{Executable: fallback(request.Runtime.Executable, "codex"), Args: args, PromptOnStdin: true, Prompt: promptForRuntime("codex", request.Prompt)}, nil
+	return Launch{Executable: fallback(request.Runtime.Executable, "codex"), Args: args, PromptOnStdin: true, Prompt: promptForRuntime("codex", request.Prompt, !request.SessionMode)}, nil
 }
 
 func (Codex) NewDecoder() Decoder { return &codexDecoder{} }
@@ -44,8 +44,11 @@ func (Codex) NewDecoder() Decoder { return &codexDecoder{} }
 type codexDecoder struct {
 	turn          bool
 	result        bool
+	sessionMode   bool
 	pendingResult *supervisor.WorkerResult
 }
+
+func (d *codexDecoder) SetSessionMode(value bool) { d.sessionMode = value }
 
 func (d *codexDecoder) DecodeLine(raw []byte) ([]supervisor.Milestone, error) {
 	var envelope struct {
@@ -112,6 +115,9 @@ func (d *codexDecoder) DecodeLine(raw []byte) ([]supervisor.Milestone, error) {
 		return []supervisor.Milestone{{Kind: supervisor.MilestoneMeaningfulProgress, Progress: envelope.Item.Text, SourceType: envelope.Type}}, nil
 	case "turn.completed":
 		if d.pendingResult == nil {
+			if d.sessionMode {
+				return nil, nil
+			}
 			return nil, errors.New("Codex turn.completed omitted the structured completion result")
 		}
 		d.result = true

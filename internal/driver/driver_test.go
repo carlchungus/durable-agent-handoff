@@ -107,6 +107,67 @@ func TestDriversUseRuntimeOwnedCompletionContract(t *testing.T) {
 	}
 }
 
+func TestCodexSessionModeDoesNotRequireStructuredCompletion(t *testing.T) {
+	request := launchRequest("codex")
+	request.SessionMode = true
+	launch, err := (Codex{}).Build(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(launch.Args, " ")
+	if strings.Contains(joined, "--output-schema") || strings.Contains(joined, " -o ") || strings.Contains(launch.Prompt, completionContract) {
+		t.Fatalf("Codex session mode still imposed a structured completion contract: args=%s prompt=%q", joined, launch.Prompt)
+	}
+}
+
+func TestGenericDriverRunsUnknownHarnessWithoutSupervisorContract(t *testing.T) {
+	request := launchRequest("grok")
+	request.Runtime.Executable = "/opt/grok"
+	request.Runtime.Arguments = `["--headless","--resume","native-session"]`
+	request.Session.ID = ""
+	request.SessionMode = true
+	launch, err := Generic{NameValue: "grok"}.Build(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if launch.Executable != "/opt/grok" || strings.Join(launch.Args, " ") != "--headless --resume native-session" || launch.Prompt != request.Prompt || strings.Contains(launch.Prompt, "Supervisor completion contract") {
+		t.Fatalf("generic launch was not native and contract-free: %+v", launch)
+	}
+	decoder := Generic{NameValue: "muse"}.NewDecoder()
+	milestones, err := decoder.DecodeLine([]byte("working on the repository\n"))
+	if err != nil || len(milestones) != 2 || milestones[0].Kind != supervisor.MilestoneTurnStarted || milestones[1].Progress != "working on the repository" {
+		t.Fatalf("generic output was not preserved as typed progress: milestones=%+v err=%v", milestones, err)
+	}
+}
+
+func TestGenericDriverFailsClosedForReadOnlyAuthority(t *testing.T) {
+	request := launchRequest("muse")
+	request.Runtime.Sandbox = supervisor.SandboxReadOnly
+	request.Session.ID = ""
+	if _, err := (Generic{NameValue: "muse"}).Build(request); err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("generic read-only launch was accepted: %v", err)
+	}
+}
+
+func TestGenericSessionOutputNeverBecomesStructuredResult(t *testing.T) {
+	decoder := Generic{NameValue: "muse"}.NewDecoder()
+	if configurable, ok := decoder.(SessionModeDecoder); ok {
+		configurable.SetSessionMode(true)
+	}
+	milestones, err := decoder.DecodeLine([]byte(`{"status":"completed","summary":"accidental result-shaped output"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, milestone := range milestones {
+		if milestone.Kind == supervisor.MilestoneResult {
+			t.Fatalf("generic session output was promoted to a Result: %+v", milestones)
+		}
+	}
+	if len(milestones) != 2 || milestones[1].Progress == "" {
+		t.Fatalf("generic session output was not preserved as progress: %+v", milestones)
+	}
+}
+
 func TestCompletionContractPrefersDraftProgressOverOptionalEvidenceBlockers(t *testing.T) {
 	for _, want := range []string{"human is unavailable", "draft PR", "external CI", "do not idle"} {
 		if !strings.Contains(completionContract, want) {

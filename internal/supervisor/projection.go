@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"errors"
 	"os"
 	"sort"
 	"strings"
@@ -51,6 +52,7 @@ type AttemptView struct {
 	ID                  AttemptID     `json:"id"`
 	ActivityID          ActivityID    `json:"activity_id"`
 	ActivityGeneration  uint64        `json:"activity_generation"`
+	PID                 int           `json:"pid,omitempty"`
 	Health              ProcessHealth `json:"health"`
 	TurnStarted         bool          `json:"turn_started"`
 	TaskAttempt         int           `json:"task_attempt,omitempty"`
@@ -114,21 +116,26 @@ const (
 )
 
 type ExecutionView struct {
-	ID           ExecutionID      `json:"id"`
-	WorkflowID   WorkflowID       `json:"workflow_id"`
-	Title        string           `json:"title,omitempty"`
-	Status       ExecutionStatus  `json:"status"`
-	Active       bool             `json:"active"`
-	Summary      string           `json:"summary,omitempty"`
-	UpdatedAt    time.Time        `json:"updated_at"`
-	Nodes        []NodeView       `json:"nodes"`
-	Activities   []ActivityView   `json:"activities"`
-	Attempts     []AttemptView    `json:"attempts"`
-	Queue        []ActivityID     `json:"queue"`
-	PendingTurns []ActivityID     `json:"pending_turns,omitempty"`
-	Publication  PublicationState `json:"publication"`
-	NextWakeAt   *time.Time       `json:"next_wake_at,omitempty"`
-	AsOf         time.Time        `json:"as_of"`
+	ID                         ExecutionID      `json:"id"`
+	WorkflowID                 WorkflowID       `json:"workflow_id"`
+	SessionID                  SessionID        `json:"session_id"`
+	Runtime                    RuntimeSpec      `json:"runtime"`
+	Root                       string           `json:"root"`
+	Mode                       ExecutionMode    `json:"mode,omitempty"`
+	SupervisionIntervalSeconds int64            `json:"supervision_interval_seconds,omitempty"`
+	Title                      string           `json:"title,omitempty"`
+	Status                     ExecutionStatus  `json:"status"`
+	Active                     bool             `json:"active"`
+	Summary                    string           `json:"summary,omitempty"`
+	UpdatedAt                  time.Time        `json:"updated_at"`
+	Nodes                      []NodeView       `json:"nodes"`
+	Activities                 []ActivityView   `json:"activities"`
+	Attempts                   []AttemptView    `json:"attempts"`
+	Queue                      []ActivityID     `json:"queue"`
+	PendingTurns               []ActivityID     `json:"pending_turns,omitempty"`
+	Publication                PublicationState `json:"publication"`
+	NextWakeAt                 *time.Time       `json:"next_wake_at,omitempty"`
+	AsOf                       time.Time        `json:"as_of"`
 }
 
 // View is a pure read. asOf is explicit so polling cannot manufacture events
@@ -147,8 +154,13 @@ func ProjectExecution(state *State, executionID ExecutionID, asOf time.Time) (*E
 		return nil, os.ErrNotExist
 	}
 	workflow := state.Workflows[execution.WorkflowID]
-	view := &ExecutionView{ID: execution.ID, WorkflowID: workflow.ID, UpdatedAt: execution.CreatedAt.UTC(), AsOf: asOf.UTC()}
-	if root := workflow.Nodes[execution.RootNodeID]; root != nil {
+	if workflow == nil {
+		return nil, errors.New("execution workflow is absent")
+	}
+	root := workflow.Nodes[execution.RootNodeID]
+	view := &ExecutionView{ID: execution.ID, WorkflowID: workflow.ID, SessionID: execution.SessionID, Root: workflow.Root, Mode: workflow.Mode, SupervisionIntervalSeconds: workflow.SupervisionIntervalSeconds, UpdatedAt: execution.CreatedAt.UTC(), AsOf: asOf.UTC()}
+	if root != nil {
+		view.Runtime = root.Work.Runtime
 		view.Title = root.Title
 	}
 	for _, activity := range orderedActivities(state, workflow.ID) {
@@ -413,6 +425,9 @@ func workerResultAttemptForActivity(state *State, activityID ActivityID) *Attemp
 
 func projectAttempt(state *State, attempt *Attempt) AttemptView {
 	view := AttemptView{ID: attempt.ID, ActivityID: attempt.ActivityID, ActivityGeneration: attempt.ActivityGeneration, Health: HealthStarting}
+	if attempt.Process != nil {
+		view.PID = attempt.Process.PID
+	}
 	var spawned, turn, progress time.Time
 	for _, milestone := range attempt.Milestones {
 		switch milestone.Kind {

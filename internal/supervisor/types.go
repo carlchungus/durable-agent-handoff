@@ -27,6 +27,17 @@ const (
 	SandboxWorkspaceWrite Sandbox = "workspace-write"
 )
 
+// ExecutionMode selects the control contract for a newly started execution.
+// Turn mode retains the structured one-shot/goal behavior. Session mode is a
+// quiet, harness-neutral background session: the process and transcript are
+// the product, and no evaluator or stage graph is required.
+type ExecutionMode string
+
+const (
+	ExecutionModeTurn    ExecutionMode = "turn"
+	ExecutionModeSession ExecutionMode = "session"
+)
+
 // RuntimeSpec is durable launch intent. Prompt-bearing argv is deliberately
 // absent: a Driver constructs it at launch time.
 type RuntimeSpec struct {
@@ -35,6 +46,10 @@ type RuntimeSpec struct {
 	Model      string  `json:"model,omitempty"`
 	Effort     string  `json:"effort,omitempty"`
 	Sandbox    Sandbox `json:"sandbox"`
+	// Arguments is a JSON array encoded as a string so RuntimeSpec remains
+	// comparable for authorization and fallback identity checks. It is decoded
+	// only by the generic harness adapter.
+	Arguments string `json:"arguments,omitempty"`
 }
 
 type NativeSessionIdentity struct {
@@ -94,13 +109,15 @@ type Workflow struct {
 	Budget    Budget        `json:"budget"`
 	// EvaluatorModel makes this a goal that keeps running until a decision says
 	// it is done. MaxTurns is an optional explicit safety cap; zero is unbounded.
-	EvaluatorModel      string           `json:"evaluator_model,omitempty"`
-	MaxTurns            int              `json:"max_turns,omitempty"`
-	WakeIntervalSeconds int64            `json:"wake_interval_seconds,omitempty"`
-	OldGoal             *oldGoalSettings `json:"autonomy,omitempty"`
-	Nodes               map[NodeID]*Node `json:"nodes"`
-	Order               []NodeID         `json:"order"`
-	CreatedAt           time.Time        `json:"created_at"`
+	EvaluatorModel             string           `json:"evaluator_model,omitempty"`
+	MaxTurns                   int              `json:"max_turns,omitempty"`
+	WakeIntervalSeconds        int64            `json:"wake_interval_seconds,omitempty"`
+	Mode                       ExecutionMode    `json:"mode,omitempty"`
+	SupervisionIntervalSeconds int64            `json:"supervision_interval_seconds,omitempty"`
+	OldGoal                    *oldGoalSettings `json:"autonomy,omitempty"`
+	Nodes                      map[NodeID]*Node `json:"nodes"`
+	Order                      []NodeID         `json:"order"`
+	CreatedAt                  time.Time        `json:"created_at"`
 }
 
 // Node is desired work. It intentionally has no attempt, session, process,
@@ -181,9 +198,13 @@ type ProcessIdentity struct {
 }
 
 type OutputIdentity struct {
-	Stdout string `json:"stdout"`
-	Stderr string `json:"stderr"`
-	Result string `json:"result,omitempty"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	Result     string `json:"result,omitempty"`
+	StdoutPath string `json:"stdout_path,omitempty"`
+	StderrPath string `json:"stderr_path,omitempty"`
+	ResultPath string `json:"result_path,omitempty"`
+	ExitPath   string `json:"exit_path,omitempty"`
 }
 
 // Attempt is one OS launch. Its creation record is immutable; later facts are

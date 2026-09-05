@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -33,6 +34,249 @@ type Executor struct {
 	Environment     []string
 	TrustMode       driver.TrustMode
 	StartupDeadline time.Duration
+}
+
+// AdoptAttempt observes an exact process that survived a Supervisor restart.
+// It never launches a second harness and only applies an explicit pending
+// control after rechecking the durable start-token fence. The old service may
+// disappear; the gated runner owns the child process and continues writing the
+// same private output files.
+func (e *Executor) AdoptAttempt(ctx context.Context, attemptID supervisor.AttemptID) error {
+	if e == nil || e.Store == nil {
+		return errors.New("executor requires a Supervisor Store")
+	}
+	state, err := e.Store.Projection()
+	if err != nil {
+		return err
+	}
+	attempt := state.Attempts[attemptID]
+	if attempt == nil || attempt.Process == nil {
+		return os.ErrNotExist
+	}
+	activity := state.Activities[attempt.ActivityID]
+	if activity == nil {
+		return errors.New("adopted Attempt has no Activity")
+	}
+	stopIssued := false
+	for {
+		match, inspectErr := processidentity.InspectMatch(attempt.Process.PID, attempt.Process.StartToken)
+		if inspectErr != nil {
+			return inspectErr
+		}
+		switch match {
+		case processidentity.MatchExact:
+			if !stopIssued {
+				control, _, controlErr := pendingControl(e.Store, activity.ID, attempt.ID)
+				if controlErr != nil && !errors.Is(controlErr, supervisor.ErrFenced) {
+					return controlErr
+				}
+				if control != nil {
+					if err := processidentity.StopExact(attempt.Process.PID, attempt.Process.StartToken, attempt.Process.TreeID); err != nil {
+						return err
+					}
+					stopIssued = true
+					if control.AppliedAt.IsZero() {
+						if _, _, applyErr := e.Store.ApplyControl(context.Background(), supervisor.ApplyControlInput{ControlID: control.ID, ActivityID: activity.ID, ExpectedGeneration: activity.Generation, AttemptID: attempt.ID, IdempotencyKey: "adopt/" + string(attempt.ID) + "/control-applied/" + string(control.ID)}); applyErr != nil && !errors.Is(applyErr, supervisor.ErrFenced) {
+							return applyErr
+						}
+					}
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		case processidentity.MatchAbsent, processidentity.MatchDifferent:
+			if err := e.recoverAttemptOutput(ctx, attempt, activity); err != nil && !errors.Is(err, supervisor.ErrFenced) {
+				return err
+			}
+			state, projectionErr := e.Store.Projection()
+			if projectionErr != nil {
+				return projectionErr
+			}
+			if current := state.Attempts[attempt.ID]; current != nil && !attemptHasExit(current) {
+				code, exitError, known, readErr := readPersistedExit(current.Outputs.ExitPath)
+				if readErr != nil {
+					return readErr
+				}
+				if !known {
+					code = 255
+					exitError = "process exited before handoff could observe its child exit code"
+				}
+				_, err = e.record(context.Background(), activity, current, "adopt/"+string(attempt.ID)+"/exit", supervisor.Milestone{Kind: supervisor.MilestoneExit, Exit: &supervisor.Exit{Code: code, Error: exitError}, SourceType: "supervisor.adopt"})
+				return err
+			}
+			return nil
+		default:
+			return fmt.Errorf("inspect adopted Attempt %s: identity status is unknown", attempt.ID)
+		}
+	}
+}
+
+func readPersistedExit(path string) (code int, exitError string, known bool, err error) {
+	if strings.TrimSpace(path) == "" {
+		return 0, "", false, nil
+	}
+	file, err := privatepath.OpenFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, "", false, nil
+		}
+		return 0, "", false, err
+	}
+	defer file.Close()
+	var record struct {
+		Code  int    `json:"code"`
+		Error string `json:"error,omitempty"`
+	}
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&record); err != nil {
+		return 0, "", false, fmt.Errorf("decode persisted child exit: %w", err)
+	}
+	return record.Code, record.Error, true, nil
+}
+
+func attemptHasExit(attempt *supervisor.Attempt) bool {
+	if attempt == nil {
+		return false
+	}
+	for _, milestone := range attempt.Milestones {
+		if milestone.Kind == supervisor.MilestoneExit {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Executor) recoverAttemptOutput(ctx context.Context, attempt *supervisor.Attempt, activity *supervisor.Activity) error {
+	if attempt.Outputs.StdoutPath == "" {
+		return nil
+	}
+	file, err := os.Open(attempt.Outputs.StdoutPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+	state, err := e.Store.Projection()
+	if err != nil {
+		return err
+	}
+	workflow := state.Workflows[activity.WorkflowID]
+	if workflow == nil {
+		return errors.New("adopted Activity has no Workflow")
+	}
+	runtimeDriver, err := driver.Lookup(attempt.Runtime.Name)
+	if err != nil {
+		return err
+	}
+	decoder := runtimeDriver.NewDecoder()
+	if configurable, ok := decoder.(driver.SessionModeDecoder); ok {
+		configurable.SetSessionMode(workflow.Mode == supervisor.ExecutionModeSession)
+	}
+	var session *supervisor.Milestone
+	var turn *supervisor.Milestone
+	var progress *supervisor.Milestone
+	var result *supervisor.Milestone
+	reader := bufio.NewReaderSize(file, 64<<10)
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			milestones, decodeErr := decoder.DecodeLine(line)
+			if decodeErr != nil {
+				return nil
+			}
+			for index := range milestones {
+				milestone := milestones[index]
+				switch milestone.Kind {
+				case supervisor.MilestoneSessionBound:
+					copy := milestone
+					session = &copy
+				case supervisor.MilestoneTurnStarted:
+					copy := milestone
+					turn = &copy
+				case supervisor.MilestoneMeaningfulProgress:
+					copy := milestone
+					progress = &copy
+				case supervisor.MilestoneResult:
+					copy := milestone
+					result = &copy
+				}
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return readErr
+		}
+	}
+	state, err = e.Store.Projection()
+	if err != nil {
+		return err
+	}
+	current := state.Attempts[attempt.ID]
+	if current == nil || attemptHasExit(current) {
+		return nil
+	}
+	if state.Sessions[activity.SessionID] != nil && state.Sessions[activity.SessionID].Native.ID == "" && session != nil {
+		if _, err = e.record(ctx, activity, current, "adopt/"+string(attempt.ID)+"/session", *session); err != nil && !errors.Is(err, supervisor.ErrFenced) {
+			return err
+		}
+	}
+	state, err = e.Store.Projection()
+	if err != nil {
+		return err
+	}
+	current = state.Attempts[attempt.ID]
+	if current == nil || attemptHasExit(current) {
+		return nil
+	}
+	if !hasMilestone(current, supervisor.MilestoneTurnStarted) && turn != nil {
+		if _, err = e.record(ctx, activity, current, "adopt/"+string(attempt.ID)+"/turn", *turn); err != nil && !errors.Is(err, supervisor.ErrFenced) {
+			return err
+		}
+	}
+	state, err = e.Store.Projection()
+	if err != nil {
+		return err
+	}
+	current = state.Attempts[attempt.ID]
+	if current == nil || attemptHasExit(current) {
+		return nil
+	}
+	if !hasMilestone(current, supervisor.MilestoneMeaningfulProgress) && progress != nil {
+		if _, err = e.record(ctx, activity, current, "adopt/"+string(attempt.ID)+"/progress", *progress); err != nil && !errors.Is(err, supervisor.ErrFenced) {
+			return err
+		}
+	}
+	if result != nil && workerResultForAttempt(current) == nil {
+		_, err = e.record(ctx, activity, current, "adopt/"+string(attempt.ID)+"/result", *result)
+	}
+	return err
+}
+
+func hasMilestone(attempt *supervisor.Attempt, kind supervisor.MilestoneKind) bool {
+	for _, milestone := range attempt.Milestones {
+		if milestone.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func workerResultForAttempt(attempt *supervisor.Attempt) *supervisor.WorkerResult {
+	for _, milestone := range attempt.Milestones {
+		if milestone.Kind == supervisor.MilestoneResult {
+			return milestone.Result
+		}
+	}
+	return nil
 }
 
 func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.ActivityID) error {
@@ -94,12 +338,13 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	stdoutPath := filepath.Join(e.OutputRoot, fileStem+".stdout.jsonl")
 	stderrPath := filepath.Join(e.OutputRoot, fileStem+".stderr.log")
 	resultPath := filepath.Join(e.OutputRoot, fileStem+".result.json")
+	exitPath := filepath.Join(e.OutputRoot, fileStem+".exit.json")
 	schemaPath := filepath.Join(e.OutputRoot, fileStem+".schema.json")
 	trustMode := e.TrustMode
 	if trustMode == "" {
 		trustMode = driver.TrustWorkspace
 	}
-	outputs := supervisor.OutputIdentity{Stdout: "output_" + shortDigest(stdoutPath), Stderr: "output_" + shortDigest(stderrPath), Result: "output_" + shortDigest(resultPath)}
+	outputs := supervisor.OutputIdentity{Stdout: "output_" + shortDigest(stdoutPath), Stderr: "output_" + shortDigest(stderrPath), Result: "output_" + shortDigest(resultPath), StdoutPath: stdoutPath, StderrPath: stderrPath, ResultPath: resultPath, ExitPath: exitPath}
 	preparePrelaunch := func(failure error) error {
 		attempt, receipt, prepareErr := e.Store.PrepareAttempt(ctx, supervisor.PrepareAttemptInput{
 			ActivityID: logical.ID, ExpectedGeneration: logical.Generation, Runtime: runtimeSpec,
@@ -121,7 +366,7 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	if prepareErr := e.runPrepareCommand(ctx, node.Work); prepareErr != nil {
 		return preparePrelaunch(prepareErr)
 	}
-	launch, err := runtimeDriver.Build(driver.LaunchRequest{Runtime: runtimeSpec, Worktree: node.Work.Root, Prompt: logical.Prompt, Session: session.Native, SchemaPath: schemaPath, ResultPath: resultPath, TrustMode: trustMode})
+	launch, err := runtimeDriver.Build(driver.LaunchRequest{Runtime: runtimeSpec, Worktree: node.Work.Root, Prompt: logical.Prompt, Session: session.Native, SchemaPath: schemaPath, ResultPath: resultPath, TrustMode: trustMode, SessionMode: workflow.Mode == supervisor.ExecutionModeSession})
 	if err != nil {
 		return preparePrelaunch(err)
 	}
@@ -161,7 +406,7 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 		}
 		stdin = []byte(prompt)
 	}
-	gated, err := activity.PrepareGatedCommand(argv, node.Work.Root, e.Environment, stdin)
+	gated, err := activity.PrepareGatedCommand(argv, node.Work.Root, e.Environment, stdin, exitPath)
 	if err != nil {
 		_ = stdout.Close()
 		_ = stderr.Close()
@@ -208,7 +453,11 @@ func (e *Executor) RunActivity(ctx context.Context, activityID supervisor.Activi
 	stopDecode := make(chan struct{})
 	decodeErrors := make(chan error, 1)
 	go func() {
-		decodeErrors <- e.decodeFile(ctx, logical, attempt, keyPrefix, stdoutPath, runtimeDriver.NewDecoder(), stopDecode)
+		decoder := runtimeDriver.NewDecoder()
+		if configurable, ok := decoder.(driver.SessionModeDecoder); ok {
+			configurable.SetSessionMode(workflow.Mode == supervisor.ExecutionModeSession)
+		}
+		decodeErrors <- e.decodeFile(ctx, logical, attempt, keyPrefix, stdoutPath, decoder, stopDecode)
 	}()
 	waited := make(chan error, 1)
 	go func() { waited <- command.Wait() }()
@@ -288,7 +537,7 @@ waitLoop:
 					}
 				}
 			}
-			if !stopping && !turnStarted && !startupFailureRecorded && time.Now().After(startupAt) {
+			if workflow.Mode != supervisor.ExecutionModeSession && !stopping && !turnStarted && !startupFailureRecorded && time.Now().After(startupAt) {
 				control, _, controlErr := e.Store.RequestControl(context.Background(), supervisor.RequestControlInput{ActivityID: logical.ID, ExpectedGeneration: logical.Generation, ExpectedAttemptID: attempt.ID, Kind: "stop", Actor: "supervisor:startup-deadline", IdempotencyKey: keyPrefix + "/startup-control"})
 				if controlErr != nil && !errors.Is(controlErr, supervisor.ErrFenced) {
 					processErr = errors.Join(<-waited, controlErr)
@@ -336,16 +585,22 @@ waitLoop:
 	// The gated runner's containment watchdog terminates its own process group
 	// after the target finishes, so the runner itself is normally observed as
 	// signaled. A committed typed Result proves the target completed its turn;
-	// normalize only that exact contained-runner case.
+	// session-mode's successful target exit is the equivalent proof because
+	// session mode intentionally has no structured worker Result.
 	if code == -1 {
-		if current, projectionErr := e.Store.Projection(); projectionErr == nil && activityHasResult(current, logical.ID) {
-			code, processErr = 0, nil
-		} else if current, projectionErr := e.Store.Projection(); projectionErr == nil && activityHasProviderUnavailable(current, logical.ID) {
-			// The containment watchdog exits with a signal after a typed provider
-			// failure. The durable provider_unavailable milestone is the authority
-			// for routing, so do not turn that expected fallback boundary into an
-			// executor crash.
-			code, processErr = 0, nil
+		if current, projectionErr := e.Store.Projection(); projectionErr == nil {
+			workflow := current.Workflows[logical.WorkflowID]
+			if !stopping && workflow != nil && workflow.Mode == supervisor.ExecutionModeSession {
+				code, processErr = 0, nil
+			} else if activityHasResult(current, logical.ID) {
+				code, processErr = 0, nil
+			} else if activityHasProviderUnavailable(current, logical.ID) {
+				// The containment watchdog exits with a signal after a typed provider
+				// failure. The durable provider_unavailable milestone is the authority
+				// for routing, so do not turn that expected fallback boundary into an
+				// executor crash.
+				code, processErr = 0, nil
+			}
 		}
 	}
 	_, exitErr := e.record(context.Background(), logical, attempt, keyPrefix+"/exit", runtimeDriver.Exited(code, processErr))
@@ -405,7 +660,7 @@ func selectRuntime(work supervisor.WorkSpec, state *supervisor.State, activityID
 }
 
 func runtimeKey(runtime supervisor.RuntimeSpec) string {
-	return runtime.Name + "\x00" + runtime.Executable + "\x00" + runtime.Model + "\x00" + runtime.Effort + "\x00" + string(runtime.Sandbox)
+	return runtime.Name + "\x00" + runtime.Executable + "\x00" + runtime.Model + "\x00" + runtime.Effort + "\x00" + string(runtime.Sandbox) + "\x00" + runtime.Arguments
 }
 
 func (e *Executor) settlePause(logical *supervisor.Activity, keyPrefix string) {

@@ -44,7 +44,7 @@ The initial named divergences are durable fenced team claims and restore (`TEAM-
 | --- | --- | --- | ---: | --- |
 | Sessions | continuously saved transcript; exact-ID resume; continue; rename; picker scoping; fork with a new identity; clear, compact, export, and retention | explicit lineage, transcript locator, retention and normalized runtime identity | 5 | partial: SES-001 passes; SES-002–005 are gaps |
 | Agent View | dispatch independent background sessions; needs-input/working/completed grouping; pin/filter; peek/reply; attach/detach/stop/delete; restart exited work on reply | durable inbox and separate logical/process state exposed in JSON and TUI | 5 | partial: VIEW-001 and VIEW-002 pass; VIEW-003–005 are gaps |
-| Supervisor | session execution survives terminal exit, update, sleep and supported reconnect; stale processes are not shown as live | leases, heartbeat, PID start-token validation, fencing, fail-closed orphan recovery, and exact resume; safe live adoption remains deferred | 4 | partial: SUP-001 passes; SUP-002–004 are gaps |
+| Supervisor | session execution survives terminal exit, update, sleep and supported reconnect; stale processes are not shown as live | leases, heartbeat, PID start-token validation, fencing, fail-closed orphan recovery, and exact resume; POSIX session adoption is now supported | 4 | partial: SUP-001 passes; broader reconnect/compatibility gaps remain |
 | Subagents | fresh or forked context; named definitions; model/effort/tools/skills/MCP/hooks/memory/permissions/worktree/background; exact resume; depth, count and concurrency limits | immutable runtime identity, transcript isolation and capability narrowing | 7 | partial substrate only: SUB-001–007 remain gaps |
 | Teams | fixed lead plus peers; shared tasks/dependencies/claims; direct and broadcast mailbox; plan approval; idle/failure/shutdown; no nesting | typed durable mailbox, generation-fenced claims, crash restore by exact identity | 8 | partial |
 | Dynamic workflows | real JavaScript with top-level `await`, `agent()` and `pipeline()`; dynamic branches/loops; 16 concurrent and 1,000 total agents; pause/stop/restart; ordered replay; saved scopes and args | sandboxed runtime adapters over one journaled invocation model | 5 | partial |
@@ -95,7 +95,7 @@ Before useful work starts, every attempt durably records workflow/node/parent/te
 
 At supervisor start:
 
-1. An exact live PID/start-token orphan is detected before scheduling; the current v2 service fails closed because safe runtime adoption is not yet implemented.
+1. An exact live PID/start-token orphan is detected before scheduling; the v2 service adopts it for observation and output recovery without launching a duplicate.
 2. A dead or prepared inherited Attempt is terminalized through one authority-owned journal command, its exact Lease is released, and the immutable Activity becomes retryable.
 3. A dead process with an exact resumable runtime session ID may then be retried by the normal scheduler, resuming only that ID; a dead process without a resume ID is retried only when the operation is restart-safe.
 4. Ambiguous identity, stale fencing, dirty worktree ownership or non-idempotent work transitions to `needs_input` with evidence.

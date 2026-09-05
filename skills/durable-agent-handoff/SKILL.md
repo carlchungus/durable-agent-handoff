@@ -46,6 +46,18 @@ do not infer lifecycle state from a transcript or a legacy store.
   records exact generation/Attempt fences, then the executor applies controls;
   leases are released only after terminal exit evidence and a durable settle.
 - Continue a bound exact Session with `handoff reply`.
+- Use `handoff session start` for the quiet terminal-like path. It has no goal,
+  evaluator, or mandatory stages; `--check-interval` defaults to 20 minutes
+  and only performs exact identity/recovery checks. Use `handoff status SESSION`
+  and `handoff tail SESSION --lines 40 [--follow]` for quick operator peeks.
+  Session mode does not apply the turn startup deadline; only an explicit
+  control stops an exact live harness. POSIX runners persist child exit facts
+  for restart adoption, while Windows Job Object teardown does not preserve a
+  live tree across service termination.
+- Runtime names are open-ended. Codex, Claude, and Pi have named adapters;
+  other names use a generic stdin/argv adapter with `--executable` and repeatable
+  `--arg=VALUE`. The generic adapter makes no native resume claim and rejects
+  read-only authority unless a future named adapter supplies an OS sandbox.
 - Treat independently hosted CI and GitHub checks as the merge requirement.
   Worker Result payloads are evidence of work only;
   handoff does not pretend that same-UID workers can authenticate their own
@@ -122,7 +134,7 @@ do not infer lifecycle state from a transcript or a legacy store.
 The old `doctor`, `discover`, `import claude`, `preference reset`, `team`,
 `activity follow`, `activity stop`, and legacy preference-file commands are not
 v2 commands. Do not tell an installed harness to use them. Team stores,
-transcript discovery/import, byte-cursor output attachment, and the broader
-Claude workflow compatibility matrix remain deferred until they have a
-Supervisor-journal command and tests; they are not silently emulated by a
-second live ledger.
+transcript discovery/import, byte-cursor attachment, and the broader Claude
+workflow compatibility matrix remain deferred. Session `status` and `tail`
+are the intentionally smaller Supervisor-journal observation surface; they do
+not create a second live ledger.

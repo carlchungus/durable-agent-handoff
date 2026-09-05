@@ -9,6 +9,27 @@ root. Set `HANDOFF_HOME` or pass `--state` to select it.
 
 ## Start and observe
 
+For the terminal-like experience, use a background Session. It has no required
+goal, evaluator, stage graph, or publication choreography. The default quiet
+check is every 20 minutes; it only rechecks exact process identity and repairs
+dead attempts. It never injects a prompt or signal into a live harness:
+
+```sh
+printf '%s' 'work overnight' | handoff session start --runtime codex --root /repo --file -
+printf '%s' 'audit this' | handoff session start --runtime claude --root /repo --file -
+printf '%s' 'keep going' | handoff session start --runtime grok --executable grok --root /repo --file -
+handoff status SESSION_ID
+handoff tail SESSION_ID --lines 40
+handoff tail SESSION_ID --follow
+```
+
+`grok`, `muse`, and other harness names use the generic stdin/argv adapter.
+Pass harness-specific arguments with repeated `--arg=VALUE`. The generic
+adapter preserves terminal output and fails closed for read-only authority; it
+does not guess a native resume flag. Codex, Claude, and Pi retain their exact
+native session adapters. A named adapter is required before handoff claims
+native resume semantics for another harness.
+
 Ordinary `start` and `create` may launch a new native Session; passing
 `--session` resumes only that exact identity. There is no global "last session"
 selector:
@@ -122,7 +143,8 @@ Session, decode typed provider milestones, and receive prompts on stdin. A
 prompt is never placed in argv, Supervisor responses, captured stdout, or a
 service unit. Full trust uses provider-native flags and still launches through
 argv; no shell wrapper is used. Pi fails closed for read-only work because it
-does not provide a native OS sandbox.
+does not provide a native OS sandbox. Unknown harnesses use the generic
+stdin/argv adapter described above and expose output for `tail`.
 
 Run queued Activities directly or through the background service:
 
@@ -146,8 +168,12 @@ only at service startup and passed to drivers without being persisted. Service
 units contain only argv, the private state root, the environment-file path,
 and trust mode. On every service start, inherited Attempts are reconciled before
 the queue is scheduled: dead or prepared orphans receive durable terminal exit
-evidence and release their exact writer Lease. An exact live orphan fails
-closed because Supervisor v2 does not guess at runtime adoption.
+evidence and release their exact writer Lease. Exact live attempts are adopted
+by PID plus process-start token and continue using their existing output files;
+the service never launches a duplicate. On POSIX, stopping the service detaches
+active work and a restart can adopt it; Windows Job Object containment ends the
+tree with the service, so the next start records an unknown/blocked exit rather
+than claiming restart survival.
 
 ## Migration
 

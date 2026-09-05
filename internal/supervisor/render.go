@@ -3,6 +3,7 @@ package supervisor
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // RenderText is the linear, screen-reader-friendly Supervisor view. Interactive
@@ -13,7 +14,10 @@ func RenderText(view *ExecutionView) string {
 		return ""
 	}
 	var output strings.Builder
-	fmt.Fprintf(&output, "Execution %s\nWorkflow %s\nTitle %s\nStatus %s\nUpdated %s\nPublication %s\n", view.ID, view.WorkflowID, singleLine(view.Title), view.Status, view.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z"), view.Publication)
+	fmt.Fprintf(&output, "Execution %s\nSession %s\nWorkflow %s\nRuntime %s\nRoot %s\nMode %s\nTitle %s\nStatus %s\nUpdated %s\nPublication %s\n", view.ID, view.SessionID, view.WorkflowID, view.Runtime.Name, view.Root, view.Mode, singleLine(view.Title), view.Status, view.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z"), view.Publication)
+	if view.SupervisionIntervalSeconds > 0 {
+		fmt.Fprintf(&output, "CheckInterval %s\n", (time.Duration(view.SupervisionIntervalSeconds) * time.Second).String())
+	}
 	if view.Summary != "" {
 		fmt.Fprintf(&output, "Progress %s\n", singleLine(view.Summary))
 	}
@@ -52,6 +56,9 @@ func RenderText(view *ExecutionView) string {
 	}
 	for _, attempt := range view.Attempts {
 		fmt.Fprintf(&output, "Attempt %s health=%s", attempt.ID, attempt.Health)
+		if attempt.PID > 0 {
+			fmt.Fprintf(&output, " pid=%d", attempt.PID)
+		}
 		if attempt.TaskAttempt > 0 {
 			fmt.Fprintf(&output, " task_attempt=%d", attempt.TaskAttempt)
 		}

@@ -26,6 +26,7 @@ type (
 	ControlID                  = internal.ControlID
 	LeaseID                    = internal.LeaseID
 	Sandbox                    = internal.Sandbox
+	ExecutionMode              = internal.ExecutionMode
 	RuntimeSpec                = internal.RuntimeSpec
 	NativeSessionIdentity      = internal.NativeSessionIdentity
 	AuthoritySpec              = internal.AuthoritySpec
@@ -92,6 +93,8 @@ const (
 
 	SandboxReadOnly       = internal.SandboxReadOnly
 	SandboxWorkspaceWrite = internal.SandboxWorkspaceWrite
+	ExecutionModeTurn     = internal.ExecutionModeTurn
+	ExecutionModeSession  = internal.ExecutionModeSession
 
 	MilestoneProcessSpawned      = internal.MilestoneProcessSpawned
 	MilestoneSessionBound        = internal.MilestoneSessionBound

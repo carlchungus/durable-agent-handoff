@@ -4,6 +4,7 @@ package activity
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -39,7 +40,7 @@ func (w *processTreeWatchdog) complete() error {
 	writeErr := json.NewEncoder(w.gate).Encode(watchdogRequest{})
 	closeErr := w.gate.Close()
 	waitErr := w.command.Wait()
-	return errorsJoin(writeErr, closeErr, waitErr)
+	return errors.Join(writeErr, closeErr, waitErr)
 }
 
 func runProcessTreeWatchdog(input io.Reader) {
@@ -105,14 +106,4 @@ func fmtInt(value int) string {
 		digits[i] = '-'
 	}
 	return string(digits[i:])
-}
-
-func errorsJoin(values ...error) error {
-	var first error
-	for _, value := range values {
-		if value != nil && first == nil {
-			first = value
-		}
-	}
-	return first
 }

@@ -129,9 +129,11 @@ launch or task-attempt budget in a tight scheduling loop.
 Service startup runs one authority-owned recovery command before scheduling. It
 validates each inherited nonterminal Attempt against its exact PID and process
 start token. A dead or prepared orphan is durably recorded with typed terminal
-milestones and its exact Lease is released; an exact live orphan fails closed
-until a safe adoption protocol exists. Projections never perform this work and
-polling never appends recovery state.
+milestones and its exact Lease is released; an exact live orphan is returned to
+the service for observation and adoption rather than launching a duplicate. The
+activity runner persists the child exit code before its POSIX containment
+watchdog exits, so adoption never treats a missing wrapper as successful work.
+Projections never perform this work and polling never appends recovery state.
 
 The task-attempt budget counts Attempts containing `turn_started`. Pre-turn
 failures consume only the independent launch budget; there are no refunds.
@@ -150,7 +152,7 @@ Meaningful progress exists only after a Driver emits `meaningful_progress`.
 
 ## Runtime Drivers
 
-Codex, Claude, and Pi implement the Driver interface. Each Driver handles:
+Codex, Claude, and Pi implement the Driver interface. Each named Driver handles:
 
 - non-shell argv construction;
 - explicit worktree, sandbox, model, and effort selection;
@@ -180,6 +182,22 @@ exit
 Decoders read only documented provider fields. They do not recursively search
 arbitrary JSON for `session_id`, `thread_id`, a result, or a limit string.
 Runtime Drivers never receive GitHub merge authority.
+
+Unknown runtime names use a generic stdin/argv Driver. It preserves ordinary
+line output and supports harness-specific arguments, but it does not infer a
+native session ID or resume flag. Exact native resume is only claimed by a
+named adapter that understands that harness's documented protocol.
+
+Session-mode launches are terminal-like background Sessions. They omit the
+structured completion contract and evaluator, while retaining the same
+process-start identity, output files, writer Lease, and immutable exit Result.
+Their configured quiet supervision cadence only rechecks exact identities and
+repairs dead Attempts; it never injects prompts or signals into live work.
+Session mode also bypasses the turn startup deadline, so a silent harness is
+not stopped merely because it has not emitted output. Explicit controls still
+stop an exact adopted process. POSIX adoption uses the persisted child exit
+record; Windows Job Object containment does not preserve a live tree across
+service termination.
 
 Turn decisions are not part of a runtime Driver. A stateless OpenRouter call
 with no tools receives the goal, prompt, worker turn, and bounded progress

@@ -11,10 +11,9 @@ import (
 	"github.com/carlchungus/durable-agent-handoff/internal/processidentity"
 )
 
-// ErrLiveOrphan is returned when startup finds an inherited Attempt whose
-// exact recorded process is still alive. Supervisor v2 does not yet have a
-// safe runtime adoption protocol, so startup fails closed instead of launching
-// a duplicate or guessing at ownership.
+// ErrLiveOrphan is retained for callers that explicitly ask an older recovery
+// path to fail closed. Normal startup now returns exact live Attempts so the
+// service can observe them without launching a duplicate.
 var ErrLiveOrphan = errors.New("live orphan Attempt requires explicit adoption")
 
 type startupRecovery struct {
@@ -54,6 +53,16 @@ func (s *Store) ReconcileStartup(ctx context.Context) error {
 		if attempt.Process != nil {
 			process := *attempt.Process
 			recovery.Process = &process
+			match, inspectErr := exactProcessMatch(attempt.Process)
+			if inspectErr != nil {
+				return fmt.Errorf("inspect orphaned Attempt %s without releasing its lease: %w", attempt.ID, inspectErr)
+			}
+			if match == processidentity.MatchUnknown {
+				return fmt.Errorf("inspect orphaned Attempt %s without releasing its lease: identity status is unknown", attempt.ID)
+			}
+			if match == processidentity.MatchExact {
+				continue
+			}
 		}
 		recoveries = append(recoveries, recovery)
 		ids = append(ids, string(attempt.ID))
@@ -66,6 +75,34 @@ func (s *Store) ReconcileStartup(ctx context.Context) error {
 	key := "startup/reconcile/" + stableID("attempts", strings.Join(ids, "\x00"))
 	_, err = s.Execute(ctx, reconcileStartupCommand{Recoveries: recoveries, IdempotencyKey: key})
 	return err
+}
+
+// LiveAttemptIDs returns exact live process identities that survived a
+// Supervisor restart. It is a pure read used by the service to start an
+// observer; it never adopts by PID alone and never mutates the journal.
+func (s *Store) LiveAttemptIDs() ([]AttemptID, error) {
+	state, err := s.Projection()
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]AttemptID, 0)
+	for _, attempt := range state.Attempts {
+		if attemptHasExit(attempt) || attempt.Process == nil {
+			continue
+		}
+		match, inspectErr := exactProcessMatch(attempt.Process)
+		if inspectErr != nil {
+			return nil, inspectErr
+		}
+		if match == processidentity.MatchUnknown {
+			return nil, fmt.Errorf("inspect live Attempt %s: identity status is unknown", attempt.ID)
+		}
+		if match == processidentity.MatchExact {
+			ids = append(ids, attempt.ID)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
 }
 
 func (c reconcileStartupCommand) decide(state *State, now time.Time) ([]DomainEvent, string, error) {

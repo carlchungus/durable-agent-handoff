@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/carlchungus/durable-agent-handoff/internal/driver"
+	"github.com/carlchungus/durable-agent-handoff/internal/processidentity"
 	"github.com/carlchungus/durable-agent-handoff/internal/supervisor"
 )
 
@@ -146,12 +148,121 @@ func TestExecutorHelperProcess(t *testing.T) {
 	os.Exit(0)
 }
 
+func TestExecutorSessionGenericHelperProcess(t *testing.T) {
+	if !strings.Contains(strings.Join(os.Args, " "), "-test.run=TestExecutorSessionGenericHelperProcess") {
+		return
+	}
+	_, _ = io.ReadAll(os.Stdin)
+	_, _ = fmt.Fprintln(os.Stdout, "generic session output")
+	os.Exit(0)
+}
+
+func TestExecutorRunsGenericSessionToNormalCompletion(t *testing.T) {
+	stateRoot, worktree, outputRoot := t.TempDir(), t.TempDir(), t.TempDir()
+	for _, path := range []string{stateRoot, worktree, outputRoot} {
+		if err := os.Chmod(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := supervisor.Open(stateRoot, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeArgs, err := json.Marshal([]string{"-test.run=TestExecutorSessionGenericHelperProcess"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, _, err := store.StartExecution(context.Background(), supervisor.StartExecutionInput{
+		NativeSession: supervisor.NativeSessionIdentity{Runtime: "muse"}, Prompt: "generic session", Runtime: supervisor.RuntimeSpec{Name: "muse", Executable: os.Args[0], Arguments: string(runtimeArgs), Sandbox: supervisor.SandboxWorkspaceWrite}, Root: worktree,
+		Mode: supervisor.ExecutionModeSession, Authority: supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite}, Budget: supervisor.DefaultBudget(), IdempotencyKey: "generic-session-run",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &Executor{Store: store, OutputRoot: outputRoot, Drivers: driver.Lookup}
+	if err := runner.RunActivity(context.Background(), execution.FirstActivity); err != nil {
+		t.Fatalf("generic session returned an unexpected runner error: %v", err)
+	}
+	view, err := store.View(execution.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Activities) != 1 || view.Activities[0].Status != supervisor.ActivityCompleted || view.Activities[0].ResultSummary != "generic session output" {
+		t.Fatalf("generic session did not settle from its normal harness exit: %+v", view.Activities)
+	}
+}
+
+func TestExecutorSessionDoesNotApplyTurnStartupDeadline(t *testing.T) {
+	stateRoot, worktree, outputRoot := t.TempDir(), t.TempDir(), t.TempDir()
+	for _, path := range []string{stateRoot, worktree, outputRoot} {
+		if err := os.Chmod(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := supervisor.Open(stateRoot, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, _, err := store.StartExecution(context.Background(), supervisor.StartExecutionInput{
+		NativeSession: supervisor.NativeSessionIdentity{Runtime: "test", ID: "silent-session"}, Prompt: "silent", Runtime: supervisor.RuntimeSpec{Name: "test", Sandbox: supervisor.SandboxWorkspaceWrite}, Root: worktree,
+		Mode: supervisor.ExecutionModeSession, Authority: supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite}, Budget: supervisor.DefaultBudget(), IdempotencyKey: "silent-session-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- (&Executor{Store: store, OutputRoot: outputRoot, Drivers: func(string) (driver.Driver, error) { return startupHungDriver{}, nil }, StartupDeadline: 100 * time.Millisecond}).RunActivity(ctx, execution.FirstActivity)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		state, projectionErr := store.Projection()
+		if projectionErr != nil {
+			t.Fatal(projectionErr)
+		}
+		for _, attempt := range state.Attempts {
+			if attempt.ActivityID != execution.FirstActivity {
+				continue
+			}
+			if attempt.Process != nil {
+				time.Sleep(250 * time.Millisecond)
+				state, projectionErr = store.Projection()
+				if projectionErr != nil {
+					t.Fatal(projectionErr)
+				}
+				if current := state.Attempts[attempt.ID]; current != nil && attemptHasExit(current) {
+					t.Fatalf("session was stopped by the turn startup deadline: %+v", current)
+				}
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("session cancellation did not stop the silent harness")
+				}
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("silent session did not establish a durable process")
+}
+
 func TestExecutorStartupHelperProcess(t *testing.T) {
 	if !strings.Contains(strings.Join(os.Args, " "), "-test.run=TestExecutorStartupHelperProcess") {
 		return
 	}
 	_, _ = io.ReadAll(os.Stdin)
 	time.Sleep(5 * time.Second)
+	os.Exit(0)
+}
+
+func TestExecutorAdoptionHelper(t *testing.T) {
+	if os.Getenv("HANDOFF_TEST_ADOPT_HELPER") != "1" || !strings.Contains(strings.Join(os.Args, " "), "-test.run=^TestExecutorAdoptionHelper$") {
+		return
+	}
+	time.Sleep(250 * time.Millisecond)
 	os.Exit(0)
 }
 
@@ -173,6 +284,98 @@ func TestExecutorFallbackHelperProcess(t *testing.T) {
 		_, _ = fmt.Fprintln(os.Stdout, `{"kind":"success"}`)
 	}
 	os.Exit(0)
+}
+
+func TestExecutorAdoptsExactLiveAttemptAndSettlesSessionOutput(t *testing.T) {
+	stateRoot, worktree, outputRoot := t.TempDir(), t.TempDir(), t.TempDir()
+	for _, path := range []string{stateRoot, worktree, outputRoot} {
+		if err := os.Chmod(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := supervisor.Open(stateRoot, supervisor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, _, err := store.StartExecution(context.Background(), supervisor.StartExecutionInput{
+		NativeSession: supervisor.NativeSessionIdentity{Runtime: "test", ID: "adopt-session"},
+		Prompt:        "adopt", Runtime: supervisor.RuntimeSpec{Name: "test", Sandbox: supervisor.SandboxWorkspaceWrite}, Root: worktree,
+		Mode: supervisor.ExecutionModeSession, Authority: supervisor.AuthoritySpec{RequestedBy: "human", HumanAuthorized: true, Sandbox: supervisor.SandboxWorkspaceWrite},
+		Budget: supervisor.DefaultBudget(), IdempotencyKey: "adopt-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdoutPath := filepath.Join(outputRoot, "adopt.stdout.log")
+	if err := os.WriteFile(stdoutPath, []byte("adopted output\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exitPath := filepath.Join(outputRoot, "adopt.exit.json")
+	if err := os.WriteFile(exitPath, []byte(`{"code":0}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	activity := state.Activities[execution.FirstActivity]
+	attempt, _, err := store.PrepareAttempt(context.Background(), supervisor.PrepareAttemptInput{
+		ActivityID: activity.ID, ExpectedGeneration: activity.Generation, Runtime: supervisor.RuntimeSpec{Name: "test", Sandbox: supervisor.SandboxWorkspaceWrite},
+		CommandDigest: "adopt-command", Outputs: supervisor.OutputIdentity{Stdout: "adopt-stdout", Stderr: "adopt-stderr", StdoutPath: stdoutPath, ExitPath: exitPath}, IdempotencyKey: "adopt-attempt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestExecutorAdoptionHelper$")
+	child.Env = append(os.Environ(), "HANDOFF_TEST_ADOPT_HELPER=1")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	token := ""
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && token == "" {
+		token = processidentity.ProcessStartToken(child.Process.Pid)
+		if token == "" {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if token == "" {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+		t.Fatal("adoption helper did not expose a process identity")
+	}
+	if _, err := store.RecordMilestone(context.Background(), supervisor.RecordMilestoneInput{ActivityID: activity.ID, ExpectedGeneration: activity.Generation, AttemptID: attempt.ID, LeaseID: attempt.LeaseID, Milestone: supervisor.Milestone{Kind: supervisor.MilestoneProcessSpawned, Process: &supervisor.ProcessIdentity{PID: child.Process.Pid, StartToken: token}}, IdempotencyKey: "adopt-process"}); err != nil {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+		t.Fatal(err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- child.Wait() }()
+	if err := (&Executor{Store: store}).AdoptAttempt(context.Background(), attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-waited; err != nil {
+		t.Fatal(err)
+	}
+	state, err = store.Projection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := state.Attempts[attempt.ID]
+	if !hasAttemptMilestone(current, supervisor.MilestoneExit) || !hasAttemptMilestone(current, supervisor.MilestoneTurnStarted) || len(state.Results) != 1 {
+		t.Fatalf("adopted attempt did not settle durable output: attempt=%+v results=%+v", current, state.Results)
+	}
+	if result := state.Results[supervisor.ResultID("result_"+string(activity.ID))]; result == nil {
+		found := false
+		for _, result := range state.Results {
+			if result.ActivityID == activity.ID && result.Status == "completed" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("adopted session result missing: %+v", state.Results)
+		}
+	}
 }
 
 func TestExecutorUsesTypedSupervisorAttemptAndStdinPrompt(t *testing.T) {

@@ -19,8 +19,9 @@ const (
 )
 
 type runnerRequest struct {
-	Argv  []string `json:"argv"`
-	Stdin []byte   `json:"stdin,omitempty"`
+	Argv     []string `json:"argv"`
+	Stdin    []byte   `json:"stdin,omitempty"`
+	ExitPath string   `json:"exit_path,omitempty"`
 }
 
 type watchdogRequest struct{}
@@ -36,7 +37,7 @@ type GatedCommand struct {
 	once    sync.Once
 }
 
-func PrepareGatedCommand(argv []string, cwd string, env []string, stdin []byte) (*GatedCommand, error) {
+func PrepareGatedCommand(argv []string, cwd string, env []string, stdin []byte, exitPath ...string) (*GatedCommand, error) {
 	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" {
 		return nil, errors.New("gated activity command is required")
 	}
@@ -57,7 +58,11 @@ func PrepareGatedCommand(argv []string, cwd string, env []string, stdin []byte) 
 		tree.close()
 		return nil, err
 	}
-	return &GatedCommand{Command: command, gate: gate, tree: tree, request: runnerRequest{Argv: append([]string(nil), argv...), Stdin: append([]byte(nil), stdin...)}}, nil
+	path := ""
+	if len(exitPath) > 0 {
+		path = exitPath[0]
+	}
+	return &GatedCommand{Command: command, gate: gate, tree: tree, request: runnerRequest{Argv: append([]string(nil), argv...), Stdin: append([]byte(nil), stdin...), ExitPath: path}}, nil
 }
 
 func (g *GatedCommand) BindProcessTree(pid int, token string) (string, error) {
@@ -159,10 +164,37 @@ func runGatedTarget(input io.Reader, stdout, stderr io.Writer) (int, error) {
 	if command.ProcessState != nil {
 		code = command.ProcessState.ExitCode()
 	}
-	if completeErr := watchdog.complete(); err == nil {
-		err = completeErr
+	exitWriteErr := writeExitRecord(request.ExitPath, code, err)
+	completeErr := watchdog.complete()
+	return code, errors.Join(err, exitWriteErr, completeErr)
+}
+
+func writeExitRecord(path string, code int, processErr error) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
 	}
-	return code, err
+	record := struct {
+		Code  int    `json:"code"`
+		Error string `json:"error,omitempty"`
+	}{Code: code}
+	if processErr != nil {
+		record.Error = processErr.Error()
+	}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = file.Write(raw); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 func withoutRunnerEnvironment(env []string) []string {

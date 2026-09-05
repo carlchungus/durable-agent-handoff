@@ -651,7 +651,7 @@ func cloneExecution(v *Execution) *Execution { c := *v; return &c }
 func cloneNode(v *Node) *Node {
 	c := *v
 	c.Dependencies = append([]NodeID(nil), v.Dependencies...)
-	c.Work.Fallbacks = append([]RuntimeSpec(nil), v.Work.Fallbacks...)
+	c.Work.Fallbacks = cloneRuntimes(v.Work.Fallbacks)
 	return &c
 }
 func cloneWorkflow(v *Workflow) *Workflow {
@@ -709,6 +709,17 @@ func cloneFinalization(v *Finalization) *Finalization {
 	c := *v
 	c.Gates = append([]string(nil), v.Gates...)
 	return &c
+}
+
+func cloneRuntimes(values []RuntimeSpec) []RuntimeSpec {
+	if values == nil {
+		return nil
+	}
+	cloned := make([]RuntimeSpec, len(values))
+	for index, value := range values {
+		cloned[index] = value
+	}
+	return cloned
 }
 func cloneMessage(v *Message) *Message { c := *v; return &c }
 func cloneLease(v *Lease) *Lease       { c := *v; return &c }
